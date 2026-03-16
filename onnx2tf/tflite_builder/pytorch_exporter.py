@@ -3418,6 +3418,8 @@ def _tensor_expr_for_channel_first_bridge_for_codegen(
     if tensor is None:
         return None
     rank = len(list(tensor.shape))
+    if rank == 3:
+        return None
     expected_perm = _perm_cl_to_cf(rank)
     if expected_perm is None or list(perm or []) != list(expected_perm):
         return None
@@ -3442,6 +3444,8 @@ def _channel_first_reduction_plan_for_codegen(
     input_rank = len(list(input_tensor.shape))
     input_layout = normalize_logical_layout(input_tensor.logical_layout)
     if not is_channel_last_logical_layout(input_layout):
+        return None
+    if input_rank == 3:
         return None
     if (
         input_rank == 4
@@ -17736,6 +17740,9 @@ def _canonicalize_generated_model_source_for_raw_export(
     generic_alias_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)$"
     )
+    rank4_reshape_consumer_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), _resolve_reshape_shape\(\[(?P<shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)\)$"
+    )
     generic_expr_assign_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>.+)$"
     )
@@ -17789,6 +17796,11 @@ def _canonicalize_generated_model_source_for_raw_export(
     )
     generic_torch_cat_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=(?P<axis>-?\d+)\)$"
+    )
+    binary_same_permute_cf_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.(?P<op>add|sub)\("
+        r"(?P<a>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\), "
+        r"(?P<b>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\)\)$"
     )
     pool2d_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<shape>[0-9, ]+)\], is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
@@ -17861,6 +17873,9 @@ def _canonicalize_generated_model_source_for_raw_export(
     )
     rank4_mean_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[(?P<dim0>-?\d+), (?P<dim1>-?\d+)\], keepdim=(?P<keepdim>True|False)\)$"
+    )
+    rank4_reshape_consumer_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), \[(?P<shape>[0-9,\- ]+)\]\)$"
     )
     pidnet_spp_scale3_mul_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.const_wa_spp_scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused\), \[1, 512, 1, 512\]\)$"
@@ -17963,6 +17978,17 @@ def _canonicalize_generated_model_source_for_raw_export(
                 return candidate
         return len(lines)
 
+    def _has_rank4_reshape_consumer(name: str, line_index: int) -> bool:
+        function_end = _function_end_index(line_index)
+        for future_line in lines[line_index + 1 : function_end]:
+            reshape_match = rank4_reshape_consumer_re.match(future_line)
+            if (
+                reshape_match is not None
+                and str(reshape_match.group("input")) == name
+            ):
+                return True
+        return False
+
     buffer_specs: Dict[str, Tuple[int, List[int], str, bool]] = {}
     const_temp_assignments: Dict[str, Tuple[int, str, str, str]] = {}
     transposed_const_alias_specs: Dict[str, Tuple[str, List[int], str]] = {}
@@ -17973,6 +17999,54 @@ def _canonicalize_generated_model_source_for_raw_export(
         stripped_line = line.strip()
         if line.startswith("    def "):
             inside_nms_method = stripped_line.startswith("def _run_nms_")
+        binary_same_permute_match = binary_same_permute_cf_re.match(line)
+        next_binary_same_permute_match = (
+            binary_same_permute_cf_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        )
+        next_cat_match = (
+            generic_torch_cat_re.match(lines[index + 2]) if index + 2 < len(lines) else None
+        )
+        if (
+            binary_same_permute_match is not None
+            and next_binary_same_permute_match is not None
+            and next_cat_match is not None
+            and str(binary_same_permute_match.group("a")) == str(next_binary_same_permute_match.group("a"))
+            and str(binary_same_permute_match.group("b")) == str(next_binary_same_permute_match.group("b"))
+            and {str(binary_same_permute_match.group("op")), str(next_binary_same_permute_match.group("op"))}
+            == {"add", "sub"}
+            and int(next_cat_match.group("axis")) in {1, 2}
+        ):
+            cat_inputs = [
+                token.strip()
+                for token in str(next_cat_match.group("inputs")).split(",")
+                if token.strip()
+            ]
+            first_lhs = str(binary_same_permute_match.group("lhs"))
+            second_lhs = str(next_binary_same_permute_match.group("lhs"))
+            if cat_inputs == [first_lhs, second_lhs]:
+                indent = str(binary_same_permute_match.group("indent"))
+                a = str(binary_same_permute_match.group("a"))
+                b = str(binary_same_permute_match.group("b"))
+                cat_lhs = str(next_cat_match.group("lhs"))
+                cat_axis = int(next_cat_match.group("axis"))
+                lines[index] = f"{indent}{first_lhs} = torch.{binary_same_permute_match.group('op')}({a}, {b})"
+                lines[index + 1] = (
+                    f"{next_binary_same_permute_match.group('indent')}{second_lhs} = "
+                    f"torch.{next_binary_same_permute_match.group('op')}({a}, {b})"
+                )
+                if cat_axis == 1:
+                    lines[index + 2] = (
+                        f"{next_cat_match.group('indent')}{cat_lhs} = "
+                        f"torch.cat([{first_lhs}, {second_lhs}], dim=1).permute(0, 2, 1).contiguous()"
+                    )
+                else:
+                    lines[index + 2] = (
+                        f"{next_cat_match.group('indent')}{cat_lhs} = "
+                        f"torch.cat([{first_lhs}, {second_lhs}], dim=2)"
+                    )
+                cf_aliases.add(cat_lhs)
+                changed = True
+                line = lines[index]
         minimum_scalar_match = minimum_scalar_tensor_re.match(line)
         if minimum_scalar_match is not None:
             lines[index] = (
@@ -18205,11 +18279,40 @@ def _canonicalize_generated_model_source_for_raw_export(
             cf_aliases.add(str(binary_align_match.group("lhs1")))
         generic_alias_match = generic_alias_re.match(lines[index])
         if generic_alias_match is not None:
-            generic_alias_sources[str(generic_alias_match.group("lhs"))] = str(
-                generic_alias_match.group("rhs")
-            )
-            if _is_known_cf_name(str(generic_alias_match.group("rhs")), set()):
-                cf_aliases.add(str(generic_alias_match.group("lhs")))
+            lhs = str(generic_alias_match.group("lhs"))
+            rhs = str(generic_alias_match.group("rhs"))
+            next_reshape_match = None
+            for lookahead_index in range(index + 1, min(index + 5, len(lines))):
+                candidate_reshape_match = rank4_reshape_consumer_re.match(lines[lookahead_index])
+                if candidate_reshape_match is not None and str(candidate_reshape_match.group("input")) == lhs:
+                    next_reshape_match = candidate_reshape_match
+                    break
+            lhs_exact_shape = _model_ir_exact_shape(lhs)
+            rhs_exact_shape = _model_ir_exact_shape(rhs)
+            nhwc_target_shape = lhs_exact_shape
+            if nhwc_target_shape is None and rhs_exact_shape is not None and len(rhs_exact_shape) == 4:
+                nhwc_target_shape = [
+                    int(rhs_exact_shape[0]),
+                    int(rhs_exact_shape[2]),
+                    int(rhs_exact_shape[3]),
+                    int(rhs_exact_shape[1]),
+                ]
+            if (
+                "_nhwc" in lhs
+                and _is_known_cf_name(rhs, set())
+                and next_reshape_match is not None
+                and str(next_reshape_match.group("input")) == lhs
+            ):
+                indent = str(generic_alias_match.group("indent"))
+                lines[index] = f"{indent}{lhs} = {rhs}.permute(0, 2, 3, 1).contiguous()"
+                changed = True
+                cf_materialized_alias_sources.pop(lhs, None)
+                generic_alias_sources.pop(lhs, None)
+                line = lines[index]
+            else:
+                generic_alias_sources[lhs] = rhs
+                if _is_known_cf_name(rhs, set()):
+                    cf_aliases.add(lhs)
         singleton_cf_align_match = singleton_cf_align_re.match(lines[index])
         if singleton_cf_align_match is not None:
             expr = str(singleton_cf_align_match.group("expr"))
@@ -18330,6 +18433,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             ]
             lhs = str(generic_cat_match.group("lhs"))
             axis = int(generic_cat_match.group("axis"))
+            if model_ir is not None and lhs in model_ir.outputs and axis != 1:
+                continue
             if (
                 len(normalized_inputs) >= 2
                 and all(_is_known_cf_name(name, singleton_cf_seeds) for name in normalized_inputs)
@@ -19018,6 +19123,8 @@ def _canonicalize_generated_model_source_for_raw_export(
                         for future_line in lines[index + 1 : function_end]
                         if re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
                     ]
+                    if _has_rank4_reshape_consumer(lhs, index):
+                        future_uses = ["__reshape_consumer__"]
                     if len(future_uses) == 0 or all(future_line.lstrip().startswith("return ") for future_line in future_uses):
                         indent = str(aligned_rank4_seed_match.group("indent"))
                         lines[index] = f"{indent}{lhs} = {expr}"
@@ -19463,6 +19570,8 @@ def _canonicalize_generated_model_source_for_raw_export(
                     for future_line in lines[index + 1 : function_end]
                     if re.search(rf"\b{re.escape(alias)}\b", future_line) is not None
                 ]
+                if _has_rank4_reshape_consumer(alias, index):
+                    future_uses = ["__reshape_consumer__"]
                 immediate_uses = "\n".join(lines[index + 1:index + 4])
                 future_uses_are_safe = all(
                     future_line.lstrip().startswith("return ")
@@ -19925,6 +20034,30 @@ def _canonicalize_generated_model_source_for_raw_export(
                     ]
                     lines[insert_index:insert_index] = load_state_dict_lines
                     changed = True
+    for index, line in enumerate(lines):
+        generic_alias_match = generic_alias_re.match(line)
+        if generic_alias_match is None:
+            continue
+        lhs = str(generic_alias_match.group("lhs"))
+        rhs = str(generic_alias_match.group("rhs"))
+        if "_nhwc" not in lhs or not _is_known_cf_name(rhs, set()):
+            continue
+        reshape_consumer_found = False
+        for lookahead_index in range(index + 1, min(index + 6, len(lines))):
+            candidate_reshape_match = rank4_reshape_consumer_re.match(lines[lookahead_index])
+            if candidate_reshape_match is not None and str(candidate_reshape_match.group("input")) == lhs:
+                reshape_consumer_found = True
+                break
+        if not reshape_consumer_found:
+            continue
+        rhs_exact_shape = _model_ir_exact_shape(rhs)
+        if rhs_exact_shape is None or len(rhs_exact_shape) != 4:
+            rhs_exact_shape = None
+        indent = str(generic_alias_match.group("indent"))
+        rewritten_line = f"{indent}{lhs} = {rhs}.permute(0, 2, 3, 1).contiguous()"
+        if rewritten_line != line:
+            lines[index] = rewritten_line
+            changed = True
     if any("_tensor_shape_list(" in line for line in lines):
         runtime_import_line = "    _tensor_shape_list,"
         has_runtime_import = any(line.strip() == "_tensor_shape_list," for line in lines)
@@ -19943,6 +20076,75 @@ def _canonicalize_generated_model_source_for_raw_export(
             if runtime_import_block_end is not None:
                 lines.insert(runtime_import_block_end, runtime_import_line)
                 changed = True
+    orphan_rank3_permute_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 2, 1\]\)$"
+    )
+    square_permuted_const_alias_re = re.compile(
+        r"^\s*self\.(?P<alias>[A-Za-z0-9_]+)\.copy_\("
+        r"self\.(?P<source>[A-Za-z0-9_]+)\.permute\(\*\(0, 1, 3, 2\)\)\.contiguous\(\)\)$"
+    )
+    square_permuted_add_use_re = re.compile(
+        r"(?P<prefix>torch\.add\([^,\n]+,\s*)self\.(?P<alias>[A-Za-z0-9_]+)(?P<suffix>\)\s*)"
+    )
+    square_target_shape_re = re.compile(
+        r"(?:target_shape=)?\[(?P<a>-?\d+),\s*(?P<b>-?\d+),\s*(?P<h>-?\d+),\s*(?P<w>-?\d+)\]"
+    )
+    square_alias_sources: Dict[str, str] = {}
+    for line in lines:
+        square_permuted_const_alias_match = square_permuted_const_alias_re.match(line)
+        if square_permuted_const_alias_match is None:
+            continue
+        square_alias_sources[str(square_permuted_const_alias_match.group("alias"))] = str(
+            square_permuted_const_alias_match.group("source")
+        )
+    if len(square_alias_sources) > 0:
+        for index, line in enumerate(lines):
+            target_shape_match = square_target_shape_re.search(line)
+            if target_shape_match is None:
+                continue
+            if int(target_shape_match.group("h")) != int(target_shape_match.group("w")):
+                continue
+            square_add_use_match = square_permuted_add_use_re.search(line)
+            if square_add_use_match is None:
+                continue
+            alias_name = str(square_add_use_match.group("alias"))
+            source_name = square_alias_sources.get(alias_name, "")
+            if source_name == "":
+                continue
+            rewritten_line = (
+                line[: square_add_use_match.start()]
+                + str(square_add_use_match.group("prefix"))
+                + f"self.{source_name}"
+                + str(square_add_use_match.group("suffix"))
+                + line[square_add_use_match.end() :]
+            )
+            if rewritten_line != line:
+                lines[index] = rewritten_line
+                changed = True
+    current_function_assigned: set[str] = set()
+    previous_assigned_name: str | None = None
+    for index, line in enumerate(lines):
+        if line.startswith("    def "):
+            current_function_assigned = set()
+            previous_assigned_name = None
+            continue
+        orphan_rank3_permute_match = orphan_rank3_permute_re.match(line)
+        if orphan_rank3_permute_match is not None:
+            src = str(orphan_rank3_permute_match.group("src"))
+            if src not in current_function_assigned and previous_assigned_name is not None:
+                lhs = str(orphan_rank3_permute_match.group("lhs"))
+                indent = str(orphan_rank3_permute_match.group("indent"))
+                if _is_known_cf_name(previous_assigned_name, singleton_cf_vars):
+                    lines[index] = f"{indent}{lhs} = {previous_assigned_name}"
+                else:
+                    lines[index] = (
+                        f"{indent}{lhs} = _torch_permute({previous_assigned_name}, [0, 2, 1])"
+                    )
+                changed = True
+        generic_assign_match = re.match(r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=", lines[index])
+        if generic_assign_match is not None:
+            previous_assigned_name = str(generic_assign_match.group("lhs"))
+            current_function_assigned.add(previous_assigned_name)
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

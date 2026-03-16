@@ -7523,6 +7523,8 @@ def test_export_pytorch_package_generates_native_swinir_package_when_model_is_av
     assert "_depth_to_space_x_" in model_source
     assert "_space_to_depth_x_" in model_source
     assert "F.pixel_shuffle(" not in model_source
+    assert "torch.add(t_1691, self.const_tensor44113_perm0_x6_x64" not in model_source
+    assert "torch.add(t_1691, self.const_tensor_44113)" in model_source
 
 
 def test_export_pytorch_package_avoids_public_bridge_permute_pairs_for_swinir_when_model_is_available(tmp_path) -> None:
