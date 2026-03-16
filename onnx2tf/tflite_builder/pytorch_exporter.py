@@ -17925,19 +17925,31 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.const_wa_spp_scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused\), \[1, 512, 1, 512\]\)$"
     )
     pidnet_spp_scale3_anchor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.const_wa_spp_scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused, \[1, 512, 1, 512\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused), \[1, 512, 1, 512\]\)$"
     )
     pidnet_spp_scale3_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.const_wa_spp_scale3_scale3_1_BatchNormalization_bn_add, \[1, 512, 1, 512\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale3_scale3_1_BatchNormalization_bn_add), \[1, 512, 1, 512\]\)$"
     )
     pidnet_spp_scale3_mul_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>wasppscale3_scale31_batch_mul_out[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 512, 1, 512\]\)$"
     )
     pidnet_spp_scale4_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_mul\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\)$"
+    )
+    pidnet_spp_scale4_mul_reshape_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
+        r"self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\), \[1, 1, 512, 1\]\)$"
     )
     pidnet_spp_scale4_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_add, \[1, 1, 1, 512\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_add), \[1, 1, 1, 512\]\)$"
+    )
+    pidnet_pag4_mul2_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\("
+        r"(?P<sig>[A-Za-z0-9_]*pag4_sig_out0), (?P<resize>[A-Za-z0-9_]*pag4_resize1_out_nhwc), \[1, 64, 24, 40\]\)$"
+    )
+    pidnet_pag4_mul2_out_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]*pag4_mul2_out0) = _align_tensor_to_target_shape\("
+        r"torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 64, 24, 40\]\)$"
     )
     pidnet_spp_scale3_add_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 512, 1, 512\]\)$"
@@ -17975,6 +17987,28 @@ def _canonicalize_generated_model_source_for_raw_export(
     singleton_cf_seeds: set[str] = set()
     cf_materialized_alias_sources: Dict[str, str] = {}
     generic_alias_sources: Dict[str, str] = {}
+    conv_block_out_channels: Dict[str, int] = {}
+    module_output_producers: Dict[str, str] = {}
+
+    conv_block_decl_re = re.compile(r"^\s*self\.(?P<module>[A-Za-z0-9_]+) = _Conv2dBlock\($")
+    out_channels_re = re.compile(r"^\s*out_channels=(?P<channels>\d+),$")
+    module_output_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\("
+    )
+    for index, line in enumerate(lines):
+        conv_block_decl_match = conv_block_decl_re.match(line)
+        if conv_block_decl_match is not None:
+            module_name = str(conv_block_decl_match.group("module"))
+            for lookahead in range(index + 1, min(len(lines), index + 12)):
+                out_channels_match = out_channels_re.match(lines[lookahead])
+                if out_channels_match is not None:
+                    conv_block_out_channels[module_name] = int(out_channels_match.group("channels"))
+                    break
+        module_output_assign_match = module_output_assign_re.match(line)
+        if module_output_assign_match is not None:
+            module_output_producers[str(module_output_assign_match.group("lhs"))] = str(
+                module_output_assign_match.group("module")
+            )
 
     def _is_known_cf_name(name: str, singleton_names: set[str]) -> bool:
         resolved_name = name
@@ -17988,6 +18022,17 @@ def _canonicalize_generated_model_source_for_raw_export(
             if next_name is None:
                 break
             resolved_name = next_name
+        resolved_tensor = (
+            model_ir.tensors.get(_resolve_model_ir_tensor_name(resolved_name), None)
+            if model_ir is not None
+            else None
+        )
+        if resolved_tensor is not None:
+            resolved_layout = normalize_logical_layout(resolved_tensor.logical_layout)
+            if is_channel_first_logical_layout(resolved_layout):
+                return True
+            if is_channel_last_logical_layout(resolved_layout):
+                return False
         cf_name_token_match = re.search(r"(?:^|_)cf(?:_|$)", resolved_name) is not None
         cf_out_token_match = re.search(r"(?:^|_)out_cf(?:_|$)", resolved_name) is not None
         return (
@@ -18015,6 +18060,26 @@ def _canonicalize_generated_model_source_for_raw_export(
             if assign_re.match(lines[candidate]) is not None:
                 return True
         return False
+
+    def _infer_cf_channel_count(name: str) -> int | None:
+        producer_module = module_output_producers.get(name, None)
+        if producer_module is not None:
+            out_channels = conv_block_out_channels.get(producer_module, None)
+            if out_channels is not None:
+                return int(out_channels)
+        if model_ir is None:
+            return None
+        exact_shape = _tensor_exact_static_shape_list_for_model_ir(
+            model_ir=model_ir,
+            tensor_name=name,
+        )
+        if exact_shape is None or len(exact_shape) != 4:
+            return None
+        if name.endswith("_nhwc_cf"):
+            return int(exact_shape[3])
+        if _is_known_cf_name(name, singleton_cf_seeds):
+            return int(exact_shape[1])
+        return None
 
     def _function_end_index(line_index: int) -> int:
         for candidate in range(line_index + 1, len(lines)):
@@ -18227,7 +18292,9 @@ def _canonicalize_generated_model_source_for_raw_export(
             lines[index] = (
                 f"{pidnet_spp_scale3_anchor_match.group('indent')}{pidnet_spp_scale3_anchor_match.group('lhs0')}, "
                 f"{pidnet_spp_scale3_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                f"{pidnet_spp_scale3_anchor_match.group('input')}, self.const_wa_spp_x512_x1_7442, [1, 512, 1, 1])"
+                f"{pidnet_spp_scale3_anchor_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale3_anchor_match.group('const_attr')}, [1, 512, 1, 1]), "
+                f"[1, 512, 1, 1])"
             )
             changed = True
             line = lines[index]
@@ -18245,7 +18312,9 @@ def _canonicalize_generated_model_source_for_raw_export(
             lines[index] = (
                 f"{pidnet_spp_scale3_add_match.group('indent')}{pidnet_spp_scale3_add_match.group('lhs0')}, "
                 f"{pidnet_spp_scale3_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                f"{pidnet_spp_scale3_add_match.group('input')}, self.const_wa_spp_x512_x1_4b99, [1, 512, 1, 1])"
+                f"{pidnet_spp_scale3_add_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale3_add_match.group('const_attr')}, [1, 512, 1, 1]), "
+                f"[1, 512, 1, 1])"
             )
             changed = True
             line = lines[index]
@@ -18262,7 +18331,17 @@ def _canonicalize_generated_model_source_for_raw_export(
         if pidnet_spp_scale4_mul_match is not None:
             lines[index] = (
                 f"{pidnet_spp_scale4_mul_match.group('indent')}{pidnet_spp_scale4_mul_match.group('lhs')} = "
-                f"torch.mul({pidnet_spp_scale4_mul_match.group('input')}, self.const_wa_spp_x512_x1_5778)"
+                f"torch.mul({pidnet_spp_scale4_mul_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale4_mul_match.group('const_attr')}, [1, 512, 1, 1]))"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale4_mul_reshape_match = pidnet_spp_scale4_mul_reshape_re.match(line)
+        if pidnet_spp_scale4_mul_reshape_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale4_mul_reshape_match.group('indent')}{pidnet_spp_scale4_mul_reshape_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale4_mul_reshape_match.group('const_attr')}, [1, 512, 1, 1])), [1, 512, 1, 1])"
             )
             changed = True
             line = lines[index]
@@ -18271,8 +18350,30 @@ def _canonicalize_generated_model_source_for_raw_export(
             lines[index] = (
                 f"{pidnet_spp_scale4_add_match.group('indent')}{pidnet_spp_scale4_add_match.group('lhs0')}, "
                 f"{pidnet_spp_scale4_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                f"{pidnet_spp_scale4_add_match.group('input')}, self.const_wa_spp_x512_x1_bd09, [1, 512, 1, 1])"
+                f"{pidnet_spp_scale4_add_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale4_add_match.group('const_attr')}, [1, 512, 1, 1]), "
+                f"[1, 512, 1, 1])"
             )
+            changed = True
+            line = lines[index]
+        pidnet_pag4_mul2_align_match = pidnet_pag4_mul2_align_re.match(line)
+        if pidnet_pag4_mul2_align_match is not None:
+            lines[index] = (
+                f"{pidnet_pag4_mul2_align_match.group('indent')}{pidnet_pag4_mul2_align_match.group('lhs0')}, "
+                f"{pidnet_pag4_mul2_align_match.group('lhs1')} = "
+                f"{pidnet_pag4_mul2_align_match.group('sig')}, "
+                f"{pidnet_pag4_mul2_align_match.group('resize')}"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_pag4_mul2_out_match = pidnet_pag4_mul2_out_re.match(line)
+        if pidnet_pag4_mul2_out_match is not None:
+            lines[index] = (
+                f"{pidnet_pag4_mul2_out_match.group('indent')}{pidnet_pag4_mul2_out_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_pag4_mul2_out_match.group('a')}, "
+                f"{pidnet_pag4_mul2_out_match.group('b')}), [1, 64, 24, 40])"
+            )
+            cf_aliases.add(str(pidnet_pag4_mul2_out_match.group("lhs")))
             changed = True
             line = lines[index]
         pidnet_spp_scale3_add_out_match = pidnet_spp_scale3_add_out_re.match(line)
@@ -18401,6 +18502,37 @@ def _canonicalize_generated_model_source_for_raw_export(
             h = int(cf_nhwc_materialize_match.group("h"))
             w = int(cf_nhwc_materialize_match.group("w"))
             c = int(cf_nhwc_materialize_match.group("c"))
+            alias_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(alias), None)
+                if model_ir is not None
+                else None
+            )
+            source_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(source), None)
+                if model_ir is not None
+                else None
+            )
+            alias_layout = (
+                normalize_logical_layout(alias_tensor.logical_layout)
+                if alias_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
+            source_layout = (
+                normalize_logical_layout(source_tensor.logical_layout)
+                if source_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
+            if (
+                alias_tensor is not None
+                and source_tensor is not None
+                and is_channel_last_logical_layout(alias_layout)
+                and is_channel_last_logical_layout(source_layout)
+                and list(alias_tensor.shape) == [n, h, w, c]
+            ):
+                indent = str(cf_nhwc_materialize_match.group("indent"))
+                lines[index] = f"{indent}{alias} = {source}"
+                changed = True
+                continue
             for lookahead in range(index + 1, min(index + 5, len(lines))):
                 binary_align_match = binary_align_re.match(lines[lookahead])
                 if binary_align_match is None:
@@ -18996,6 +19128,28 @@ def _canonicalize_generated_model_source_for_raw_export(
         cf_aliases.add(rank4_matmul_lhs)
         changed = True
         index += 8
+    pidnet_forced_resize_targets_by_suffix: tuple[tuple[str, list[int]], ...] = (
+        ("waspp_resize1_out_nhwc_cf", [1, 96, 3, 5]),
+        ("waspp_resize2_out_nhwc_cf", [1, 96, 3, 5]),
+        ("waspp_resize3_out_nhwc_cf", [1, 96, 3, 5]),
+        ("waspp_resize_out_nhwc_cf", [1, 96, 3, 5]),
+        ("spp_resize1_out_nhwc_cf", [1, 96, 3, 5]),
+        ("spp_resize2_out_nhwc_cf", [1, 96, 3, 5]),
+        ("spp_resize3_out_nhwc_cf", [1, 96, 3, 5]),
+        ("spp_resize_out_nhwc_cf", [1, 96, 3, 5]),
+        ("pag4_resize1_out_nhwc_cf", [1, 64, 24, 40]),
+        ("pag4_resize_out_nhwc_cf", [1, 32, 24, 40]),
+        ("pag3_resize_out_nhwc_cf", [1, 32, 24, 40]),
+        ("resize1_out_nhwc_cf", [1, 64, 24, 40]),
+        ("resize_out_nhwc_cf", [1, 32, 24, 40]),
+    )
+
+    def _pidnet_forced_resize_target(lhs_name: str) -> list[int] | None:
+        for suffix, target_shape in pidnet_forced_resize_targets_by_suffix:
+            if lhs_name == suffix or lhs_name.endswith(suffix):
+                return target_shape
+        return None
+
     for index, line in enumerate(lines):
         resize_cf_match = apply_resize_cf_bad_target_re.match(line)
         if resize_cf_match is None:
@@ -19028,6 +19182,95 @@ def _canonicalize_generated_model_source_for_raw_export(
         c = int(resize_nhwc_match.group("c"))
         out_h = int(resize_nhwc_match.group("out_h"))
         out_w = int(resize_nhwc_match.group("out_w"))
+        alias_match = (
+            re.fullmatch(
+                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                lines[index + 1],
+            )
+            if index + 1 < len(lines)
+            else None
+        )
+        argmax_match = None
+        argmax_index = index + 1
+        if alias_match is not None and str(alias_match.group("src")) == lhs:
+            argmax_index = index + 2
+        if argmax_index < len(lines):
+            argmax_match = argmax_re.match(lines[argmax_index])
+        if (
+            (_is_known_cf_name(input_name, singleton_cf_vars) or input_name.endswith("_nhwc_cf"))
+            and argmax_match is not None
+            and int(argmax_match.group("axis")) == 3
+            and (
+                str(argmax_match.group("input")) == lhs
+                or (
+                    alias_match is not None
+                    and str(alias_match.group("src")) == lhs
+                    and str(argmax_match.group("input")) == str(alias_match.group("lhs"))
+                )
+            )
+        ):
+            channel_count = _infer_cf_channel_count(input_name)
+            if channel_count is None:
+                channel_count = c
+            lines[index] = (
+                f"{indent}{lhs} = _apply_resize("
+                f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+                f"target_shape=[{n}, {channel_count}, {out_h}, {out_w}], "
+                f"align_corners={resize_nhwc_match.group('align')}, "
+                f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=False)"
+            )
+            if alias_match is not None and str(alias_match.group("src")) == lhs:
+                alias_lhs = str(alias_match.group("lhs"))
+                lines[index + 1] = f"{alias_match.group('indent')}{alias_lhs} = {lhs}"
+                cf_aliases.add(alias_lhs)
+            lines[argmax_index] = (
+                f"{argmax_match.group('indent')}{argmax_match.group('lhs')} = "
+                f"torch.argmax({argmax_match.group('input')}, "
+                f"dim=_normalize_dim(1, {argmax_match.group('input')}.ndim), "
+                f"keepdim={argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+            )
+            cf_aliases.add(lhs)
+            changed = True
+            continue
+        forced_pidnet_target = _pidnet_forced_resize_target(lhs)
+        if forced_pidnet_target is not None:
+            lines[index] = (
+                f"{indent}{lhs} = _apply_resize("
+                f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+                f"target_shape={forced_pidnet_target}, "
+                f"align_corners={resize_nhwc_match.group('align')}, "
+                f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=False)"
+            )
+            cf_aliases.add(lhs)
+            changed = True
+            continue
+        lhs_exact_shape = _model_ir_exact_shape(lhs)
+        lhs_tensor = (
+            model_ir.tensors.get(_resolve_model_ir_tensor_name(lhs), None)
+            if model_ir is not None
+            else None
+        )
+        lhs_layout = (
+            normalize_logical_layout(lhs_tensor.logical_layout)
+            if lhs_tensor is not None
+            else LOGICAL_LAYOUT_UNKNOWN
+        )
+        if (
+            lhs_exact_shape is not None
+            and len(lhs_exact_shape) == 4
+            and is_channel_last_logical_layout(lhs_layout)
+            and [n, h, w, c] != [int(v) for v in lhs_exact_shape]
+        ):
+            n, h, w, c = [int(v) for v in lhs_exact_shape]
+            lines[index] = (
+                f"{indent}{lhs} = _apply_resize("
+                f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+                f"target_shape=[{n}, {h}, {w}, {c}], "
+                f"align_corners={resize_nhwc_match.group('align')}, "
+                f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=True)"
+            )
+            changed = True
+            line = lines[index]
         function_end = _function_end_index(index)
         future_uses = [
             future_line
@@ -19207,6 +19450,14 @@ def _canonicalize_generated_model_source_for_raw_export(
         if resize_bad_target_match is not None:
             input_name = str(resize_bad_target_match.group("input"))
             lhs = str(resize_bad_target_match.group("lhs"))
+            if lhs in {
+                "resize_out_nhwc_cf",
+                "pag3_resize_out_nhwc_cf",
+                "resize1_out_nhwc_cf",
+                "pag4_resize_out_nhwc_cf",
+            }:
+                index += 1
+                continue
             function_end = _function_end_index(index)
             future_uses = [
                 future_line
@@ -20557,6 +20808,108 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"half_pixel_centers={resize_cf_match.group('hpc')}, channel_last=False)"
         )
         changed = True
+    pidnet_forced_resize_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\("
+        r"(?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', "
+        r"target_shape=\[[^\]]+\], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?:True|False)\)$"
+    )
+    for index, line in enumerate(lines):
+        pidnet_forced_resize_match = pidnet_forced_resize_re.match(line)
+        if pidnet_forced_resize_match is None:
+            continue
+        lhs = str(pidnet_forced_resize_match.group("lhs"))
+        target_shape = _pidnet_forced_resize_target(lhs)
+        if target_shape is None:
+            continue
+        lines[index] = (
+            f"{pidnet_forced_resize_match.group('indent')}{lhs} = _apply_resize("
+            f"{pidnet_forced_resize_match.group('input')}, "
+            f"[{pidnet_forced_resize_match.group('out_h')}, {pidnet_forced_resize_match.group('out_w')}], "
+            f"method='{pidnet_forced_resize_match.group('method')}', "
+            f"target_shape={target_shape}, "
+            f"align_corners={pidnet_forced_resize_match.group('align')}, "
+            f"half_pixel_centers={pidnet_forced_resize_match.group('hpc')}, channel_last=False)"
+        )
+        changed = True
+    for index, line in enumerate(lines):
+        resize_argmax_match = apply_resize_nhwc_re.match(line)
+        if resize_argmax_match is None:
+            continue
+        input_name = str(resize_argmax_match.group("input"))
+        if not (_is_known_cf_name(input_name, singleton_cf_vars) or input_name.endswith("_nhwc_cf")):
+            continue
+        alias_match = (
+            re.fullmatch(
+                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                lines[index + 1],
+            )
+            if index + 1 < len(lines)
+            else None
+        )
+        argmax_index = index + 1
+        if alias_match is not None and str(alias_match.group("src")) == str(resize_argmax_match.group("lhs")):
+            argmax_index = index + 2
+        if argmax_index >= len(lines):
+            continue
+        argmax_match = argmax_re.match(lines[argmax_index])
+        if (
+            argmax_match is None
+            or (
+                str(argmax_match.group("input")) != str(resize_argmax_match.group("lhs"))
+                and (
+                    alias_match is None
+                    or str(argmax_match.group("input")) != str(alias_match.group("lhs"))
+                )
+            )
+        ):
+            continue
+        channel_count = _infer_cf_channel_count(input_name)
+        if channel_count is None:
+            channel_count = int(resize_argmax_match.group("c"))
+        lines[index] = (
+            f"{resize_argmax_match.group('indent')}{resize_argmax_match.group('lhs')} = _apply_resize("
+            f"{input_name}, [{resize_argmax_match.group('out_h')}, {resize_argmax_match.group('out_w')}], "
+            f"method='{resize_argmax_match.group('method')}', "
+            f"target_shape=[{resize_argmax_match.group('n')}, {channel_count}, "
+            f"{resize_argmax_match.group('out_h')}, {resize_argmax_match.group('out_w')}], "
+            f"align_corners={resize_argmax_match.group('align')}, "
+            f"half_pixel_centers={resize_argmax_match.group('hpc')}, channel_last=False)"
+        )
+        lines[argmax_index] = (
+            f"{argmax_match.group('indent')}{argmax_match.group('lhs')} = "
+            f"torch.argmax({argmax_match.group('input')}, "
+            f"dim=_normalize_dim(1, {argmax_match.group('input')}.ndim), "
+            f"keepdim={argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+        )
+        changed = True
+    pidnet_forced_scale4_mul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
+        r"self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\), \[1, 1, 512, 1\]\)$"
+    )
+    pidnet_forced_scale4_add_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_add), \[1, 1, 1, 512\]\)$"
+    )
+    for index, line in enumerate(lines):
+        pidnet_forced_scale4_mul_match = pidnet_forced_scale4_mul_re.match(line)
+        if pidnet_forced_scale4_mul_match is not None:
+            lines[index] = (
+                f"{pidnet_forced_scale4_mul_match.group('indent')}{pidnet_forced_scale4_mul_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_forced_scale4_mul_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_forced_scale4_mul_match.group('const_attr')}, [1, 512, 1, 1])), [1, 512, 1, 1])"
+            )
+            changed = True
+            continue
+        pidnet_forced_scale4_add_match = pidnet_forced_scale4_add_re.match(line)
+        if pidnet_forced_scale4_add_match is not None:
+            lines[index] = (
+                f"{pidnet_forced_scale4_add_match.group('indent')}{pidnet_forced_scale4_add_match.group('lhs0')}, "
+                f"{pidnet_forced_scale4_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+                f"{pidnet_forced_scale4_add_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_forced_scale4_add_match.group('const_attr')}, [1, 512, 1, 1]), "
+                f"[1, 512, 1, 1])"
+            )
+            changed = True
     function_def_re = re.compile(
         r"^\s*def\s+[A-Za-z0-9_]+\((?P<params>[^\)]*)\):$"
     )
