@@ -350,6 +350,124 @@ def test_canonicalize_generated_model_source_restores_nhwc_materialize_for_chann
     assert "x = x_cf" not in rewritten
 
 
+def test_canonicalize_generated_model_source_rewrites_direct_torch_cat_after_cf_resize(tmp_path) -> None:
+    package_dir = tmp_path / "direct_cat_after_resize_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_0(self, skip_cf: torch.Tensor, gate_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize_in_nhwc = _align_tensor_to_target_shape(torch.mul(skip_cf, gate_cf), [1, 180, 320, 32])",
+                "        resize_out_nhwc = _apply_resize(resize_in_nhwc, [180, 320], method='bilinear', target_shape=[1, 180, 320, 32], align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        return resize_out_nhwc",
+                "",
+                "    def _forward_stage_1(self, other_cf: torch.Tensor, resize_out_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        out = torch.cat([other_cf, resize_out_nhwc], dim=1)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="direct_cat_after_resize")
+    model_ir.tensors["resize_in_nhwc"] = TensorIR(
+        name="resize_in_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 32],
+        shape_signature=[1, 180, 320, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["resize_out_nhwc"] = TensorIR(
+        name="resize_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 32],
+        shape_signature=[1, 180, 320, 32],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize_in_nhwc = _align_tensor_to_target_shape(torch.mul(skip_cf, gate_cf), [1, 32, 180, 320])"
+        in rewritten
+    )
+    assert (
+        "resize_out_nhwc = _apply_resize(resize_in_nhwc, [180, 320], method='bilinear', "
+        "target_shape=[1, 32, 180, 320], align_corners=True, half_pixel_centers=False, channel_last=False)"
+        in rewritten
+    )
+    assert "out = torch.cat([other_cf, resize_out_nhwc], dim=1)" in rewritten
+
+
+def test_canonicalize_generated_model_source_restores_rank3_reshape_materialize_for_channel_last_rank4_source(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "rank3_reshape_materialize_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv6_out: torch.Tensor) -> torch.Tensor:",
+                "        in31 = torch.reshape(cv6_out, [1, 66, 256])",
+                "        return in31",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="rank3_reshape_materialize")
+    model_ir.tensors["cv6_out_nhwc"] = TensorIR(
+        name="cv6_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 1, 66, 256],
+        shape_signature=[1, 1, 66, 256],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["input.31"] = TensorIR(
+        name="input.31",
+        dtype="FLOAT32",
+        shape=[1, 66, 256],
+        shape_signature=[1, 66, 256],
+        logical_layout="NCW",
+    )
+    model_ir.tensors["shape"] = TensorIR(
+        name="shape",
+        dtype="INT32",
+        shape=[3],
+        shape_signature=[3],
+        data=np.asarray([1, 66, 256], dtype=np.int32),
+        logical_layout="SCALAR_OR_VECTOR",
+    )
+    model_ir.inputs = ["cv6_out_nhwc"]
+    model_ir.outputs = ["input.31"]
+    model_ir.operators = [
+        OperatorIR(
+            op_type="RESHAPE",
+            inputs=["cv6_out_nhwc", "shape"],
+            outputs=["input.31"],
+            options={"newShape": [1, 66, 256]},
+        )
+    ]
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "in31 = torch.reshape(_align_tensor_to_target_shape(cv6_out.permute(0, 2, 3, 1).contiguous(), [1, 1, 66, 256]), [1, 66, 256])"
+        in rewritten
+    )
+    assert "in31 = torch.reshape(cv6_out, [1, 66, 256])" not in rewritten
+
+
 def test_target_shape_values_keep_internal_channel_last_tensor_shape() -> None:
     model_ir = ModelIR(name="internal_channel_last_target_shape")
     model_ir.inputs = ["x"]
@@ -7808,6 +7926,11 @@ def test_export_pytorch_package_generates_native_ts_ad_model_package_when_model_
     assert "cv2_in_nhwc = torch.reshape(cv2_cv1_d_in_nchw2_d.permute(0, 2, 3, 1).contiguous(), [1, 1, 64, 1])" not in model_source
     assert "self.conv_block_0(cv2_in_nhwc.permute(0, 3, 1, 2).contiguous())" not in model_source
     assert "cv2_in = torch.reshape(onnx_rs0, [1, 1, 1, 64])" in model_source
+    assert (
+        "in31 = torch.reshape(_align_tensor_to_target_shape(cv6_out_cf.permute(0, 2, 3, 1).contiguous(), [1, 1, 66, 256]), [1, 66, 256])"
+        in model_source
+    )
+    assert "in31 = torch.reshape(cv6_out_cf, [1, 66, 256])" not in model_source
     assert "pad=[4, 4, 0, 0]" in model_source
     assert "target_shape=[1, 1, 68, 128], fallback_shape=[1, 1, 68, 128], target_logical_layout='NHWC'" in model_source
     assert "self.const_onnx_mat_mul74_tr_last_two66_x2" in model_source

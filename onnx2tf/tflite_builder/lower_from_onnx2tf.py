@@ -3089,6 +3089,12 @@ def _repair_rank4_binary_singleton_broadcast_layout_mismatch(model_ir: ModelIR) 
             def _singleton_nchw(shape: List[int]) -> bool:
                 return int(shape[1]) == 1
 
+            def _already_broadcasts_to_output(lhs_shape: List[int], rhs_shape: List[int], output_shape: List[int]) -> bool:
+                try:
+                    return list(np.broadcast_shapes(tuple(lhs_shape), tuple(rhs_shape))) == [int(v) for v in list(output_shape)]
+                except Exception:
+                    return False
+
             def _insert_transpose_adapter(input_index: int, source_name: str, source_tensor: TensorIR, target_shape: List[int]) -> None:
                 perm_name = _make_unique_tensor_name(f"{source_name}_singleton_layout_fix_perm")
                 adapted_name = _make_unique_tensor_name(f"{source_name}_singleton_layout_fix")
@@ -3167,6 +3173,8 @@ def _repair_rank4_binary_singleton_broadcast_layout_mismatch(model_ir: ModelIR) 
                 and s1[2] == s0[3]
                 and sout == [int(s0[0]), int(s1[3]), int(s0[2]), int(s0[3])]
             ):
+                if _already_broadcasts_to_output(s0, s1, sout):
+                    continue
                 _insert_transpose_adapter(1, str(op.inputs[1]), t1, sout)
                 repaired += 1
                 changed = True
@@ -3178,6 +3186,8 @@ def _repair_rank4_binary_singleton_broadcast_layout_mismatch(model_ir: ModelIR) 
                 and s0[2] == s1[3]
                 and sout == [int(s1[0]), int(s0[3]), int(s1[2]), int(s1[3])]
             ):
+                if _already_broadcasts_to_output(s0, s1, sout):
+                    continue
                 _insert_transpose_adapter(0, str(op.inputs[0]), t0, sout)
                 repaired += 1
                 changed = True
@@ -3189,6 +3199,8 @@ def _repair_rank4_binary_singleton_broadcast_layout_mismatch(model_ir: ModelIR) 
                 and s1[2] == s0[3]
                 and sout == s1
             ):
+                if _already_broadcasts_to_output(s0, s1, sout):
+                    continue
                 _insert_reshape_adapter(0, str(op.inputs[0]), t0, [int(s0[0]), int(s0[2]), int(s0[3]), 1])
                 repaired += 1
                 changed = True
@@ -3200,6 +3212,8 @@ def _repair_rank4_binary_singleton_broadcast_layout_mismatch(model_ir: ModelIR) 
                 and s0[2] == s1[3]
                 and sout == s0
             ):
+                if _already_broadcasts_to_output(s0, s1, sout):
+                    continue
                 _insert_reshape_adapter(1, str(op.inputs[1]), t1, [int(s1[0]), int(s1[2]), int(s1[3]), 1])
                 repaired += 1
                 changed = True

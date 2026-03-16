@@ -38166,6 +38166,43 @@ def test_repair_rank4_binary_singleton_broadcast_layout_mismatch_inserts_transpo
     assert [str(v) for v in list(mul_op.inputs)] == ["gate_nchw", adapted_name]
 
 
+def test_repair_rank4_binary_singleton_broadcast_layout_mismatch_skips_existing_broadcast() -> None:
+    model_ir = ModelIR(name="singleton_binary_broadcast_passthrough")
+    model_ir.tensors["bias_nchw"] = TensorIR(
+        name="bias_nchw",
+        dtype="FLOAT32",
+        shape=[1, 1, 1, 64],
+        shape_signature=[1, 1, 1, 64],
+    )
+    model_ir.tensors["activations_nhwc"] = TensorIR(
+        name="activations_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 1, 64, 64],
+        shape_signature=[1, 1, 64, 64],
+    )
+    model_ir.tensors["add_out"] = TensorIR(
+        name="add_out",
+        dtype="FLOAT32",
+        shape=[1, 1, 64, 64],
+        shape_signature=[1, 1, 64, 64],
+    )
+    model_ir.inputs = ["bias_nchw", "activations_nhwc"]
+    model_ir.outputs = ["add_out"]
+    model_ir.operators = [
+        OperatorIR(
+            op_type="ADD",
+            inputs=["bias_nchw", "activations_nhwc"],
+            outputs=["add_out"],
+        ),
+    ]
+
+    stats = _repair_rank4_binary_singleton_broadcast_layout_mismatch(model_ir)
+
+    assert stats["repaired_rank4_binary_singleton_broadcast_layout_mismatch"] == 0
+    assert [str(op.op_type) for op in model_ir.operators] == ["ADD"]
+    assert set(model_ir.tensors) == {"bias_nchw", "activations_nhwc", "add_out"}
+
+
 def test_constant_input_average_pool_is_folded_into_div_denominator() -> None:
     model_ir = ModelIR(name="constant_pool_div_fold")
     model_ir.tensors["x"] = TensorIR(
