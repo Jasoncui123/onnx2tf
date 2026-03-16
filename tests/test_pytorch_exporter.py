@@ -7596,6 +7596,8 @@ def test_export_pytorch_package_generates_native_ts_ad_model_package_when_model_
     assert "pad=[4, 4, 0, 0]" in model_source
     assert "target_shape=[1, 1, 68, 128], fallback_shape=[1, 1, 68, 128], target_logical_layout='NHWC'" in model_source
     assert "self.const_onnx_mat_mul74_tr_last_two66_x2" in model_source
+    assert "torch.as_tensor([0.05643776059150696, -0.00908423587679863]" not in model_source
+    assert "self.const_inline_literal_0" in model_source
 
     torchscript_path = export_torchscript_from_generated_package(package_dir=package_path)
     dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
@@ -7670,6 +7672,10 @@ def test_export_pytorch_package_generates_native_ts_ad_model_package_when_model_
     ]
     assert any(
         node.op == "call_function" and str(node.target) == "aten.matmul.default"
+        for node in exported_program.module().graph.nodes
+    )
+    assert not any(
+        node.op == "call_function" and str(node.target) == "aten.lift_fresh_copy.default"
         for node in exported_program.module().graph.nodes
     )
     matmul_nodes = [
@@ -8181,8 +8187,6 @@ def test_export_pytorch_package_generates_native_pidnet_package_when_model_is_av
     assert "load_generated_model_package" not in model_source
     assert "torch.argmax(" in model_source
     assert "_apply_pool2d(" in model_source or "torch.mean(" in model_source
-    assert "spp_concat4_out0 = torch.cat([spp_add_out0, spp_add1_out0, spp_add2_out0, spp_add3_out0], dim=1)" in model_source
-    assert "spp_concat5_out0 = torch.cat([sppscale0_scale02_cv_out_cf, sppscale_processscale_process2_cv_out_cf], dim=1)" in model_source
     assert "self.const_wa_spp_scale1_scale1_0_AveragePool_exclude_pad_mask_pool.permute(*(0, 3, 1, 2)).contiguous()" not in model_source
     assert "self.const_wa_spp_scale1_scale1_1_BatchNormalization_bn_mul.permute(*(0, 3, 1, 2)).contiguous()" not in model_source
     assert "self.const_wa_spp_scale1_scale1_1_BatchNormalization_bn_add.permute(*(0, 3, 1, 2)).contiguous()" not in model_source
