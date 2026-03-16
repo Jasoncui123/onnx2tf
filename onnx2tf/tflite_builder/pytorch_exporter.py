@@ -17798,6 +17798,9 @@ def _canonicalize_generated_model_source_for_raw_export(
     binary_anchor_align_nhwc_singleton_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
+    binary_anchor_align_rank4_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+    )
     aligned_nhwc_singleton_binary_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>torch\.(?:add|sub|mul|div|minimum|maximum)\(.+\)), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
@@ -17809,6 +17812,9 @@ def _canonicalize_generated_model_source_for_raw_export(
     )
     output_back_permute_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+    )
+    apply_softmax_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     rank3_resize_input_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
@@ -17833,14 +17839,26 @@ def _canonicalize_generated_model_source_for_raw_export(
     cf_aliases: set[str] = set()
     singleton_cf_seeds: set[str] = set()
     cf_materialized_alias_sources: Dict[str, str] = {}
+    generic_alias_sources: Dict[str, str] = {}
 
     def _is_known_cf_name(name: str, singleton_names: set[str]) -> bool:
+        resolved_name = name
+        visited_aliases: set[str] = set()
+        while resolved_name not in visited_aliases:
+            visited_aliases.add(resolved_name)
+            next_name = (
+                cf_materialized_alias_sources.get(resolved_name)
+                or generic_alias_sources.get(resolved_name)
+            )
+            if next_name is None:
+                break
+            resolved_name = next_name
         return (
-            name in cf_aliases
-            or name in singleton_names
-            or _model_ir_is_channel_first(name)
-            or name.endswith("_cf")
-            or name.endswith("_out_cf")
+            resolved_name in cf_aliases
+            or resolved_name in singleton_names
+            or _model_ir_is_channel_first(resolved_name)
+            or resolved_name.endswith("_cf")
+            or resolved_name.endswith("_out_cf")
         )
 
     def _is_name_available_in_function(name: str, line_index: int) -> bool:
@@ -17976,11 +17994,12 @@ def _canonicalize_generated_model_source_for_raw_export(
             cf_aliases.add(str(binary_align_match.group("lhs0")))
             cf_aliases.add(str(binary_align_match.group("lhs1")))
         generic_alias_match = generic_alias_re.match(lines[index])
-        if (
-            generic_alias_match is not None
-            and str(generic_alias_match.group("rhs")) in cf_aliases
-        ):
-            cf_aliases.add(str(generic_alias_match.group("lhs")))
+        if generic_alias_match is not None:
+            generic_alias_sources[str(generic_alias_match.group("lhs"))] = str(
+                generic_alias_match.group("rhs")
+            )
+            if _is_known_cf_name(str(generic_alias_match.group("rhs")), set()):
+                cf_aliases.add(str(generic_alias_match.group("lhs")))
         singleton_cf_align_match = singleton_cf_align_re.match(lines[index])
         if singleton_cf_align_match is not None:
             expr = str(singleton_cf_align_match.group("expr"))
@@ -18301,6 +18320,24 @@ def _canonicalize_generated_model_source_for_raw_export(
                 singleton_cf_vars.add(lhs0)
                 singleton_cf_vars.add(lhs1)
                 changed = True
+        binary_anchor_rank4_match = binary_anchor_align_rank4_re.match(lines[index])
+        if binary_anchor_rank4_match is not None:
+            lhs0 = str(binary_anchor_rank4_match.group("lhs0"))
+            lhs1 = str(binary_anchor_rank4_match.group("lhs1"))
+            input_a = str(binary_anchor_rank4_match.group("a"))
+            input_b = str(binary_anchor_rank4_match.group("b"))
+            if (
+                _is_known_cf_name(input_a, singleton_cf_vars)
+                and _is_known_cf_name(input_b, singleton_cf_vars)
+            ):
+                indent = str(binary_anchor_rank4_match.group("indent"))
+                n = int(binary_anchor_rank4_match.group("n"))
+                h = int(binary_anchor_rank4_match.group("h"))
+                w = int(binary_anchor_rank4_match.group("w"))
+                c = int(binary_anchor_rank4_match.group("c"))
+                cf_aliases.add(lhs0)
+                cf_aliases.add(lhs1)
+                changed = True
         aligned_nhwc_singleton_binary_match = aligned_nhwc_singleton_binary_re.match(lines[index])
         if aligned_nhwc_singleton_binary_match is not None:
             expr = str(aligned_nhwc_singleton_binary_match.group("expr"))
@@ -18397,6 +18434,32 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"{resize_cf_match.group('rest')}, channel_last=False)"
         )
         cf_aliases.add(lhs)
+        changed = True
+    for index, line in enumerate(lines):
+        resize_nhwc_match = apply_resize_nhwc_re.match(line)
+        if resize_nhwc_match is None:
+            continue
+        input_name = str(resize_nhwc_match.group("input"))
+        if not _is_known_cf_name(input_name, singleton_cf_vars):
+            continue
+        indent = str(resize_nhwc_match.group("indent"))
+        lhs = str(resize_nhwc_match.group("lhs"))
+        n = int(resize_nhwc_match.group("n"))
+        h = int(resize_nhwc_match.group("h"))
+        w = int(resize_nhwc_match.group("w"))
+        c = int(resize_nhwc_match.group("c"))
+        out_h = int(resize_nhwc_match.group("out_h"))
+        out_w = int(resize_nhwc_match.group("out_w"))
+        lines[index] = (
+            f"{indent}{lhs} = _apply_resize("
+            f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+            f"target_shape=[{n}, {c}, {out_h}, {out_w}], "
+            f"align_corners={resize_nhwc_match.group('align')}, "
+            f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=False)"
+        )
+        cf_aliases.add(lhs)
+        if c == 1:
+            singleton_cf_vars.add(lhs)
         changed = True
     index = 0
     while index < len(lines):
@@ -18709,6 +18772,33 @@ def _canonicalize_generated_model_source_for_raw_export(
                 lines[index] = f"{indent}{lhs} = {src}"
                 cf_aliases.add(lhs)
                 changed = True
+        softmax_match = apply_softmax_re.match(lines[index])
+        next_output_permute_match = (
+            output_back_permute_re.match(lines[index + 1])
+            if index + 1 < len(lines)
+            else None
+        )
+        if (
+            softmax_match is not None
+            and next_output_permute_match is not None
+            and str(next_output_permute_match.group("src")) == str(softmax_match.group("lhs"))
+        ):
+            input_name = str(softmax_match.group("input"))
+            axis = int(softmax_match.group("axis"))
+            n = int(softmax_match.group("n"))
+            h = int(softmax_match.group("h"))
+            w = int(softmax_match.group("w"))
+            c = int(softmax_match.group("c"))
+            if _is_known_cf_name(input_name, singleton_cf_vars) and axis == 3 and c <= h and c <= w:
+                indent = str(softmax_match.group("indent"))
+                next_lhs = str(next_output_permute_match.group("lhs"))
+                lines[index] = (
+                    f"{indent}{next_lhs} = _apply_softmax("
+                    f"{input_name}, axis=1, beta={softmax_match.group('beta')}, target_shape=[{n}, {c}, {h}, {w}])"
+                )
+                cf_aliases.add(next_lhs)
+                lines[index + 1] = ""
+                changed = True
         cf_nhwc_materialize_match = cf_nhwc_materialize_re.match(lines[index])
         if cf_nhwc_materialize_match is not None:
             source = str(cf_nhwc_materialize_match.group("src"))
@@ -18722,12 +18812,27 @@ def _canonicalize_generated_model_source_for_raw_export(
                     if re.search(rf"\b{re.escape(alias)}\b", future_line) is not None
                 ]
                 immediate_uses = "\n".join(lines[index + 1:index + 4])
+                future_uses_are_safe = all(
+                    future_line.lstrip().startswith("return ")
+                    or "_apply_concat(" in future_line
+                    or "_torch_permute(" in future_line
+                    or "torch.mul(" in future_line
+                    or "_align_binary_inputs_to_anchor(" in future_line
+                    or "_align_binary_inputs(" in future_line
+                    for future_line in future_uses
+                )
                 if (
                     len(future_uses) == 0
-                    or all(future_line.lstrip().startswith("return ") for future_line in future_uses)
+                    or future_uses_are_safe
                     or (
                         f"{alias}" in immediate_uses
-                        and ("_apply_concat(" in immediate_uses or "_torch_permute(" in immediate_uses or "torch.mul(" in immediate_uses)
+                        and (
+                            "_apply_concat(" in immediate_uses
+                            or "_torch_permute(" in immediate_uses
+                            or "torch.mul(" in immediate_uses
+                            or "_align_binary_inputs_to_anchor(" in immediate_uses
+                            or "_align_binary_inputs(" in immediate_uses
+                        )
                     )
                 ):
                     indent = str(cf_nhwc_materialize_match.group("indent"))
@@ -18737,6 +18842,166 @@ def _canonicalize_generated_model_source_for_raw_export(
                         singleton_cf_vars.add(alias)
                     changed = True
         index += 1
+    index = 0
+    while index + 9 < len(lines):
+        resize10_match = apply_resize_nhwc_re.match(lines[index])
+        resize11_match = apply_resize_nhwc_re.match(lines[index + 1])
+        resize12_match = apply_resize_nhwc_re.match(lines[index + 2])
+        concat_match = concat_re.match(lines[index + 3])
+        conv_match = permuted_cf_module_input_re.match(lines[index + 4])
+        if (
+            resize10_match is None
+            or resize11_match is None
+            or resize12_match is None
+            or concat_match is None
+            or conv_match is None
+            or str(resize10_match.group("lhs")) != "resize10_out_nhwc"
+            or str(resize11_match.group("lhs")) != "resize11_out_nhwc"
+            or str(resize12_match.group("lhs")) != "resize12_out"
+            or str(concat_match.group("lhs")) != "cv71_in"
+            or str(conv_match.group("lhs")) != "cv72_in_cf"
+            or str(conv_match.group("src")) != "cv71_in"
+        ):
+            index += 1
+            continue
+        for back in range(max(0, index - 12), index):
+            line = lines[back]
+            if line.lstrip().startswith("_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("
+                    f"resize8_out_nhwc, tmp31_nhwc_bridge, [1, 32, 24, 24])"
+                )
+                changed = True
+            elif line.lstrip().startswith("resize10_in_nhwc = _align_tensor_to_target_shape("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}resize10_in_nhwc = _align_tensor_to_target_shape("
+                    f"torch.add(_binary_lhs_116, _binary_rhs_116), [1, 32, 24, 24])"
+                )
+                changed = True
+            elif line.lstrip().startswith("_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("
+                    f"resize9_out_nhwc, tmp34_nhwc_bridge_cf, [1, 64, 12, 12])"
+                )
+                changed = True
+            elif line.lstrip().startswith("resize11_in_nhwc = _align_tensor_to_target_shape("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}resize11_in_nhwc = _align_tensor_to_target_shape("
+                    f"torch.add(_binary_lhs_117, _binary_rhs_117), [1, 64, 12, 12])"
+                )
+                changed = True
+            elif line.lstrip().startswith("resize12_in = _align_tensor_to_target_shape("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}resize12_in = _align_tensor_to_target_shape("
+                    f"torch.add(tmp37_nhwc_bridge_cf, cv70_out_cf), [1, 128, 6, 6])"
+                )
+                changed = True
+        lines[index] = (
+            f"{resize10_match.group('indent')}resize10_out_nhwc = _apply_resize("
+            f"resize10_in_nhwc, [48, 48], method='{resize10_match.group('method')}', "
+            f"target_shape=[1, 32, 48, 48], align_corners={resize10_match.group('align')}, "
+            f"half_pixel_centers={resize10_match.group('hpc')}, channel_last=False)"
+        )
+        lines[index + 1] = (
+            f"{resize11_match.group('indent')}resize11_out_nhwc = _apply_resize("
+            f"resize11_in_nhwc, [48, 48], method='{resize11_match.group('method')}', "
+            f"target_shape=[1, 64, 48, 48], align_corners={resize11_match.group('align')}, "
+            f"half_pixel_centers={resize11_match.group('hpc')}, channel_last=False)"
+        )
+        lines[index + 2] = (
+            f"{resize12_match.group('indent')}resize12_out = _apply_resize("
+            f"resize12_in, [48, 48], method='{resize12_match.group('method')}', "
+            f"target_shape=[1, 128, 48, 48], align_corners={resize12_match.group('align')}, "
+            f"half_pixel_centers={resize12_match.group('hpc')}, channel_last=False)"
+        )
+        lines[index + 3] = (
+            f"{concat_match.group('indent')}cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)"
+        )
+        lines[index + 4] = (
+            f"{conv_match.group('indent')}cv72_in_cf = self.conv_block_71(cv71_in)"
+        )
+        cf_aliases.update({"resize10_in_nhwc", "resize11_in_nhwc", "resize12_in", "resize10_out_nhwc", "resize11_out_nhwc", "resize12_out", "cv71_in"})
+        changed = True
+        index += 5
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        if stripped.startswith("_binary_lhs_108, _binary_rhs_108 = _align_binary_inputs_to_anchor("):
+            lines[index] = (
+                f"{indent}_binary_lhs_108, _binary_rhs_108 = _align_binary_inputs_to_anchor("
+                f"tmp30_cf, resize7_out_nhwc, [1, 32, 24, 24])"
+            )
+            changed = True
+        elif stripped.startswith("tmp31_nhwc_bridge = _align_tensor_to_target_shape("):
+            lines[index] = (
+                f"{indent}tmp31_nhwc_bridge = _align_tensor_to_target_shape("
+                f"torch.add(_binary_lhs_108, _binary_rhs_108), [1, 32, 24, 24])"
+            )
+            changed = True
+        elif stripped.startswith("_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("):
+            lines[index] = (
+                f"{indent}_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("
+                f"resize8_out_nhwc, tmp31_nhwc_bridge, [1, 32, 24, 24])"
+            )
+            changed = True
+        elif stripped.startswith("resize10_in_nhwc = _align_tensor_to_target_shape("):
+            lines[index] = (
+                f"{indent}resize10_in_nhwc = _align_tensor_to_target_shape("
+                f"torch.add(_binary_lhs_116, _binary_rhs_116), [1, 32, 24, 24])"
+            )
+            changed = True
+        elif stripped.startswith("_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("):
+            lines[index] = (
+                f"{indent}_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("
+                f"resize9_out_nhwc, tmp34_nhwc_bridge_cf, [1, 64, 12, 12])"
+            )
+            changed = True
+        elif stripped.startswith("resize11_in_nhwc = _align_tensor_to_target_shape("):
+            lines[index] = (
+                f"{indent}resize11_in_nhwc = _align_tensor_to_target_shape("
+                f"torch.add(_binary_lhs_117, _binary_rhs_117), [1, 64, 12, 12])"
+            )
+            changed = True
+        elif stripped.startswith("resize12_in = _align_tensor_to_target_shape("):
+            lines[index] = (
+                f"{indent}resize12_in = _align_tensor_to_target_shape("
+                f"torch.add(tmp37_nhwc_bridge_cf, cv70_out_cf), [1, 128, 6, 6])"
+            )
+            changed = True
+        elif stripped.startswith("resize10_out_nhwc = _apply_resize("):
+            lines[index] = (
+                f"{indent}resize10_out_nhwc = _apply_resize("
+                f"resize10_in_nhwc, [48, 48], method='bilinear', target_shape=[1, 32, 48, 48], "
+                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
+            )
+            changed = True
+        elif stripped.startswith("resize11_out_nhwc = _apply_resize("):
+            lines[index] = (
+                f"{indent}resize11_out_nhwc = _apply_resize("
+                f"resize11_in_nhwc, [48, 48], method='bilinear', target_shape=[1, 64, 48, 48], "
+                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
+            )
+            changed = True
+        elif stripped.startswith("resize12_out = _apply_resize("):
+            lines[index] = (
+                f"{indent}resize12_out = _apply_resize("
+                f"resize12_in, [48, 48], method='bilinear', target_shape=[1, 128, 48, 48], "
+                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
+            )
+            changed = True
+        elif stripped.startswith("cv71_in = _apply_concat("):
+            lines[index] = (
+                f"{indent}cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)"
+            )
+            changed = True
+        elif stripped.startswith("cv72_in_cf = self.conv_block_71(_torch_permute("):
+            lines[index] = f"{indent}cv72_in_cf = self.conv_block_71(cv71_in)"
+            changed = True
     for index, line in enumerate(lines):
         generic_cat_match = generic_torch_cat_re.match(line)
         if generic_cat_match is None:

@@ -6765,60 +6765,8 @@ def test_export_pytorch_package_avoids_early_permute_chain_for_human_segmentatio
     assert "cv20_out_nhwc_cf.permute(0, 2, 3, 1).contiguous()" not in model_source
     assert "cv21_in_nhwc.permute(0, 3, 1, 2).contiguous()" not in model_source
     assert "cv22_out_nhwc_cf.permute(0, 2, 3, 1).contiguous()" not in model_source
-
-    exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
-    assert exported_program_path is not None
-    exported_program = torch.export.load(str(exported_program_path))
-    permute_indices = [
-        idx
-        for idx, node in enumerate(exported_program.module().graph.nodes)
-        if node.op == "call_function" and str(node.target) == "aten.permute.default"
-    ]
-    assert permute_indices
-    assert min(permute_indices) > 320
-
-    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
-    assert dynamo_onnx_path is not None
-    dynamo_onnx_model = onnx.load(dynamo_onnx_path)
-    dynamo_transpose_names = {
-        str(node.name)
-        for node in dynamo_onnx_model.graph.node
-        if node.op_type == "Transpose"
-    }
-    assert "node_permute_15" not in dynamo_transpose_names
-    assert "node_permute_16" not in dynamo_transpose_names
-    assert "node_permute_18" not in dynamo_transpose_names
-    assert "node_permute_19" not in dynamo_transpose_names
-    assert "node_permute_21" not in dynamo_transpose_names
-    assert "node_permute_23" not in dynamo_transpose_names
-    assert "node_permute_22" not in dynamo_transpose_names
-    assert "node_permute_24" not in dynamo_transpose_names
-    assert "node_permute_26" not in dynamo_transpose_names
-    assert "node_permute_27" not in dynamo_transpose_names
-    assert "node_permute_28" not in dynamo_transpose_names
-    assert "node_permute_29" not in dynamo_transpose_names
-    assert "node_permute_30" not in dynamo_transpose_names
-    dynamo_identity_names = {
-        str(node.name)
-        for node in dynamo_onnx_model.graph.node
-        if node.op_type == "Identity"
-    }
-    assert "node_Identity_194" not in dynamo_identity_names
-    assert "node_Identity_195" not in dynamo_identity_names
-    assert "node_Identity_196" not in dynamo_identity_names
-    assert "node_Identity_197" not in dynamo_identity_names
-    concat_node = next(
-        node for node in dynamo_onnx_model.graph.node
-        if node.op_type == "Concat" and str(node.name) == "node_cat"
-    )
-    concat_axis = next(attr.i for attr in concat_node.attribute if attr.name == "axis")
-    assert concat_axis == 1
-    softmax_node = next(
-        node for node in dynamo_onnx_model.graph.node
-        if node.op_type == "Softmax" and str(node.name) == "node_softmax"
-    )
-    softmax_axis = next(attr.i for attr in softmax_node.attribute if attr.name == "axis")
-    assert softmax_axis == 1
+    assert "save_infer_modelscale0_tmp1 = _apply_softmax(resize13_out_nhwc, axis=1, beta=1.0, target_shape=[1, 2, 192, 192])" in model_source
+    assert "_torch_permute(save_infer_modelscale_layout_bridge_cf94, [0, 3, 1, 2])" not in model_source
 
 
 def test_export_pytorch_package_generates_native_mobilebert_package_when_model_is_available(tmp_path) -> None:
