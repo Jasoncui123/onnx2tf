@@ -218,6 +218,167 @@ def test_canonicalize_generated_model_source_preserves_rank3_permute_function_ar
     assert "t_7863 = _torch_permute(t_653, [0, 2, 1])" not in rewritten
 
 
+def test_canonicalize_generated_model_source_reorders_scalar_first_mul_for_dynamo(tmp_path) -> None:
+    package_dir = tmp_path / "scalar_first_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        y = torch.mul(1.25, x)",
+                "        z = _align_tensor_to_target_shape(torch.add(0.5, y), [1, 3])",
+                "        return z",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "y = torch.mul(x, 1.25)" in rewritten
+    assert "z = _align_tensor_to_target_shape(torch.add(y, 0.5), [1, 3])" in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_nhwc_materialize_before_rank4_reshape(tmp_path) -> None:
+    package_dir = tmp_path / "nhwc_materialize_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x_cf: torch.Tensor) -> torch.Tensor:",
+                "        x_nhwc = _align_tensor_to_target_shape(x_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])",
+                "        y = torch.reshape(x_nhwc, _resolve_reshape_shape([1, -1, 64], x_nhwc, allow_zero=False))",
+                "        return y",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "x_nhwc = _align_tensor_to_target_shape(x_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])" in rewritten
+    assert "x_nhwc = x_cf" not in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_aligned_nhwc_alias_before_rank4_reshape(tmp_path) -> None:
+    package_dir = tmp_path / "aligned_nhwc_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x_cf: torch.Tensor) -> torch.Tensor:",
+                "        x_nhwc = _align_tensor_to_target_shape(x_cf, [1, 45, 80, 64])",
+                "        y = torch.reshape(x_nhwc, _resolve_reshape_shape([1, -1, 64], x_nhwc, allow_zero=False))",
+                "        return y",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "x_nhwc = _align_tensor_to_target_shape(x_cf, [1, 45, 80, 64])" in rewritten
+    assert "x_nhwc = x_cf" not in rewritten
+
+
+def test_canonicalize_generated_model_source_restores_nhwc_materialize_for_channel_last_alias_before_rank4_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "channel_last_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x_cf: torch.Tensor) -> torch.Tensor:",
+                "        x = x_cf",
+                "        y = torch.reshape(x, _resolve_reshape_shape([1, -1, 64], x, allow_zero=False))",
+                "        return y",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="channel_last_alias_before_rank4_reshape")
+    model_ir.tensors["x_cf"] = TensorIR(
+        name="x_cf",
+        dtype="FLOAT32",
+        shape=[1, 64, 45, 80],
+        shape_signature=[1, 64, 45, 80],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["x"] = TensorIR(
+        name="x",
+        dtype="FLOAT32",
+        shape=[1, 45, 80, 64],
+        shape_signature=[1, 45, 80, 64],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["y"] = TensorIR(
+        name="y",
+        dtype="FLOAT32",
+        shape=[1, 3600, 64],
+        shape_signature=[1, 3600, 64],
+        logical_layout="NWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "x = _align_tensor_to_target_shape(x_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])" in rewritten
+    assert "x = x_cf" not in rewritten
+
+
+def test_target_shape_values_keep_internal_channel_last_tensor_shape() -> None:
+    model_ir = ModelIR(name="internal_channel_last_target_shape")
+    model_ir.inputs = ["x"]
+    model_ir.outputs = ["y"]
+    model_ir.tensors["x"] = TensorIR(
+        name="x",
+        dtype="FLOAT32",
+        shape=[1, 3, 8, 8],
+        shape_signature=[1, 3, 8, 8],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["mid"] = TensorIR(
+        name="mid",
+        dtype="FLOAT32",
+        shape=[1, 4, 10, 3600],
+        shape_signature=[1, 4, 10, 3600],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["y"] = TensorIR(
+        name="y",
+        dtype="FLOAT32",
+        shape=[1, 3, 8, 8],
+        shape_signature=[1, 3, 8, 8],
+        logical_layout="NCHW",
+    )
+
+    assert _target_shape_values_for_model_ir(model_ir=model_ir, tensor_name="mid") == [1, 4, 10, 3600]
+
+
 def _make_add_model() -> onnx.ModelProto:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3])
@@ -7553,6 +7714,30 @@ def test_export_pytorch_package_generates_native_swinir_package_when_model_is_av
     assert "F.pixel_shuffle(" not in model_source
     assert "torch.add(t_1691, self.const_tensor44113_perm0_x6_x64" not in model_source
     assert "torch.add(t_1691, self.const_tensor_44113)" in model_source
+
+
+def test_export_pytorch_package_iat_llie_smoke_inference_when_model_is_available(tmp_path) -> None:
+    model_path = Path("iat_llie_180x320.onnx")
+    if not model_path.exists():
+        pytest.skip("iat_llie_180x320.onnx is not available")
+    model_proto = onnx.load(model_path)
+    model_ir = lower_onnx_to_ir(
+        model_proto,
+        output_file_name="iat_llie_native_codegen_test",
+        show_progress=False,
+    )
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=model_ir,
+        output_folder_path=str(tmp_path / "iat_llie_native_pytorch"),
+    )
+    report = smoke_test_pytorch_package_inference(
+        onnx_graph=model_proto,
+        package_dir=str(package_path),
+        output_report_path=str(tmp_path / "iat_llie_smoke_report.json"),
+        num_samples=1,
+        seed=0,
+    )
+    assert report["inference_pass"] is True
 
 
 def test_export_pytorch_package_avoids_public_bridge_permute_pairs_for_swinir_when_model_is_available(tmp_path) -> None:

@@ -474,6 +474,11 @@ def _target_shape_values_for_model_ir(
     tensor = model_ir.tensors.get(str(tensor_name), None)
     if tensor is None:
         return None
+    public_tensor_names = {
+        str(name) for name in list(model_ir.inputs) + list(model_ir.outputs)
+    }
+    if str(tensor_name) not in public_tensor_names:
+        return [int(v) for v in list(tensor.shape)]
     resolved = _base_target_shape_values_for_model_ir(
         model_ir=model_ir,
         tensor_name=str(tensor_name),
@@ -17694,7 +17699,13 @@ def _canonicalize_generated_model_source_for_raw_export(
             lines.insert(insert_index, suppress_apply_line)
     model_ir_shape_map: Dict[str, List[int]] = {}
     model_ir_cf_names: Set[str] = set()
+    tensor_name_by_var_name: Dict[str, str] = {}
     if model_ir is not None:
+        tensor_var_name_map = _build_tensor_var_name_map(model_ir)
+        tensor_name_by_var_name = {
+            str(var_name): str(tensor_name)
+            for tensor_name, var_name in tensor_var_name_map.items()
+        }
         for tensor_name, tensor in model_ir.tensors.items():
             shape_values = list(getattr(tensor, "shape", []) or [])
             if len(shape_values) > 0 and all(int(v) > 0 for v in shape_values):
@@ -17702,11 +17713,15 @@ def _canonicalize_generated_model_source_for_raw_export(
             if is_channel_first_logical_layout(normalize_logical_layout(tensor.logical_layout)):
                 model_ir_cf_names.add(str(tensor_name))
 
+    def _resolve_model_ir_tensor_name(name: str) -> str:
+        resolved = tensor_name_by_var_name.get(str(name), str(name))
+        return str(resolved)
+
     def _model_ir_exact_shape(name: str) -> List[int] | None:
-        return model_ir_shape_map.get(str(name), None)
+        return model_ir_shape_map.get(_resolve_model_ir_tensor_name(name), None)
 
     def _model_ir_is_channel_first(name: str) -> bool:
-        return str(name) in model_ir_cf_names
+        return _resolve_model_ir_tensor_name(name) in model_ir_cf_names
 
     register_buffer_re = re.compile(
         r"^(?P<indent>\s*)self\.register_buffer\('(?P<name>[A-Za-z0-9_]+)', torch\.zeros\(\[(?P<shape>[0-9, ]+)\], dtype=torch\.(?P<dtype>[A-Za-z0-9_]+)\), persistent=(?P<persistent>True|False)\)$"
@@ -17719,6 +17734,16 @@ def _canonicalize_generated_model_source_for_raw_export(
     )
     scalar_as_tensor_re = re.compile(
         r"torch\.as_tensor\((?P<value>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), dtype=torch\.[A-Za-z0-9_]+, device=_module_device\(self\)\)"
+    )
+    scalar_first_binary_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.(?P<op>add|mul)\("
+        r"(?P<scalar>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), "
+        r"(?P<rhs>.+)\)$"
+    )
+    scalar_first_inline_binary_re = re.compile(
+        r"torch\.(?P<op>add|mul)\("
+        r"(?P<scalar>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), "
+        r"(?P<rhs>[A-Za-z0-9_\.]+)\)"
     )
     tensor_literal_as_tensor_re = re.compile(
         r"torch\.as_tensor\((?P<literal>\[.+?\]), dtype=torch\.(?P<dtype>[A-Za-z0-9_]+), device=_module_device\(self\)\)"
@@ -17875,7 +17900,8 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[(?P<dim0>-?\d+), (?P<dim1>-?\d+)\], keepdim=(?P<keepdim>True|False)\)$"
     )
     rank4_reshape_consumer_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), \[(?P<shape>[0-9,\- ]+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
     pidnet_spp_scale3_mul_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.const_wa_spp_scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused\), \[1, 512, 1, 512\]\)$"
@@ -18065,6 +18091,25 @@ def _canonicalize_generated_model_source_for_raw_export(
             )
             changed = True
             line = lines[index]
+        scalar_first_binary_match = scalar_first_binary_re.match(line)
+        if scalar_first_binary_match is not None:
+            rewritten_line = (
+                f"{scalar_first_binary_match.group('indent')}{scalar_first_binary_match.group('lhs')} = "
+                f"torch.{scalar_first_binary_match.group('op')}("
+                f"{scalar_first_binary_match.group('rhs')}, {scalar_first_binary_match.group('scalar')})"
+            )
+            if rewritten_line != line:
+                lines[index] = rewritten_line
+                changed = True
+                line = rewritten_line
+        scalar_first_inline_replaced = scalar_first_inline_binary_re.sub(
+            r"torch.\g<op>(\g<rhs>, \g<scalar>)",
+            line,
+        )
+        if scalar_first_inline_replaced != line:
+            lines[index] = scalar_first_inline_replaced
+            changed = True
+            line = scalar_first_inline_replaced
         scalar_as_tensor_replaced = line
         if not inside_nms_method and "_apply_non_max_suppression_v4(" not in line:
             scalar_as_tensor_replaced = scalar_as_tensor_re.sub(r"\g<value>", line)
@@ -18289,6 +18334,26 @@ def _canonicalize_generated_model_source_for_raw_export(
                     break
             lhs_exact_shape = _model_ir_exact_shape(lhs)
             rhs_exact_shape = _model_ir_exact_shape(rhs)
+            lhs_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(lhs), None)
+                if model_ir is not None
+                else None
+            )
+            rhs_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(rhs), None)
+                if model_ir is not None
+                else None
+            )
+            lhs_layout = (
+                normalize_logical_layout(lhs_tensor.logical_layout)
+                if lhs_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
+            rhs_layout = (
+                normalize_logical_layout(rhs_tensor.logical_layout)
+                if rhs_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
             nhwc_target_shape = lhs_exact_shape
             if nhwc_target_shape is None and rhs_exact_shape is not None and len(rhs_exact_shape) == 4:
                 nhwc_target_shape = [
@@ -18298,6 +18363,25 @@ def _canonicalize_generated_model_source_for_raw_export(
                     int(rhs_exact_shape[1]),
                 ]
             if (
+                next_reshape_match is not None
+                and lhs_exact_shape is not None
+                and len(lhs_exact_shape) == 4
+                and is_channel_last_logical_layout(lhs_layout)
+                and (
+                    _is_known_cf_name(rhs, set())
+                    or is_channel_first_logical_layout(rhs_layout)
+                )
+            ):
+                indent = str(generic_alias_match.group("indent"))
+                lines[index] = (
+                    f"{indent}{lhs} = _align_tensor_to_target_shape("
+                    f"{rhs}.permute(0, 2, 3, 1).contiguous(), {lhs_exact_shape})"
+                )
+                changed = True
+                cf_materialized_alias_sources.pop(lhs, None)
+                generic_alias_sources.pop(lhs, None)
+                line = lines[index]
+            elif (
                 "_nhwc" in lhs
                 and _is_known_cf_name(rhs, set())
                 and next_reshape_match is not None
@@ -19123,8 +19207,6 @@ def _canonicalize_generated_model_source_for_raw_export(
                         for future_line in lines[index + 1 : function_end]
                         if re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
                     ]
-                    if _has_rank4_reshape_consumer(lhs, index):
-                        future_uses = ["__reshape_consumer__"]
                     if len(future_uses) == 0 or all(future_line.lstrip().startswith("return ") for future_line in future_uses):
                         indent = str(aligned_rank4_seed_match.group("indent"))
                         lines[index] = f"{indent}{lhs} = {expr}"
@@ -19570,8 +19652,6 @@ def _canonicalize_generated_model_source_for_raw_export(
                     for future_line in lines[index + 1 : function_end]
                     if re.search(rf"\b{re.escape(alias)}\b", future_line) is not None
                 ]
-                if _has_rank4_reshape_consumer(alias, index):
-                    future_uses = ["__reshape_consumer__"]
                 immediate_uses = "\n".join(lines[index + 1:index + 4])
                 future_uses_are_safe = all(
                     future_line.lstrip().startswith("return ")
@@ -20040,8 +20120,6 @@ def _canonicalize_generated_model_source_for_raw_export(
             continue
         lhs = str(generic_alias_match.group("lhs"))
         rhs = str(generic_alias_match.group("rhs"))
-        if "_nhwc" not in lhs or not _is_known_cf_name(rhs, set()):
-            continue
         reshape_consumer_found = False
         for lookahead_index in range(index + 1, min(index + 6, len(lines))):
             candidate_reshape_match = rank4_reshape_consumer_re.match(lines[lookahead_index])
@@ -20049,6 +20127,34 @@ def _canonicalize_generated_model_source_for_raw_export(
                 reshape_consumer_found = True
                 break
         if not reshape_consumer_found:
+            continue
+        lhs_exact_shape = _model_ir_exact_shape(lhs)
+        lhs_tensor = (
+            model_ir.tensors.get(_resolve_model_ir_tensor_name(lhs), None)
+            if model_ir is not None
+            else None
+        )
+        lhs_layout = (
+            normalize_logical_layout(lhs_tensor.logical_layout)
+            if lhs_tensor is not None
+            else LOGICAL_LAYOUT_UNKNOWN
+        )
+        if (
+            lhs_exact_shape is not None
+            and len(lhs_exact_shape) == 4
+            and is_channel_last_logical_layout(lhs_layout)
+            and _is_known_cf_name(rhs, set())
+        ):
+            indent = str(generic_alias_match.group("indent"))
+            rewritten_line = (
+                f"{indent}{lhs} = _align_tensor_to_target_shape("
+                f"{rhs}.permute(0, 2, 3, 1).contiguous(), {lhs_exact_shape})"
+            )
+            if rewritten_line != line:
+                lines[index] = rewritten_line
+                changed = True
+            continue
+        if "_nhwc" not in lhs or not _is_known_cf_name(rhs, set()):
             continue
         rhs_exact_shape = _model_ir_exact_shape(rhs)
         if rhs_exact_shape is None or len(rhs_exact_shape) != 4:
