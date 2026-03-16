@@ -45,6 +45,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _build_metadata_payload,
     _build_tensor_var_name_map,
     _build_torchscript_example_inputs,
+    _canonicalize_generated_model_source_for_raw_export,
     _conv2d_input_pre_permute_for_codegen,
     _conv2d_same_pad_padding_arg_for_codegen,
     _export_runtime_wrapper_package_from_model_ir,
@@ -188,6 +189,33 @@ def test_rewrite_channel_last_gap_means_to_reduce_mean_keeps_rank3_cf_mean_consi
         "t_1780 = _align_tensor_to_target_shape(t1780_cf.permute(0, 2, 1).contiguous(), [1, 4096, 180])",
         "t1781_cf = torch.mean(t1780_cf, dim=1, keepdim=True)",
     ]
+
+
+def test_canonicalize_generated_model_source_preserves_rank3_permute_function_arg(tmp_path) -> None:
+    package_dir = tmp_path / "permute_arg_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, t_7859: torch.Tensor) -> torch.Tensor:",
+                "        t_653 = torch.neg(t_7859)",
+                "        t_7863 = _torch_permute(t_7859, [0, 2, 1])",
+                "        return t_7863",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "t_7863 = _torch_permute(t_7859, [0, 2, 1])" in rewritten
+    assert "t_7863 = _torch_permute(t_653, [0, 2, 1])" not in rewritten
 
 
 def _make_add_model() -> onnx.ModelProto:

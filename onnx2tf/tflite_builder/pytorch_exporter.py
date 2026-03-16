@@ -20121,30 +20121,48 @@ def _canonicalize_generated_model_source_for_raw_export(
             if rewritten_line != line:
                 lines[index] = rewritten_line
                 changed = True
+    function_def_re = re.compile(
+        r"^\s*def\s+[A-Za-z0-9_]+\((?P<params>[^\)]*)\):$"
+    )
     current_function_assigned: set[str] = set()
-    previous_assigned_name: str | None = None
+    current_function_defined: set[str] = set()
     for index, line in enumerate(lines):
         if line.startswith("    def "):
             current_function_assigned = set()
-            previous_assigned_name = None
+            current_function_defined = set()
+            function_def_match = function_def_re.match(line)
+            if function_def_match is not None:
+                raw_params = str(function_def_match.group("params"))
+                for raw_param in raw_params.split(","):
+                    param = str(raw_param).strip()
+                    if param == "":
+                        continue
+                    param_name = param.split(":", 1)[0].split("=", 1)[0].strip()
+                    if param_name != "":
+                        current_function_defined.add(param_name)
             continue
         orphan_rank3_permute_match = orphan_rank3_permute_re.match(line)
         if orphan_rank3_permute_match is not None:
             src = str(orphan_rank3_permute_match.group("src"))
-            if src not in current_function_assigned and previous_assigned_name is not None:
+            alias_source = generic_alias_sources.get(src, "")
+            if (
+                src not in current_function_defined
+                and alias_source != ""
+            ):
                 lhs = str(orphan_rank3_permute_match.group("lhs"))
                 indent = str(orphan_rank3_permute_match.group("indent"))
-                if _is_known_cf_name(previous_assigned_name, singleton_cf_vars):
-                    lines[index] = f"{indent}{lhs} = {previous_assigned_name}"
+                if _is_known_cf_name(alias_source, singleton_cf_vars):
+                    lines[index] = f"{indent}{lhs} = {alias_source}"
                 else:
                     lines[index] = (
-                        f"{indent}{lhs} = _torch_permute({previous_assigned_name}, [0, 2, 1])"
+                        f"{indent}{lhs} = _torch_permute({alias_source}, [0, 2, 1])"
                     )
                 changed = True
         generic_assign_match = re.match(r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=", lines[index])
         if generic_assign_match is not None:
-            previous_assigned_name = str(generic_assign_match.group("lhs"))
-            current_function_assigned.add(previous_assigned_name)
+            assigned_name = str(generic_assign_match.group("lhs"))
+            current_function_assigned.add(assigned_name)
+            current_function_defined.add(assigned_name)
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
