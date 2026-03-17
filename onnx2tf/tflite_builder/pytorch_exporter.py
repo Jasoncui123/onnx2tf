@@ -12258,7 +12258,8 @@ def _onnx_fold_relu_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
     for transpose_node in list(graph.node):
         if str(transpose_node.op_type) != "Transpose":
             continue
-        if list(_onnx_node_attr(transpose_node, "perm") or []) != [0, 2, 3, 1]:
+        transpose_perm = [int(v) for v in list(_onnx_node_attr(transpose_node, "perm") or [])]
+        if not transpose_perm:
             continue
         transpose_consumers = consumer_map.get(str(transpose_node.output[0]), [])
         if len(transpose_consumers) != 1:
@@ -12272,7 +12273,16 @@ def _onnx_fold_relu_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
         inverse_node = relu_consumers[0]
         if str(inverse_node.op_type) != "Transpose":
             continue
-        if list(_onnx_node_attr(inverse_node, "perm") or []) != [0, 3, 1, 2]:
+        inverse_perm = [0] * len(transpose_perm)
+        for perm_index, perm_value in enumerate(transpose_perm):
+            perm_value_int = int(perm_value)
+            if perm_value_int < 0 or perm_value_int >= len(transpose_perm):
+                inverse_perm = []
+                break
+            inverse_perm[perm_value_int] = int(perm_index)
+        if not inverse_perm:
+            continue
+        if [int(v) for v in list(_onnx_node_attr(inverse_node, "perm") or [])] != inverse_perm:
             continue
         relu_node.input[0] = str(transpose_node.input[0])
         relu_node.output[0] = str(inverse_node.output[0])
@@ -12414,6 +12424,186 @@ def _onnx_fold_inverse_transpose_pairs_in_place(graph: onnx.GraphProto) -> None:
         )
         remove_node_names.extend([str(first_node.name), str(second_node.name)])
     _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_pad_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for inverse_transpose_node in list(graph.node):
+        if str(inverse_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(inverse_transpose_node, "perm") or []) != [0, 3, 1, 2]:
+            continue
+        if not inverse_transpose_node.input or not inverse_transpose_node.output:
+            continue
+        pad_node = producer_map.get(str(inverse_transpose_node.input[0]))
+        if pad_node is None or str(pad_node.op_type) != "Pad" or len(pad_node.input) < 2:
+            continue
+        if len(consumer_map.get(str(pad_node.output[0]), [])) != 1:
+            continue
+        input_transpose_node = producer_map.get(str(pad_node.input[0]))
+        if input_transpose_node is None or str(input_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(input_transpose_node, "perm") or []) != [0, 2, 3, 1]:
+            continue
+        if len(consumer_map.get(str(input_transpose_node.output[0]), [])) != 1:
+            continue
+        pad_name = str(pad_node.input[1])
+        pad_values = _onnx_get_initializer_array(graph, pad_name)
+        nchw_pad_values = (
+            _onnx_convert_pads_nhwc_to_nchw(pad_values)
+            if pad_values is not None
+            else None
+        )
+        if nchw_pad_values is None:
+            continue
+        new_pad_name = _onnx_make_unique_initializer_name(graph, f"{pad_name}_nchw")
+        _onnx_set_initializer_array(graph, name=new_pad_name, array=nchw_pad_values)
+        pad_node.input[0] = str(input_transpose_node.input[0])
+        pad_node.input[1] = str(new_pad_name)
+        _onnx_replace_all_node_inputs(
+            graph,
+            old_name=str(inverse_transpose_node.output[0]),
+            new_name=str(pad_node.output[0]),
+        )
+        remove_node_names.extend([str(input_transpose_node.name), str(inverse_transpose_node.name)])
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_residual_add_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    layout_preserving_unary_op_types = {
+        "Clip",
+        "Identity",
+        "LeakyRelu",
+        "Relu",
+        "Sigmoid",
+    }
+    while True:
+        producer_map, consumer_map = _onnx_node_maps(graph)
+        optimized = False
+        for add_node in list(graph.node):
+            if str(add_node.op_type) != "Add" or len(add_node.input) != 2:
+                continue
+            add_output_name = str(add_node.output[0]) if add_node.output else ""
+            if add_output_name == "":
+                continue
+
+            rewritten_inputs: List[str] = []
+            remove_node_names: List[str] = []
+            expected_shape: Optional[List[int]] = None
+            valid_inputs = True
+            for input_name in list(add_node.input):
+                input_str = str(input_name)
+                input_producer = producer_map.get(input_str)
+                if (
+                    input_producer is not None
+                    and str(input_producer.op_type) == "Transpose"
+                    and list(_onnx_node_attr(input_producer, "perm") or []) == [0, 2, 3, 1]
+                    and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                    and input_producer.input
+                ):
+                    source_name = str(input_producer.input[0])
+                    source_shape = _onnx_resolve_rank4_shape(
+                        graph,
+                        source_name,
+                        producer_map=producer_map,
+                    )
+                    if source_shape is None or len(source_shape) != 4:
+                        valid_inputs = False
+                        break
+                    if expected_shape is None:
+                        expected_shape = [int(v) for v in list(source_shape)]
+                    elif [int(v) for v in list(source_shape)] != expected_shape:
+                        valid_inputs = False
+                        break
+                    rewritten_inputs.append(source_name)
+                    remove_node_names.append(str(input_producer.name))
+                    continue
+                input_shape = _onnx_resolve_rank4_shape(
+                    graph,
+                    input_str,
+                    producer_map=producer_map,
+                )
+                if input_shape is None or len(input_shape) != 4:
+                    valid_inputs = False
+                    break
+                if expected_shape is None:
+                    expected_shape = [int(v) for v in list(input_shape)]
+                elif [int(v) for v in list(input_shape)] != expected_shape:
+                    valid_inputs = False
+                    break
+                rewritten_inputs.append(input_str)
+            if not valid_inputs:
+                continue
+            if rewritten_inputs == [str(v) for v in list(add_node.input)]:
+                continue
+
+            add_consumers = consumer_map.get(add_output_name, [])
+            if len(add_consumers) != 1:
+                continue
+            first_consumer = add_consumers[0]
+
+            trailing_relu_node: Optional[onnx.NodeProto] = None
+            trailing_transpose_node: Optional[onnx.NodeProto] = None
+            conv_anchor_name = ""
+
+            if str(first_consumer.op_type) in layout_preserving_unary_op_types:
+                relu_consumers = consumer_map.get(str(first_consumer.output[0]), [])
+                if not relu_consumers:
+                    continue
+                transpose_consumers = [
+                    node
+                    for node in relu_consumers
+                    if str(node.op_type) == "Transpose"
+                    and list(_onnx_node_attr(node, "perm") or []) == [0, 3, 1, 2]
+                ]
+                if len(transpose_consumers) != 1:
+                    continue
+                candidate_transpose = transpose_consumers[0]
+                transpose_output_consumers = consumer_map.get(str(candidate_transpose.output[0]), [])
+                if (
+                    not transpose_output_consumers
+                    or not all(str(node.op_type) == "Conv" for node in transpose_output_consumers)
+                ):
+                    continue
+                trailing_relu_node = first_consumer
+                trailing_transpose_node = candidate_transpose
+                conv_anchor_name = str(candidate_transpose.output[0])
+            elif (
+                str(first_consumer.op_type) == "Transpose"
+                and list(_onnx_node_attr(first_consumer, "perm") or []) == [0, 3, 1, 2]
+            ):
+                transpose_consumers = consumer_map.get(str(first_consumer.output[0]), [])
+                if len(transpose_consumers) != 1:
+                    continue
+                candidate_relu = transpose_consumers[0]
+                if str(candidate_relu.op_type) not in layout_preserving_unary_op_types:
+                    continue
+                relu_consumers = consumer_map.get(str(candidate_relu.output[0]), [])
+                if not relu_consumers or not all(str(node.op_type) == "Conv" for node in relu_consumers):
+                    continue
+                trailing_transpose_node = first_consumer
+                trailing_relu_node = candidate_relu
+                conv_anchor_name = str(first_consumer.output[0])
+            else:
+                continue
+
+            for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+                add_node.input[input_index] = str(rewritten_input_name)
+            if str(trailing_relu_node.input[0]) != add_output_name:
+                trailing_relu_node.input[0] = add_output_name
+            if str(first_consumer.op_type) in layout_preserving_unary_op_types:
+                _onnx_replace_all_node_inputs(
+                    graph,
+                    old_name=conv_anchor_name,
+                    new_name=str(trailing_relu_node.output[0]),
+                )
+            remove_node_names.append(str(trailing_transpose_node.name))
+            _onnx_remove_nodes_by_name(graph, remove_node_names)
+            optimized = True
+            break
+        if not optimized:
+            break
 
 
 def _onnx_remove_passthrough_identity_nodes_in_place(graph: onnx.GraphProto) -> None:
@@ -13487,6 +13677,12 @@ def _sanitize_dynamo_exported_onnx_metadata(onnx_path: Path) -> None:
     external_data_sidecar_path = onnx_path.with_name(f"{onnx_path.name}.data")
     original_uses_external_data = _inspect_onnx_uses_external_data(onnx_path)
     model = onnx.load(str(onnx_path))
+    _onnx_fold_relu_layout_bridges_in_place(model.graph)
+    _onnx_fold_pad_layout_bridges_in_place(model.graph)
+    _onnx_fold_residual_add_layout_bridges_in_place(model.graph)
+    _onnx_repair_inferred_shapes_in_place(model)
+    _onnx_fold_residual_add_layout_bridges_in_place(model.graph)
+    _onnx_repair_inferred_shapes_in_place(model)
     del model.metadata_props[:]
     _clear_onnx_graph_and_node_metadata_in_place(model.graph)
     onnx.checker.check_model(model)

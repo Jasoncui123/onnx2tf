@@ -10517,6 +10517,217 @@ def test_sanitize_dynamo_exported_onnx_metadata_removes_orphan_external_data_fil
     assert not orphan_external_data_path.exists()
 
 
+def test_sanitize_dynamo_exported_onnx_metadata_folds_transpose_pad_transpose_bridge(tmp_path) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, 8, 8])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3, 4, 4])
+    pads = helper.make_tensor(
+        "pads_nhwc",
+        TensorProto.INT64,
+        [8],
+        [0, 1, 1, 0, 0, 1, 1, 0],
+    )
+    constant_value = helper.make_tensor(
+        "pad_value",
+        TensorProto.FLOAT,
+        [],
+        [0.0],
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["x"], ["x_nhwc"], name="ToNHWC", perm=[0, 2, 3, 1]),
+            helper.make_node("Pad", ["x_nhwc", "pads_nhwc", "pad_value"], ["x_pad"], name="PadNHWC", mode="constant"),
+            helper.make_node("Transpose", ["x_pad"], ["x_pad_nchw"], name="ToNCHW", perm=[0, 3, 1, 2]),
+            helper.make_node(
+                "MaxPool",
+                ["x_pad_nchw"],
+                ["y"],
+                name="Pool",
+                kernel_shape=[3, 3],
+                strides=[2, 2],
+                pads=[0, 0, 0, 0],
+            ),
+        ],
+        "transpose_pad_transpose_bridge_graph",
+        [x],
+        [y],
+        initializer=[pads, constant_value],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "transpose_pad_bridge.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert [str(node.op_type) for node in sanitized_model.graph.node] == ["Pad", "MaxPool"]
+    pad_node = sanitized_model.graph.node[0]
+    assert list(pad_node.input) == ["x", "pads_nhwc_nchw", "pad_value"]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(next(initializer for initializer in sanitized_model.graph.initializer if initializer.name == "pads_nhwc_nchw")),
+        np.asarray([0, 0, 1, 1, 0, 0, 1, 1], dtype=np.int64),
+    )
+    assert list(sanitized_model.graph.node[1].input) == ["x_pad"]
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_relu_between_inverse_transposes(tmp_path) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4, 5, 6])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4, 5, 6])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["x"], ["x_t"], name="ToAlt", perm=[0, 3, 1, 2]),
+            helper.make_node("Relu", ["x_t"], ["x_relu"], name="ReluBridge"),
+            helper.make_node("Transpose", ["x_relu"], ["y"], name="Back", perm=[0, 2, 3, 1]),
+        ],
+        "relu_inverse_transpose_bridge_graph",
+        [x],
+        [y],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "relu_inverse_transpose_bridge.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert [str(node.op_type) for node in sanitized_model.graph.node] == ["Relu"]
+    relu_node = sanitized_model.graph.node[0]
+    assert list(relu_node.input) == ["x"]
+    assert list(relu_node.output) == ["y"]
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_residual_add_relu_conv_bridge(tmp_path) -> None:
+    lhs = helper.make_tensor_value_info("lhs", TensorProto.FLOAT, [1, 8, 6, 6])
+    rhs = helper.make_tensor_value_info("rhs", TensorProto.FLOAT, [1, 8, 6, 6])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 6, 6])
+    conv_w = helper.make_tensor(
+        "conv_w_residual",
+        TensorProto.FLOAT,
+        [8, 8, 3, 3],
+        (np.arange(8 * 8 * 3 * 3, dtype=np.float32) / 100.0).tolist(),
+    )
+    conv_b = helper.make_tensor(
+        "conv_b_residual",
+        TensorProto.FLOAT,
+        [8],
+        np.zeros((8,), dtype=np.float32).tolist(),
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["lhs"], ["lhs_nhwc"], name="LHSNHWC", perm=[0, 2, 3, 1]),
+            helper.make_node("Transpose", ["rhs"], ["rhs_nhwc"], name="RHSNHWC", perm=[0, 2, 3, 1]),
+            helper.make_node("Add", ["lhs_nhwc", "rhs_nhwc"], ["sum_nhwc"], name="ResidualAdd"),
+            helper.make_node("Relu", ["sum_nhwc"], ["sum_relu_nhwc"], name="ResidualRelu"),
+            helper.make_node("Transpose", ["sum_relu_nhwc"], ["sum_relu_nchw"], name="BackToNCHW", perm=[0, 3, 1, 2]),
+            helper.make_node("Conv", ["sum_relu_nchw", "conv_w_residual", "conv_b_residual"], ["y"], name="ResidualConv", pads=[1, 1, 1, 1]),
+        ],
+        "residual_add_relu_conv_bridge_graph",
+        [lhs, rhs],
+        [y],
+        initializer=[conv_w, conv_b],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "residual_add_relu_conv_bridge.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert [str(node.op_type) for node in sanitized_model.graph.node] == ["Add", "Relu", "Conv"]
+    add_node, relu_node, conv_node = sanitized_model.graph.node
+    assert list(add_node.input) == ["lhs", "rhs"]
+    assert list(relu_node.input) == ["sum_nhwc"]
+    assert list(relu_node.output) == ["sum_relu_nhwc"]
+    assert list(conv_node.input)[0] == "sum_relu_nhwc"
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_chained_residual_add_bridges(tmp_path) -> None:
+    lhs = helper.make_tensor_value_info("lhs", TensorProto.FLOAT, [1, 8, 6, 6])
+    rhs = helper.make_tensor_value_info("rhs", TensorProto.FLOAT, [1, 8, 6, 6])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 6, 6])
+    conv_w1 = helper.make_tensor(
+        "conv_w_mid_1",
+        TensorProto.FLOAT,
+        [8, 8, 3, 3],
+        (np.arange(8 * 8 * 3 * 3, dtype=np.float32) / 90.0).tolist(),
+    )
+    conv_b1 = helper.make_tensor(
+        "conv_b_mid_1",
+        TensorProto.FLOAT,
+        [8],
+        np.zeros((8,), dtype=np.float32).tolist(),
+    )
+    conv_w2 = helper.make_tensor(
+        "conv_w_mid_2",
+        TensorProto.FLOAT,
+        [8, 8, 3, 3],
+        (np.arange(8 * 8 * 3 * 3, dtype=np.float32) / 80.0).tolist(),
+    )
+    conv_b2 = helper.make_tensor(
+        "conv_b_mid_2",
+        TensorProto.FLOAT,
+        [8],
+        np.zeros((8,), dtype=np.float32).tolist(),
+    )
+    conv_w3 = helper.make_tensor(
+        "conv_w_out",
+        TensorProto.FLOAT,
+        [8, 8, 3, 3],
+        (np.arange(8 * 8 * 3 * 3, dtype=np.float32) / 70.0).tolist(),
+    )
+    conv_b3 = helper.make_tensor(
+        "conv_b_out",
+        TensorProto.FLOAT,
+        [8],
+        np.zeros((8,), dtype=np.float32).tolist(),
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["lhs"], ["lhs_nhwc"], name="LHSNHWC", perm=[0, 2, 3, 1]),
+            helper.make_node("Transpose", ["rhs"], ["rhs_nhwc"], name="RHSNHWC", perm=[0, 2, 3, 1]),
+            helper.make_node("Add", ["lhs_nhwc", "rhs_nhwc"], ["sum0_nhwc"], name="ResidualAdd0"),
+            helper.make_node("Relu", ["sum0_nhwc"], ["sum0_relu_nhwc"], name="ResidualRelu0"),
+            helper.make_node("Transpose", ["sum0_relu_nhwc"], ["sum0_relu_nchw"], name="BackToNCHW0", perm=[0, 3, 1, 2]),
+            helper.make_node("Conv", ["sum0_relu_nchw", "conv_w_mid_1", "conv_b_mid_1"], ["mid0"], name="ResidualConv0", pads=[1, 1, 1, 1]),
+            helper.make_node("Relu", ["mid0"], ["mid0_relu"], name="MidRelu"),
+            helper.make_node("Conv", ["mid0_relu", "conv_w_mid_2", "conv_b_mid_2"], ["mid1"], name="ResidualConv1", pads=[1, 1, 1, 1]),
+            helper.make_node("Transpose", ["mid1"], ["mid1_nhwc"], name="MidNHWC", perm=[0, 2, 3, 1]),
+            helper.make_node("Add", ["sum0_relu_nhwc", "mid1_nhwc"], ["sum1_nhwc"], name="ResidualAdd1"),
+            helper.make_node("Transpose", ["sum1_nhwc"], ["sum1_nchw"], name="BackToNCHW1", perm=[0, 3, 1, 2]),
+            helper.make_node("Relu", ["sum1_nchw"], ["sum1_relu"], name="ResidualRelu1"),
+            helper.make_node("Conv", ["sum1_relu", "conv_w_out", "conv_b_out"], ["y"], name="ResidualConv2", pads=[1, 1, 1, 1]),
+        ],
+        "chained_residual_add_bridge_graph",
+        [lhs, rhs],
+        [y],
+        initializer=[conv_w1, conv_b1, conv_w2, conv_b2, conv_w3, conv_b3],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "chained_residual_add_bridge.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert [str(node.op_type) for node in sanitized_model.graph.node] == [
+        "Add", "Relu", "Conv", "Relu", "Conv", "Add", "Relu", "Conv",
+    ]
+    assert [str(node.name) for node in sanitized_model.graph.node] == [
+        "ResidualAdd0", "ResidualRelu0", "ResidualConv0", "MidRelu",
+        "ResidualConv1", "ResidualAdd1", "ResidualRelu1", "ResidualConv2",
+    ]
+    assert [str(node.input[0]) for node in sanitized_model.graph.node if str(node.op_type) == "Conv"] == [
+        "sum0_relu_nhwc", "mid0_relu", "sum1_relu",
+    ]
+    add0_node = sanitized_model.graph.node[0]
+    add1_node = sanitized_model.graph.node[5]
+    assert list(add0_node.input) == ["lhs", "rhs"]
+    assert list(add1_node.input) == ["sum0_relu_nhwc", "mid1"]
+
+
 def test_export_exported_program_from_generated_package_writes_artifact_and_metadata(tmp_path) -> None:
     package_path = export_pytorch_package_from_model_ir(
         model_ir=_make_add_model_ir(),
