@@ -10570,6 +10570,32 @@ def test_sanitize_dynamo_exported_onnx_metadata_folds_transpose_pad_transpose_br
     assert list(sanitized_model.graph.node[1].input) == ["x_pad"]
 
 
+def test_sanitize_dynamo_exported_onnx_metadata_preserves_atan_rank4_output_shape(tmp_path) -> None:
+    x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 224, 224])
+    y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 224, 224])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Atan", ["input"], ["output"], name="AtanNode"),
+        ],
+        "atan_rank4_graph",
+        [x],
+        [y],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "atan_rank4.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    output_dims = [
+        int(dim.dim_value)
+        for dim in sanitized_model.graph.output[0].type.tensor_type.shape.dim
+    ]
+    assert output_dims == [1, 3, 224, 224]
+
+
 def test_sanitize_dynamo_exported_onnx_metadata_folds_relu_between_inverse_transposes(tmp_path) -> None:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4, 5, 6])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4, 5, 6])

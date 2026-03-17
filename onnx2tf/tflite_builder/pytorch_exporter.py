@@ -12129,6 +12129,39 @@ def _onnx_get_value_info_shape(
     return None
 
 
+_ONNX_RANK4_SHAPE_PASSTHROUGH_OP_TYPES = {
+    "Abs",
+    "Acos",
+    "Asin",
+    "Atan",
+    "Cast",
+    "Ceil",
+    "Clip",
+    "Cos",
+    "Cosh",
+    "Elu",
+    "Erf",
+    "Exp",
+    "Floor",
+    "HardSigmoid",
+    "Identity",
+    "LeakyRelu",
+    "Log",
+    "Neg",
+    "Reciprocal",
+    "Relu",
+    "Round",
+    "Selu",
+    "Sigmoid",
+    "Sin",
+    "Sinh",
+    "Softplus",
+    "Softsign",
+    "Sqrt",
+    "Tanh",
+}
+
+
 def _onnx_resolve_rank4_shape(
     graph: onnx.GraphProto,
     name: str,
@@ -12150,7 +12183,7 @@ def _onnx_resolve_rank4_shape(
     if producer_node is None:
         return None
     op_type = str(producer_node.op_type)
-    if op_type in {"Clip", "Exp", "Identity", "LeakyRelu", "Neg", "Relu", "Sigmoid"} and producer_node.input:
+    if op_type in _ONNX_RANK4_SHAPE_PASSTHROUGH_OP_TYPES and producer_node.input:
         return _onnx_resolve_rank4_shape(
             graph,
             str(producer_node.input[0]),
