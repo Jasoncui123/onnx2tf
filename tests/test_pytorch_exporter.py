@@ -234,6 +234,83 @@ def test_canonicalize_generated_model_source_preserves_rank3_permute_function_ar
     assert "t_7863 = _torch_permute(t_653, [0, 2, 1])" not in rewritten
 
 
+def test_export_pytorch_package_materializes_rank3_channel_last_binary_before_transpose(tmp_path) -> None:
+    perm = np.asarray([0, 2, 1], dtype=np.int32)
+    model_ir = ModelIR(
+        name="rank3_binary_transpose_bridge",
+        tensors={
+            "seq": TensorIR(
+                name="seq",
+                dtype="FLOAT32",
+                shape=[1, 4, 3],
+                shape_signature=[1, 4, 3],
+                logical_layout="NWC",
+            ),
+            "residual": TensorIR(
+                name="residual",
+                dtype="FLOAT32",
+                shape=[1, 4, 3],
+                shape_signature=[1, 4, 3],
+                logical_layout="NWC",
+            ),
+            "sum_nwc": TensorIR(
+                name="sum_nwc",
+                dtype="FLOAT32",
+                shape=[1, 4, 3],
+                shape_signature=[1, 4, 3],
+                logical_layout="NWC",
+            ),
+            "perm": TensorIR(
+                name="perm",
+                dtype="INT32",
+                shape=[3],
+                shape_signature=[3],
+                data=perm,
+                logical_layout="UNKNOWN",
+            ),
+            "sum_ncw": TensorIR(
+                name="sum_ncw",
+                dtype="FLOAT32",
+                shape=[1, 3, 4],
+                shape_signature=[1, 3, 4],
+                logical_layout="NCW",
+            ),
+        },
+        operators=[
+            OperatorIR(
+                op_type="ADD",
+                inputs=["seq", "residual"],
+                outputs=["sum_nwc"],
+                options={"fusedActivationFunction": "NONE"},
+            ),
+            OperatorIR(
+                op_type="TRANSPOSE",
+                inputs=["sum_nwc", "perm"],
+                outputs=["sum_ncw"],
+                options={},
+            ),
+        ],
+        inputs=["seq", "residual"],
+        outputs=["sum_ncw"],
+    )
+
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=model_ir,
+        output_folder_path=str(tmp_path / "rank3_binary_transpose_bridge_pytorch"),
+    )
+    model_source = (Path(package_path) / "model.py").read_text(encoding="utf-8")
+    assert "sum_nwc = _align_tensor_to_target_shape(sum_nwc_cf.permute(0, 2, 1).contiguous(), [1, 4, 3])" in model_source
+    assert "sum_ncw = _torch_permute(sum_nwc, [0, 2, 1])" in model_source
+
+    pkg = _import_generated_package(package_path)
+    model = pkg.load_model()
+    seq = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+    residual = torch.full((1, 4, 3), 0.5, dtype=torch.float32)
+    out = model(seq, residual)
+    ref = torch.add(seq, residual).permute(0, 2, 1).contiguous()
+    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
+
+
 def test_canonicalize_generated_model_source_reorders_scalar_first_mul_for_dynamo(tmp_path) -> None:
     package_dir = tmp_path / "scalar_first_pkg"
     package_dir.mkdir()

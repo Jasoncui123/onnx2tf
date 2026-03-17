@@ -3988,6 +3988,12 @@ def _can_omit_materialized_channel_last_alias_recursive_for_codegen(
                 or list(transpose_perm or []) != list(expected_input_bridge_perm)
             ):
                 return False
+            # Rank-3 feature-last tensors still need a materialized alias here.
+            # Later transpose emission cannot always reuse the channel-first
+            # producer alias because `_tensor_expr` intentionally preserves the
+            # logical NWC name for public/bridge cases.
+            if int(output_rank) == 3:
+                return False
             continue
         if consumer_type in {"CONV_2D", "DEPTHWISE_CONV_2D"}:
             if len(consumer_op.inputs) < 2 or str(consumer_op.inputs[0]) != str(output_name):
@@ -23556,3 +23562,52 @@ def export_pytorch_package_from_model_ir(
             output_folder_path=output_folder_path,
             tflite_file_path=str(fallback_tflite_path),
         )
+
+
+def debug_export_native_codegen_intermediates_from_model_ir(
+    *,
+    model_ir: ModelIR,
+    output_folder_path: str,
+    stop_after: str = "canonicalize",
+) -> Dict[str, str]:
+    stop_after_normalized = str(stop_after).strip().lower()
+    if stop_after_normalized not in {"write", "canonicalize"}:
+        raise ValueError(
+            "stop_after must be either 'write' or 'canonicalize'."
+        )
+
+    normalized = prepare_model_ir_for_native_pytorch(model_ir)
+    _ensure_no_custom_ops(normalized)
+    _ensure_supported_ops(normalized)
+
+    tensor_storage_name_map = _make_tensor_storage_name_map(normalized)
+    os.makedirs(output_folder_path, exist_ok=True)
+    metadata = _build_metadata_payload(normalized)
+    metadata["execution_backend"] = "native"
+    metadata["tensor_storage_names"] = dict(tensor_storage_name_map)
+
+    package_dir = Path(output_folder_path)
+    _write_native_model_file(
+        output_folder_path,
+        model_ir=normalized,
+        metadata=metadata,
+        tensor_storage_name_map=tensor_storage_name_map,
+    )
+
+    model_path = package_dir / "model.py"
+    pre_canonicalize_path = package_dir / "model_pre_canonicalize.py"
+    shutil.copyfile(model_path, pre_canonicalize_path)
+    artifacts = {
+        "package_path": str(package_dir),
+        "model_path": str(model_path),
+        "model_pre_canonicalize_path": str(pre_canonicalize_path),
+    }
+    if stop_after_normalized == "write":
+        return artifacts
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=normalized,
+    )
+    artifacts["model_post_canonicalize_path"] = str(model_path)
+    return artifacts
