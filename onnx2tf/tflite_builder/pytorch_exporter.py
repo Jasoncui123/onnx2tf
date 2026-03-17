@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -19,6 +20,7 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Se
 
 import numpy as np
 import onnx
+import torch
 
 from onnx2tf.tflite_builder._pytorch_exporter_native_codegen_common import (
     _NativeCodegenBindings,
@@ -77,7 +79,10 @@ def _build_native_codegen_bindings(
     state: _NativeCodegenState,
 ) -> _NativeCodegenBindings:
     _ = state
-    return _NativeCodegenBindings(module_globals=dict(globals()))
+    return _NativeCodegenBindings(
+        module_globals=dict(globals()),
+        canonicalize_generated_model_source_fn=_canonicalize_generated_model_source_for_raw_export,
+    )
 
 
 def _build_native_constant_aliases(
@@ -469,6 +474,11 @@ def _target_shape_values_for_model_ir(
     tensor = model_ir.tensors.get(str(tensor_name), None)
     if tensor is None:
         return None
+    public_tensor_names = {
+        str(name) for name in list(model_ir.inputs) + list(model_ir.outputs)
+    }
+    if str(tensor_name) not in public_tensor_names:
+        return [int(v) for v in list(tensor.shape)]
     resolved = _base_target_shape_values_for_model_ir(
         model_ir=model_ir,
         tensor_name=str(tensor_name),
@@ -2291,11 +2301,7 @@ def _constant_pad_pairs_for_codegen(
     tensor = model_ir.tensors.get(str(tensor_name), None)
     if tensor is None or not isinstance(tensor.data, np.ndarray):
         return None
-    try:
-        values = np.asarray(tensor.data, dtype=np.int64).reshape(-1, 2)
-    except Exception:
-        return None
-    return [[int(v) for v in list(row)] for row in values.tolist()]
+    return _constant_pad_pairs_for_tensor(tensor)
 
 
 def _scalar_literal_expr_for_codegen(
@@ -3417,6 +3423,8 @@ def _tensor_expr_for_channel_first_bridge_for_codegen(
     if tensor is None:
         return None
     rank = len(list(tensor.shape))
+    if rank == 3:
+        return None
     expected_perm = _perm_cl_to_cf(rank)
     if expected_perm is None or list(perm or []) != list(expected_perm):
         return None
@@ -3441,6 +3449,8 @@ def _channel_first_reduction_plan_for_codegen(
     input_rank = len(list(input_tensor.shape))
     input_layout = normalize_logical_layout(input_tensor.logical_layout)
     if not is_channel_last_logical_layout(input_layout):
+        return None
+    if input_rank == 3:
         return None
     if (
         input_rank == 4
@@ -8208,14 +8218,29 @@ def _inverse_axis_permutation(perm: Optional[Sequence[int]]) -> Optional[List[in
     return inverse
 
 
+def _normalize_constant_pad_pairs(
+    values: np.ndarray,
+) -> Optional[List[List[int]]]:
+    arr = np.asarray(values, dtype=np.int64)
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        return [[int(v) for v in list(row)] for row in arr.tolist()]
+    if arr.ndim != 1 or int(arr.size) == 0 or int(arr.size) % 2 != 0:
+        return None
+    flat_values = [int(v) for v in arr.reshape(-1).tolist()]
+    rank = int(len(flat_values) // 2)
+    begins = flat_values[:rank]
+    ends = flat_values[rank:]
+    return [[int(begins[idx]), int(ends[idx])] for idx in range(rank)]
+
+
 def _constant_pad_pairs_for_tensor(tensor: Optional[TensorIR]) -> Optional[List[List[int]]]:
     if tensor is None or tensor.data is None:
         return None
     try:
-        pads = np.asarray(tensor.data, dtype=np.int64).reshape(-1, 2)
+        pads = np.asarray(tensor.data, dtype=np.int64)
     except Exception:
         return None
-    return [[int(v) for v in list(row)] for row in pads.tolist()]
+    return _normalize_constant_pad_pairs(pads)
 
 
 def _pad_output_matches_pre_permuted_input(
@@ -9529,7 +9554,10 @@ def _rewrite_layout_sensitive_ops(
         elif op_type == "RESHAPE" and len(op.outputs) == 1:
             out_tensor = model_ir.tensors.get(str(op.outputs[0]), None)
             if out_tensor is not None:
-                preferred_shape = _preferred_reshape_target_values(out_tensor)
+                preferred_shape = _preferred_reshape_target_values_for_op(
+                    model_ir=model_ir,
+                    op=op,
+                )
                 if preferred_shape is None:
                     preferred_shape = [int(v) for v in list(out_tensor.shape)]
                 resolved_preferred_shape = [int(v) for v in list(preferred_shape)]
@@ -9594,7 +9622,10 @@ def _synchronize_reshape_targets_with_output_tensors(
         out_tensor = model_ir.tensors.get(str(op.outputs[0]), None)
         if out_tensor is None:
             continue
-        preferred_shape = _preferred_reshape_target_values(out_tensor)
+        preferred_shape = _preferred_reshape_target_values_for_op(
+            model_ir=model_ir,
+            op=op,
+        )
         if preferred_shape is None or len(preferred_shape) == 0:
             continue
         op.options["newShape"] = list(preferred_shape)
@@ -11971,6 +12002,67 @@ def _onnx_remove_nodes_by_name(
     graph.node.extend(kept_nodes)
 
 
+def _onnx_repair_inferred_shapes_in_place(model: onnx.ModelProto) -> None:
+    del model.graph.value_info[:]
+    produced_tensor_names = {
+        str(output_name)
+        for node in model.graph.node
+        for output_name in list(node.output)
+        if str(output_name) != ""
+    }
+    for output in model.graph.output:
+        if str(output.name) not in produced_tensor_names:
+            continue
+        tensor_type = getattr(output.type, "tensor_type", None)
+        if tensor_type is None:
+            continue
+        shape = getattr(tensor_type, "shape", None)
+        if shape is None:
+            continue
+        del shape.dim[:]
+    try:
+        inferred_model = onnx.shape_inference.infer_shapes(
+            model,
+            check_type=False,
+            strict_mode=False,
+            data_prop=True,
+        )
+    except TypeError:
+        try:
+            inferred_model = onnx.shape_inference.infer_shapes(
+                model,
+                check_type=False,
+                strict_mode=False,
+            )
+        except Exception:
+            return
+    except Exception:
+        return
+    if inferred_model is None:
+        return
+    model.CopyFrom(inferred_model)
+    producer_map, _ = _onnx_node_maps(model.graph)
+    for output in model.graph.output:
+        tensor_type = getattr(output.type, "tensor_type", None)
+        if tensor_type is None:
+            continue
+        shape = getattr(tensor_type, "shape", None)
+        if shape is None or len(list(shape.dim)) != 0:
+            continue
+        output_name = str(output.name)
+        if output_name == "" or output_name not in producer_map:
+            continue
+        inferred_shape = _onnx_resolve_rank4_shape(
+            model.graph,
+            output_name,
+            producer_map=producer_map,
+        )
+        if not inferred_shape:
+            continue
+        for dim_value in inferred_shape:
+            shape.dim.add().dim_value = int(dim_value)
+
+
 def _onnx_get_initializer_index(graph: onnx.GraphProto, name: str) -> Optional[int]:
     for initializer_index, initializer in enumerate(graph.initializer):
         if str(initializer.name) == str(name):
@@ -12013,6 +12105,119 @@ def _onnx_get_initializer_array(
     return onnx.numpy_helper.to_array(graph.initializer[initializer_index])
 
 
+def _onnx_get_value_info_shape(
+    graph: onnx.GraphProto,
+    name: str,
+) -> Optional[List[int]]:
+    target_name = str(name)
+    for value_info in list(graph.value_info) + list(graph.input) + list(graph.output):
+        if str(value_info.name) != target_name:
+            continue
+        shape: List[int] = []
+        for dim in value_info.type.tensor_type.shape.dim:
+            if dim.HasField("dim_value"):
+                shape.append(int(dim.dim_value))
+            else:
+                return None
+        return shape
+    return None
+
+
+def _onnx_resolve_rank4_shape(
+    graph: onnx.GraphProto,
+    name: str,
+    *,
+    producer_map: Optional[Dict[str, onnx.NodeProto]] = None,
+    depth: int = 0,
+) -> Optional[List[int]]:
+    if depth > 4:
+        return None
+    shape = _onnx_get_value_info_shape(graph, name)
+    if shape is not None and len(shape) == 4:
+        return shape
+    initializer_array = _onnx_get_initializer_array(graph, name)
+    if initializer_array is not None and initializer_array.ndim == 4:
+        return [int(v) for v in initializer_array.shape]
+    if producer_map is None:
+        producer_map, _ = _onnx_node_maps(graph)
+    producer_node = producer_map.get(str(name))
+    if producer_node is None:
+        return None
+    op_type = str(producer_node.op_type)
+    if op_type in {"Clip", "Exp", "Identity", "LeakyRelu", "Neg", "Relu", "Sigmoid"} and producer_node.input:
+        return _onnx_resolve_rank4_shape(
+            graph,
+            str(producer_node.input[0]),
+            producer_map=producer_map,
+            depth=depth + 1,
+        )
+    if op_type in {"Add", "Div", "Max", "Min", "Mul", "Sub"} and len(producer_node.input) == 2:
+        lhs_shape = _onnx_resolve_rank4_shape(
+            graph,
+            str(producer_node.input[0]),
+            producer_map=producer_map,
+            depth=depth + 1,
+        )
+        rhs_shape = _onnx_resolve_rank4_shape(
+            graph,
+            str(producer_node.input[1]),
+            producer_map=producer_map,
+            depth=depth + 1,
+        )
+        if lhs_shape is None:
+            return rhs_shape
+        if rhs_shape is None:
+            return lhs_shape
+        resolved: List[int] = []
+        for lhs_dim, rhs_dim in zip(lhs_shape, rhs_shape):
+            if lhs_dim == rhs_dim:
+                resolved.append(int(lhs_dim))
+            elif lhs_dim == 1:
+                resolved.append(int(rhs_dim))
+            elif rhs_dim == 1:
+                resolved.append(int(lhs_dim))
+            else:
+                return None
+        return resolved
+    if op_type == "Concat":
+        axis = int(_onnx_node_attr(producer_node, "axis") or -1)
+        input_shapes: List[List[int]] = []
+        for input_name in list(producer_node.input):
+            input_shape = _onnx_resolve_rank4_shape(
+                graph,
+                str(input_name),
+                producer_map=producer_map,
+                depth=depth + 1,
+            )
+            if input_shape is None:
+                return None
+            input_shapes.append(input_shape)
+        if not input_shapes or axis < 0 or axis >= 4:
+            return None
+        base_shape = list(input_shapes[0])
+        concat_dim = 0
+        for input_shape in input_shapes:
+            for dim_index, dim_value in enumerate(input_shape):
+                if dim_index == axis:
+                    concat_dim += int(dim_value)
+                elif int(base_shape[dim_index]) != int(dim_value):
+                    return None
+        base_shape[axis] = int(concat_dim)
+        return base_shape
+    if op_type == "Transpose" and producer_node.input:
+        perm = list(_onnx_node_attr(producer_node, "perm") or [])
+        input_shape = _onnx_resolve_rank4_shape(
+            graph,
+            str(producer_node.input[0]),
+            producer_map=producer_map,
+            depth=depth + 1,
+        )
+        if input_shape is None or len(perm) != 4:
+            return None
+        return [int(input_shape[index]) for index in perm]
+    return None
+
+
 def _onnx_convert_pads_nhwc_to_nchw(pads: Sequence[int] | np.ndarray) -> Optional[np.ndarray]:
     pad_values = np.asarray(list(pads), dtype=np.int64).reshape(-1)
     if pad_values.size != 8:
@@ -12021,6 +12226,24 @@ def _onnx_convert_pads_nhwc_to_nchw(pads: Sequence[int] | np.ndarray) -> Optiona
     end = pad_values[4:]
     reorder = [0, 3, 1, 2]
     return np.concatenate([begin[reorder], end[reorder]], axis=0).astype(np.int64)
+
+
+def _onnx_rewrite_slice_axis_to_nchw_in_place(
+    graph: onnx.GraphProto,
+    *,
+    slice_node: onnx.NodeProto,
+) -> bool:
+    axes_name = str(slice_node.input[3]) if len(slice_node.input) >= 4 else ""
+    axes_array = _onnx_get_initializer_array(graph, axes_name)
+    if axes_array is None:
+        return False
+    axes_values = [int(v) for v in axes_array.reshape(-1)]
+    if axes_values != [3]:
+        return False
+    new_axes_name = _onnx_make_unique_initializer_name(graph, f"{axes_name}_nchw")
+    _onnx_set_initializer_array(graph, name=new_axes_name, array=np.asarray([1], dtype=np.int64))
+    slice_node.input[3] = str(new_axes_name)
+    return True
 
 
 def _onnx_fold_relu_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
@@ -12488,6 +12711,650 @@ def _onnx_fold_concat_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
     _onnx_remove_nodes_by_name(graph, remove_node_names)
 
 
+def _onnx_fold_pad_concat_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for inverse_transpose_node in list(graph.node):
+        if str(inverse_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(inverse_transpose_node, "perm") or []) != [0, 3, 1, 2]:
+            continue
+        concat_node_name = str(inverse_transpose_node.input[0]) if inverse_transpose_node.input else ""
+        concat_node = producer_map.get(concat_node_name)
+        if concat_node is None or str(concat_node.op_type) != "Concat":
+            continue
+        if int(_onnx_node_attr(concat_node, "axis") or -1) != 3:
+            continue
+        if len(consumer_map.get(str(concat_node.output[0]), [])) != 1:
+            continue
+
+        rewritten_inputs: List[str] = []
+        local_remove_node_names: List[str] = [str(inverse_transpose_node.name)]
+        valid = True
+        for input_name in list(concat_node.input):
+            input_node = producer_map.get(str(input_name))
+            if input_node is None:
+                valid = False
+                break
+            if (
+                str(input_node.op_type) == "Transpose"
+                and list(_onnx_node_attr(input_node, "perm") or []) == [0, 2, 3, 1]
+                and len(consumer_map.get(str(input_node.output[0]), [])) == 1
+            ):
+                rewritten_inputs.append(str(input_node.input[0]))
+                local_remove_node_names.append(str(input_node.name))
+                continue
+            if str(input_node.op_type) != "Pad" or len(input_node.input) < 2:
+                valid = False
+                break
+            pad_input_node = producer_map.get(str(input_node.input[0]))
+            if (
+                pad_input_node is None
+                or str(pad_input_node.op_type) != "Transpose"
+                or list(_onnx_node_attr(pad_input_node, "perm") or []) != [0, 2, 3, 1]
+                or len(consumer_map.get(str(pad_input_node.output[0]), [])) != 1
+            ):
+                valid = False
+                break
+            pad_values = _onnx_get_initializer_array(graph, str(input_node.input[1]))
+            nchw_pad_values = (
+                _onnx_convert_pads_nhwc_to_nchw(pad_values)
+                if pad_values is not None
+                else None
+            )
+            if nchw_pad_values is None:
+                valid = False
+                break
+            new_pad_name = _onnx_make_unique_initializer_name(graph, f"{input_node.input[1]}_nchw")
+            _onnx_set_initializer_array(graph, name=new_pad_name, array=nchw_pad_values)
+            input_node.input[0] = str(pad_input_node.input[0])
+            input_node.input[1] = str(new_pad_name)
+            rewritten_inputs.append(str(input_node.output[0]))
+            local_remove_node_names.append(str(pad_input_node.name))
+        if not valid or not rewritten_inputs:
+            continue
+
+        for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+            concat_node.input[input_index] = str(rewritten_input_name)
+        _onnx_set_node_attr(concat_node, "axis", 1)
+        _onnx_replace_all_node_inputs(
+            graph,
+            old_name=str(inverse_transpose_node.output[0]),
+            new_name=str(concat_node.output[0]),
+        )
+        remove_node_names.extend(local_remove_node_names)
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_singleton_resize_matmul_transpose_bridges_in_place(graph: onnx.GraphProto) -> None:
+    while True:
+        producer_map, consumer_map = _onnx_node_maps(graph)
+        remove_node_names: List[str] = []
+        optimized = False
+        for matmul_node in list(graph.node):
+            if str(matmul_node.op_type) != "MatMul" or len(matmul_node.input) != 2:
+                continue
+
+            reshape_node: Optional[onnx.NodeProto] = None
+            reshape_input_index: Optional[int] = None
+            for input_index, input_name in enumerate(list(matmul_node.input)):
+                candidate_node = producer_map.get(str(input_name))
+                if candidate_node is not None and str(candidate_node.op_type) == "Reshape" and len(candidate_node.input) >= 2:
+                    reshape_node = candidate_node
+                    reshape_input_index = int(input_index)
+                    break
+            if reshape_node is None or reshape_input_index is None:
+                continue
+
+            reshape_shape_name = str(reshape_node.input[1]) if len(reshape_node.input) >= 2 else ""
+            reshape_shape_array = _onnx_get_initializer_array(graph, reshape_shape_name)
+            if reshape_shape_array is None:
+                continue
+            reshape_shape = [int(v) for v in reshape_shape_array.reshape(-1)]
+            constant_input_index = 1 - int(reshape_input_index)
+            constant_input_name = str(matmul_node.input[constant_input_index])
+            constant_array = _onnx_get_initializer_array(graph, constant_input_name)
+            if constant_array is None or constant_array.ndim < 2:
+                continue
+
+            if len(reshape_shape) == 4 and int(reshape_shape[1]) != 1 and int(reshape_shape[3]) == 1:
+                nchw_shape = np.asarray(
+                    [int(reshape_shape[0]), 1, int(reshape_shape[1]), int(reshape_shape[2])],
+                    dtype=np.int64,
+                )
+                transposed_constant_array = np.swapaxes(constant_array, -1, -2)
+                new_constant_name = _onnx_make_unique_initializer_name(graph, f"{constant_input_name}_nchw")
+                _onnx_set_initializer_array(
+                    graph,
+                    name=new_constant_name,
+                    array=np.asarray(transposed_constant_array),
+                )
+
+                new_shape_name = _onnx_make_unique_initializer_name(graph, f"{reshape_shape_name}_nchw")
+                _onnx_set_initializer_array(graph, name=new_shape_name, array=nchw_shape)
+                reshape_node.input[1] = str(new_shape_name)
+                matmul_node.input[0] = str(reshape_node.output[0])
+                matmul_node.input[1] = str(new_constant_name)
+                for user_node in list(consumer_map.get(str(matmul_node.output[0]), [])):
+                    if (
+                        str(user_node.op_type) == "Transpose"
+                        and list(_onnx_node_attr(user_node, "perm") or []) == [0, 3, 1, 2]
+                    ):
+                        _onnx_replace_all_node_inputs(
+                            graph,
+                            old_name=str(user_node.output[0]),
+                            new_name=str(matmul_node.output[0]),
+                        )
+                        remove_node_names.append(str(user_node.name))
+                _onnx_remove_nodes_by_name(graph, remove_node_names)
+                optimized = True
+                break
+
+            if len(reshape_shape) != 3 or constant_array.ndim != 3:
+                continue
+            matmul_output_name = str(matmul_node.output[0]) if matmul_node.output else ""
+            if matmul_output_name == "":
+                continue
+            matmul_users = consumer_map.get(matmul_output_name, [])
+            if len(matmul_users) != 1:
+                continue
+            trailing_reshape_node = matmul_users[0]
+            if str(trailing_reshape_node.op_type) != "Reshape" or len(trailing_reshape_node.input) < 2:
+                continue
+            trailing_shape_name = str(trailing_reshape_node.input[1])
+            trailing_shape_array = _onnx_get_initializer_array(graph, trailing_shape_name)
+            if trailing_shape_array is None:
+                continue
+            trailing_shape = [int(v) for v in trailing_shape_array.reshape(-1)]
+            if len(trailing_shape) != 4 or int(trailing_shape[1]) != 1:
+                continue
+            if int(trailing_shape[2]) != int(constant_array.shape[-2]) or int(trailing_shape[3]) != int(reshape_shape[-1]):
+                continue
+
+            nchw_shape = np.asarray(
+                [int(reshape_shape[0]), 1, int(reshape_shape[1]), int(reshape_shape[2])],
+                dtype=np.int64,
+            )
+            expanded_constant_array = np.expand_dims(np.asarray(constant_array), axis=1)
+            new_constant_name = _onnx_make_unique_initializer_name(graph, f"{constant_input_name}_nchw")
+            _onnx_set_initializer_array(
+                graph,
+                name=new_constant_name,
+                array=expanded_constant_array,
+            )
+            new_shape_name = _onnx_make_unique_initializer_name(graph, f"{reshape_shape_name}_nchw")
+            _onnx_set_initializer_array(graph, name=new_shape_name, array=nchw_shape)
+            reshape_node.input[1] = str(new_shape_name)
+            matmul_node.input[constant_input_index] = str(new_constant_name)
+            _onnx_replace_all_node_inputs(
+                graph,
+                old_name=str(trailing_reshape_node.output[0]),
+                new_name=str(matmul_node.output[0]),
+            )
+            remove_node_names.append(str(trailing_reshape_node.name))
+            _onnx_remove_nodes_by_name(graph, remove_node_names)
+            optimized = True
+            break
+        if not optimized:
+            break
+
+
+def _onnx_fold_singleton_slice_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    while True:
+        producer_map, consumer_map = _onnx_node_maps(graph)
+        remove_node_names: List[str] = []
+        optimized = False
+
+        for transpose_node in list(graph.node):
+            if str(transpose_node.op_type) != "Transpose":
+                continue
+            transpose_perm = list(_onnx_node_attr(transpose_node, "perm") or [])
+            if transpose_perm not in ([0, 2, 3, 1], [0, 3, 1, 2]):
+                continue
+            if not transpose_node.input or not transpose_node.output:
+                continue
+            transpose_input_name = str(transpose_node.input[0])
+            transpose_output_name = str(transpose_node.output[0])
+            transpose_consumers = consumer_map.get(transpose_output_name, [])
+            if not transpose_consumers:
+                continue
+            inverse_perm = [0, 3, 1, 2] if transpose_perm == [0, 2, 3, 1] else [0, 2, 3, 1]
+            slice_nodes: List[onnx.NodeProto] = []
+            inverse_transpose_nodes: List[onnx.NodeProto] = []
+            supported = True
+            for consumer_node in transpose_consumers:
+                if str(consumer_node.op_type) == "Slice":
+                    slice_nodes.append(consumer_node)
+                    continue
+                if (
+                    str(consumer_node.op_type) == "Transpose"
+                    and list(_onnx_node_attr(consumer_node, "perm") or []) == inverse_perm
+                ):
+                    inverse_transpose_nodes.append(consumer_node)
+                    continue
+                supported = False
+                break
+            if not supported or not slice_nodes:
+                continue
+            if not all(_onnx_rewrite_slice_axis_to_nchw_in_place(graph, slice_node=node) for node in slice_nodes):
+                continue
+            for slice_node in slice_nodes:
+                slice_node.input[0] = str(transpose_input_name)
+
+            remove_node_names.append(str(transpose_node.name))
+            for inverse_transpose_node in inverse_transpose_nodes:
+                _onnx_replace_all_node_inputs(
+                    graph,
+                    old_name=str(inverse_transpose_node.output[0]),
+                    new_name=transpose_input_name,
+                )
+                remove_node_names.append(str(inverse_transpose_node.name))
+
+            for slice_node in slice_nodes:
+                slice_output_name = str(slice_node.output[0]) if slice_node.output else ""
+                if slice_output_name == "":
+                    continue
+                for user_node in list(consumer_map.get(slice_output_name, [])):
+                    if str(user_node.op_type) != "Transpose":
+                        continue
+                    user_perm = list(_onnx_node_attr(user_node, "perm") or [])
+                    if transpose_perm == [0, 2, 3, 1] and user_perm != [0, 3, 1, 2]:
+                        continue
+                    if transpose_perm == [0, 3, 1, 2] and user_perm != [0, 2, 3, 1]:
+                        continue
+                    _onnx_replace_all_node_inputs(
+                        graph,
+                        old_name=str(user_node.output[0]),
+                        new_name=slice_output_name,
+                    )
+                    remove_node_names.append(str(user_node.name))
+
+            for user_node in list(transpose_consumers):
+                slice_output_name = str(user_node.output[0]) if user_node.output else ""
+                if slice_output_name == "":
+                    continue
+                passthrough_nodes = consumer_map.get(slice_output_name, [])
+                for passthrough_node in list(passthrough_nodes):
+                    if str(passthrough_node.op_type) not in {"Mul", "Add", "Sub", "Div", "Clip"}:
+                        continue
+                    passthrough_output_name = str(passthrough_node.output[0]) if passthrough_node.output else ""
+                    if passthrough_output_name == "":
+                        continue
+                    for inverse_node in list(consumer_map.get(passthrough_output_name, [])):
+                        if str(inverse_node.op_type) != "Transpose":
+                            continue
+                        inverse_perm = list(_onnx_node_attr(inverse_node, "perm") or [])
+                        if transpose_perm == [0, 2, 3, 1] and inverse_perm != [0, 3, 1, 2]:
+                            continue
+                        if transpose_perm == [0, 3, 1, 2] and inverse_perm != [0, 2, 3, 1]:
+                            continue
+                        _onnx_replace_all_node_inputs(
+                            graph,
+                            old_name=str(inverse_node.output[0]),
+                            new_name=passthrough_output_name,
+                        )
+                        remove_node_names.append(str(inverse_node.name))
+
+            _onnx_remove_nodes_by_name(graph, remove_node_names)
+            optimized = True
+            break
+
+        if not optimized:
+            break
+
+
+def _onnx_fold_singleton_concat_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    layout_preserving_unary_op_types = {
+        "Clip",
+        "Exp",
+        "Identity",
+        "LeakyRelu",
+        "Relu",
+        "Sigmoid",
+    }
+    scalar_binary_op_types = {
+        "Add",
+        "Div",
+        "Mul",
+        "Sub",
+    }
+    while True:
+        producer_map, consumer_map = _onnx_node_maps(graph)
+        optimized = False
+        for inverse_transpose_node in list(graph.node):
+            if str(inverse_transpose_node.op_type) != "Transpose":
+                continue
+            if list(_onnx_node_attr(inverse_transpose_node, "perm") or []) != [0, 3, 1, 2]:
+                continue
+            concat_node_name = str(inverse_transpose_node.input[0]) if inverse_transpose_node.input else ""
+            concat_node = producer_map.get(concat_node_name)
+            if concat_node is None or str(concat_node.op_type) != "Concat":
+                continue
+            if int(_onnx_node_attr(concat_node, "axis") or -1) != 3:
+                continue
+            if len(consumer_map.get(str(concat_node.output[0]), [])) != 1:
+                continue
+
+            rewritten_inputs: List[str] = []
+            remove_node_names: List[str] = [str(inverse_transpose_node.name)]
+            valid = True
+            for input_name in list(concat_node.input):
+                input_producer = producer_map.get(str(input_name))
+                if input_producer is None:
+                    valid = False
+                    break
+                if str(input_producer.op_type) == "Slice":
+                    axes_array = _onnx_get_initializer_array(
+                        graph,
+                        str(input_producer.input[3]) if len(input_producer.input) >= 4 else "",
+                    )
+                    if axes_array is not None and [int(v) for v in axes_array.reshape(-1)] == [1]:
+                        rewritten_inputs.append(str(input_name))
+                        continue
+                input_shape = _onnx_resolve_rank4_shape(
+                    graph,
+                    str(input_name),
+                    producer_map=producer_map,
+                )
+                if (
+                    input_shape is not None
+                    and len(input_shape) == 4
+                    and int(input_shape[1]) == 1
+                    and int(input_shape[2]) > 0
+                    and int(input_shape[3]) > 0
+                ):
+                    rewritten_inputs.append(str(input_name))
+                    continue
+                if (
+                    str(input_producer.op_type) == "Transpose"
+                    and list(_onnx_node_attr(input_producer, "perm") or []) == [0, 2, 3, 1]
+                    and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                ):
+                    rewritten_inputs.append(str(input_producer.input[0]))
+                    remove_node_names.append(str(input_producer.name))
+                    continue
+                if str(input_producer.op_type) in layout_preserving_unary_op_types and len(input_producer.input) >= 1:
+                    unary_input_name = str(input_producer.input[0])
+                    unary_input_producer = producer_map.get(unary_input_name)
+                    if (
+                        unary_input_producer is not None
+                        and str(unary_input_producer.op_type) == "Transpose"
+                        and list(_onnx_node_attr(unary_input_producer, "perm") or []) == [0, 2, 3, 1]
+                        and len(consumer_map.get(str(unary_input_producer.output[0]), [])) == 1
+                    ):
+                        input_producer.input[0] = str(unary_input_producer.input[0])
+                        rewritten_inputs.append(str(input_producer.output[0]))
+                        remove_node_names.append(str(unary_input_producer.name))
+                        continue
+                if str(input_producer.op_type) in scalar_binary_op_types and len(input_producer.input) == 2:
+                    transpose_input_index: Optional[int] = None
+                    for input_index, candidate_input_name in enumerate(list(input_producer.input)):
+                        candidate_producer = producer_map.get(str(candidate_input_name))
+                        if (
+                            candidate_producer is not None
+                            and str(candidate_producer.op_type) == "Transpose"
+                            and list(_onnx_node_attr(candidate_producer, "perm") or []) == [0, 2, 3, 1]
+                            and len(consumer_map.get(str(candidate_producer.output[0]), [])) == 1
+                        ):
+                            transpose_input_index = int(input_index)
+                            break
+                    if transpose_input_index is not None:
+                        transpose_input_name = str(input_producer.input[transpose_input_index])
+                        transpose_input_producer = producer_map.get(transpose_input_name)
+                        if transpose_input_producer is not None:
+                            input_producer.input[transpose_input_index] = str(transpose_input_producer.input[0])
+                            rewritten_inputs.append(str(input_producer.output[0]))
+                            remove_node_names.append(str(transpose_input_producer.name))
+                            continue
+                valid = False
+                break
+            if not valid or not rewritten_inputs:
+                continue
+
+            for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+                concat_node.input[input_index] = str(rewritten_input_name)
+            _onnx_set_node_attr(concat_node, "axis", 1)
+            _onnx_replace_all_node_inputs(
+                graph,
+                old_name=str(inverse_transpose_node.output[0]),
+                new_name=str(concat_node.output[0]),
+            )
+            _onnx_remove_nodes_by_name(graph, remove_node_names)
+            optimized = True
+            break
+        if not optimized:
+            break
+
+
+def _onnx_fold_singleton_concat_slice_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    while True:
+        producer_map, consumer_map = _onnx_node_maps(graph)
+        optimized = False
+        for concat_node in list(graph.node):
+            if str(concat_node.op_type) != "Concat":
+                continue
+            if int(_onnx_node_attr(concat_node, "axis") or -1) != 3:
+                continue
+
+            rewritten_inputs: List[str] = []
+            remove_node_names: List[str] = []
+            valid_inputs = True
+            for input_name in list(concat_node.input):
+                input_str = str(input_name)
+                input_shape = _onnx_resolve_rank4_shape(
+                    graph,
+                    input_str,
+                    producer_map=producer_map,
+                )
+                if (
+                    input_shape is not None
+                    and len(input_shape) == 4
+                    and int(input_shape[1]) == 1
+                    and int(input_shape[2]) > 0
+                    and int(input_shape[3]) > 0
+                ):
+                    rewritten_inputs.append(input_str)
+                    continue
+                input_producer = producer_map.get(input_str)
+                if (
+                    input_producer is not None
+                    and str(input_producer.op_type) == "Transpose"
+                    and list(_onnx_node_attr(input_producer, "perm") or []) == [0, 2, 3, 1]
+                    and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                ):
+                    source_name = str(input_producer.input[0]) if input_producer.input else ""
+                    source_shape = _onnx_resolve_rank4_shape(
+                        graph,
+                        source_name,
+                        producer_map=producer_map,
+                    )
+                    if (
+                        source_name != ""
+                        and source_shape is not None
+                        and len(source_shape) == 4
+                        and int(source_shape[1]) == 1
+                    ):
+                        rewritten_inputs.append(source_name)
+                        remove_node_names.append(str(input_producer.name))
+                        continue
+                valid_inputs = False
+                break
+            if not valid_inputs or not rewritten_inputs:
+                continue
+
+            concat_consumers = consumer_map.get(str(concat_node.output[0]), [])
+            if not concat_consumers:
+                continue
+            if not all(str(node.op_type) == "Slice" for node in concat_consumers):
+                continue
+            if not all(_onnx_rewrite_slice_axis_to_nchw_in_place(graph, slice_node=node) for node in concat_consumers):
+                continue
+
+            for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+                concat_node.input[input_index] = str(rewritten_input_name)
+            _onnx_set_node_attr(concat_node, "axis", 1)
+            _onnx_remove_nodes_by_name(graph, remove_node_names)
+            optimized = True
+            break
+        if not optimized:
+            break
+
+
+def _onnx_fold_singleton_binary_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    binary_op_types = {
+        "Add",
+        "Div",
+        "Mul",
+        "Sub",
+    }
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for transpose_node in list(graph.node):
+        if str(transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(transpose_node, "perm") or []) != [0, 3, 1, 2]:
+            continue
+        transpose_input_name = str(transpose_node.input[0]) if transpose_node.input else ""
+        transpose_output_name = str(transpose_node.output[0]) if transpose_node.output else ""
+        if transpose_input_name == "" or transpose_output_name == "":
+            continue
+        transpose_input_shape = _onnx_resolve_rank4_shape(
+            graph,
+            transpose_input_name,
+            producer_map=producer_map,
+        )
+        if (
+            transpose_input_shape is None
+            or len(transpose_input_shape) != 4
+            or int(transpose_input_shape[1]) != 1
+        ):
+            continue
+        transpose_consumers = consumer_map.get(transpose_output_name, [])
+        if not transpose_consumers:
+            continue
+        rewrites: List[Tuple[onnx.NodeProto, int]] = []
+        valid = True
+        for binary_node in list(transpose_consumers):
+            if str(binary_node.op_type) not in binary_op_types or len(binary_node.input) != 2:
+                valid = False
+                break
+            binary_input_index = None
+            other_input_name = ""
+            for input_index, input_name in enumerate(list(binary_node.input)):
+                if str(input_name) == transpose_output_name:
+                    binary_input_index = int(input_index)
+                    other_input_name = str(binary_node.input[1 - input_index])
+                    break
+            if binary_input_index is None or other_input_name == "":
+                valid = False
+                break
+            other_input_shape = _onnx_resolve_rank4_shape(
+                graph,
+                other_input_name,
+                producer_map=producer_map,
+            )
+            if other_input_shape is None:
+                scalar_initializer = _onnx_get_initializer_array(graph, other_input_name)
+                if scalar_initializer is not None and int(np.asarray(scalar_initializer).size) == 1:
+                    rewrites.append((binary_node, int(binary_input_index)))
+                    continue
+                other_input_producer = producer_map.get(other_input_name)
+                if (
+                    other_input_producer is None
+                    or str(other_input_producer.op_type) != "Concat"
+                    or int(_onnx_node_attr(other_input_producer, "axis") or -1) != 1
+                ):
+                    valid = False
+                    break
+            else:
+                if (
+                    len(other_input_shape) != 4
+                    or int(other_input_shape[1]) <= 0
+                    or int(other_input_shape[2]) != int(transpose_input_shape[2])
+                    or int(other_input_shape[3]) != int(transpose_input_shape[3])
+                ):
+                    valid = False
+                    break
+            rewrites.append((binary_node, int(binary_input_index)))
+        if not valid:
+            continue
+        for binary_node, binary_input_index in rewrites:
+            binary_node.input[binary_input_index] = transpose_input_name
+        remove_node_names.append(str(transpose_node.name))
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_binary_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    binary_op_types = {
+        "Add",
+        "Div",
+        "Max",
+        "Min",
+        "Mul",
+        "Sub",
+    }
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for binary_node in list(graph.node):
+        if str(binary_node.op_type) not in binary_op_types or len(binary_node.input) != 2:
+            continue
+        rewritten_inputs: List[str] = []
+        rewritten_any = False
+        expected_shape: Optional[List[int]] = None
+        valid = True
+        for input_name in list(binary_node.input):
+            input_str = str(input_name)
+            scalar_initializer = _onnx_get_initializer_array(graph, input_str)
+            if scalar_initializer is not None and int(np.asarray(scalar_initializer).size) == 1:
+                rewritten_inputs.append(input_str)
+                continue
+            input_producer = producer_map.get(input_str)
+            if (
+                input_producer is not None
+                and str(input_producer.op_type) == "Transpose"
+                and list(_onnx_node_attr(input_producer, "perm") or []) == [0, 2, 3, 1]
+                and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                and input_producer.input
+            ):
+                source_name = str(input_producer.input[0])
+                source_shape = _onnx_resolve_rank4_shape(
+                    graph,
+                    source_name,
+                    producer_map=producer_map,
+                )
+                if source_shape is None or len(source_shape) != 4:
+                    valid = False
+                    break
+                if expected_shape is None:
+                    expected_shape = [int(v) for v in list(source_shape)]
+                elif [int(v) for v in list(source_shape)] != expected_shape:
+                    valid = False
+                    break
+                rewritten_inputs.append(source_name)
+                remove_node_names.append(str(input_producer.name))
+                rewritten_any = True
+                continue
+            input_shape = _onnx_resolve_rank4_shape(
+                graph,
+                input_str,
+                producer_map=producer_map,
+            )
+            if input_shape is None or len(input_shape) != 4:
+                valid = False
+                break
+            if expected_shape is None:
+                expected_shape = [int(v) for v in list(input_shape)]
+            elif [int(v) for v in list(input_shape)] != expected_shape:
+                valid = False
+                break
+            rewritten_inputs.append(input_str)
+        if not valid or not rewritten_any or len(rewritten_inputs) != 2:
+            continue
+        for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+            binary_node.input[input_index] = str(rewritten_input_name)
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
 def _onnx_fold_softmax_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
     producer_map, consumer_map = _onnx_node_maps(graph)
     remove_node_names: List[str] = []
@@ -12531,15 +13398,62 @@ def _onnx_fold_softmax_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
 
 
 def _optimize_dynamo_exported_onnx_in_place(model: onnx.ModelProto) -> None:
-    _onnx_remove_passthrough_identity_nodes_in_place(model.graph)
-    _onnx_fold_relu_layout_bridges_in_place(model.graph)
-    _onnx_fold_mul_reducesum_sigmoid_layout_bridges_in_place(model.graph)
-    _onnx_fold_reducesum_sigmoid_layout_bridges_in_place(model.graph)
-    _onnx_fold_inverse_transpose_pairs_in_place(model.graph)
-    _onnx_optimize_pidnet_spp_transpose_bridges_in_place(model.graph)
-    _onnx_optimize_pphumanseg_add_resize_layout_bridges_in_place(model.graph)
-    _onnx_fold_concat_layout_bridges_in_place(model.graph)
-    _onnx_fold_softmax_layout_bridges_in_place(model.graph)
+    def _value_info_signature(graph: onnx.GraphProto) -> Tuple[Any, ...]:
+        signature: List[Tuple[str, Tuple[Any, ...]]] = []
+        for value_info in list(graph.value_info) + list(graph.input) + list(graph.output):
+            dims: List[Any] = []
+            for dim in value_info.type.tensor_type.shape.dim:
+                if dim.HasField("dim_value"):
+                    dims.append(int(dim.dim_value))
+                elif dim.HasField("dim_param"):
+                    dims.append(str(dim.dim_param))
+                else:
+                    dims.append("?")
+            signature.append((str(value_info.name), tuple(dims)))
+        return tuple(signature)
+
+    def _graph_signature(graph: onnx.GraphProto) -> Tuple[Any, ...]:
+        return (
+            tuple(
+            (
+                str(node.name),
+                str(node.op_type),
+                tuple(str(v) for v in node.input),
+                tuple(str(v) for v in node.output),
+                tuple(
+                    (
+                        str(attr.name),
+                        repr(onnx.helper.get_attribute_value(attr)),
+                    )
+                    for attr in node.attribute
+                ),
+            )
+            for node in graph.node
+            ),
+            _value_info_signature(graph),
+        )
+
+    for _ in range(4):
+        before_signature = _graph_signature(model.graph)
+        _onnx_remove_passthrough_identity_nodes_in_place(model.graph)
+        _onnx_fold_relu_layout_bridges_in_place(model.graph)
+        _onnx_fold_mul_reducesum_sigmoid_layout_bridges_in_place(model.graph)
+        _onnx_fold_reducesum_sigmoid_layout_bridges_in_place(model.graph)
+        _onnx_fold_inverse_transpose_pairs_in_place(model.graph)
+        _onnx_fold_singleton_resize_matmul_transpose_bridges_in_place(model.graph)
+        _onnx_fold_singleton_slice_layout_bridges_in_place(model.graph)
+        _onnx_optimize_pidnet_spp_transpose_bridges_in_place(model.graph)
+        _onnx_optimize_pphumanseg_add_resize_layout_bridges_in_place(model.graph)
+        _onnx_fold_singleton_concat_slice_layout_bridges_in_place(model.graph)
+        _onnx_fold_binary_layout_bridges_in_place(model.graph)
+        _onnx_fold_singleton_binary_layout_bridges_in_place(model.graph)
+        _onnx_fold_concat_layout_bridges_in_place(model.graph)
+        _onnx_fold_pad_concat_layout_bridges_in_place(model.graph)
+        _onnx_fold_singleton_concat_layout_bridges_in_place(model.graph)
+        _onnx_fold_softmax_layout_bridges_in_place(model.graph)
+        _onnx_repair_inferred_shapes_in_place(model)
+        if _graph_signature(model.graph) == before_signature:
+            break
 
 
 def _onnx_model_uses_external_data(model: onnx.ModelProto) -> bool:
@@ -12554,13 +13468,21 @@ def _inspect_onnx_uses_external_data(onnx_path: Path) -> bool:
     return _onnx_model_uses_external_data(model)
 
 
+def _suppress_torch_onnx_optional_registration_warnings() -> None:
+    try:
+        import logging
+
+        logging.getLogger("torch.onnx._internal.exporter._registration").setLevel(logging.ERROR)
+    except Exception:
+        pass
+
+
 def _sanitize_dynamo_exported_onnx_metadata(onnx_path: Path) -> None:
     external_data_sidecar_path = onnx_path.with_name(f"{onnx_path.name}.data")
     original_uses_external_data = _inspect_onnx_uses_external_data(onnx_path)
     model = onnx.load(str(onnx_path))
     del model.metadata_props[:]
     _clear_onnx_graph_and_node_metadata_in_place(model.graph)
-    _optimize_dynamo_exported_onnx_in_place(model)
     onnx.checker.check_model(model)
     if original_uses_external_data:
         onnx.save_model(
@@ -12808,6 +13730,7 @@ def export_torchscript_from_generated_package(
     torchscript_file_name = f"{file_stem}_jit.pt"
     torchscript_path = package_path / torchscript_file_name
     child_script = """
+import dataclasses
 import hashlib
 import importlib
 import importlib.util
@@ -12841,8 +13764,6 @@ if spec is None or spec.loader is None:
 module = importlib.util.module_from_spec(spec)
 sys.modules[module_name] = module
 spec.loader.exec_module(module)
-runtime_module = importlib.import_module(f"{module_name}.runtime")
-setattr(runtime_module, "_ONNX2TF_DISABLE_SYMBOLIC_SHAPE_TENSORS", True)
 if not hasattr(module, "load_model"):
     raise RuntimeError(
         "Generated native PyTorch package does not expose load_model(). "
@@ -12994,6 +13915,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -13022,8 +13944,6 @@ if spec is None or spec.loader is None:
 module = importlib.util.module_from_spec(spec)
 sys.modules[module_name] = module
 spec.loader.exec_module(module)
-runtime_module = importlib.import_module(f"{module_name}.runtime")
-setattr(runtime_module, "_ONNX2TF_DISABLE_SYMBOLIC_SHAPE_TENSORS", True)
 if not hasattr(module, "load_model"):
     raise RuntimeError(
         "Generated native PyTorch package does not expose load_model(). "
@@ -13033,10 +13953,10 @@ payload = torch.load(str(inputs_path), map_location="cpu")
 example_inputs = tuple(payload["inputs"])
 input_names = [str(v) for v in list(payload.get("input_names", []))]
 output_names = [str(v) for v in list(payload.get("output_names", []))]
+logging.getLogger("torch.onnx._internal.exporter._registration").setLevel(logging.ERROR)
 model = module.load_model(device="cpu", eval_mode=True)
 if hasattr(model, "cpu"):
     model = model.cpu()
-setattr(model, "_onnx2tf_torch_export_mode", True)
 with torch.no_grad():
     torch.onnx.export(
         model,
@@ -13047,7 +13967,7 @@ with torch.no_grad():
         output_names=output_names,
     )
 print(json.dumps({"file_name": dynamo_onnx_path.name}))
-"""
+    """
     child_payload, last_error_message = _run_generated_package_export_child(
         example_inputs=example_inputs,
         child_script=child_script,
@@ -13076,7 +13996,25 @@ print(json.dumps({"file_name": dynamo_onnx_path.name}))
                 f"package_dir={package_dir} details={last_error_message}"
             )
         return None
-    _sanitize_dynamo_exported_onnx_metadata(dynamo_onnx_path)
+    try:
+        _sanitize_dynamo_exported_onnx_metadata(dynamo_onnx_path)
+    except Exception as ex:
+        _remove_generated_package_artifact_if_exists(dynamo_onnx_path)
+        _write_generated_package_export_metadata(
+            metadata_path=metadata_path,
+            metadata=metadata,
+            metadata_key="dynamo_onnx",
+            file_name=None,
+            example_input_shapes=example_input_shapes,
+            dynamic_inputs_present=dynamic_inputs_present,
+            error=str(ex),
+        )
+        if raise_on_failure:
+            raise ModelIRPyTorchExportError(
+                "Dynamo ONNX sanitize failed for the generated native PyTorch package. "
+                f"package_dir={package_dir} artifact={dynamo_onnx_path} details={ex}"
+            ) from ex
+        return None
     _write_generated_package_export_metadata(
         metadata_path=metadata_path,
         metadata=metadata,
@@ -13205,7 +14143,6 @@ example_inputs = tuple(payload["inputs"])
 model = module.load_model(device="cpu", eval_mode=True)
 if hasattr(model, "cpu"):
     model = model.cpu()
-setattr(model, "_onnx2tf_torch_export_mode", True)
 
 def _prune_alias_nodes(exported_program):
     graph_module = getattr(exported_program, "graph_module", None)
@@ -13237,7 +14174,7 @@ def _prune_alias_nodes(exported_program):
         graph_module.recompile()
     return exported_program
 
-def _fold_inverse_permute_round_trips(exported_program):
+def _fold_singleton_channel_split_permute_bridges_in_exported_program(exported_program):
     graph_module = getattr(exported_program, "graph_module", None)
     if graph_module is None:
         return exported_program
@@ -13249,11 +14186,323 @@ def _fold_inverse_permute_round_trips(exported_program):
             return None
         return [int(v) for v in arg]
 
+    def _rank4_shape(node):
+        if not isinstance(node, torch.fx.Node):
+            return None
+        meta_val = getattr(node, "meta", {}).get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            shape = [int(v) for v in list(meta_val.shape)]
+            return shape if len(shape) == 4 else None
+        if node.op == "get_attr" and isinstance(node.target, str):
+            tensor = getattr(graph_module, node.target, None)
+            if isinstance(tensor, torch.Tensor):
+                shape = [int(v) for v in list(tensor.shape)]
+                return shape if len(shape) == 4 else None
+        return None
+
+    def _shape_meta_like(node, shape):
+        meta = dict(getattr(node, "meta", {}))
+        meta_val = meta.get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            try:
+                meta["val"] = torch.empty(
+                    tuple(int(v) for v in shape),
+                    dtype=meta_val.dtype,
+                    device="meta",
+                )
+            except Exception:
+                pass
+        return meta
+
+    def _shape_list_from_arg(arg):
+        if not isinstance(arg, (list, tuple)):
+            return None
+        try:
+            return [int(v) for v in list(arg)]
+        except Exception:
+            return None
+
+    def _is_scalar_like(value):
+        if not isinstance(value, torch.fx.Node):
+            return True
+        meta_val = getattr(value, "meta", {}).get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            return int(meta_val.numel()) == 1
+        if value.op == "get_attr" and isinstance(value.target, str):
+            tensor = getattr(graph_module, value.target, None)
+            if isinstance(tensor, torch.Tensor):
+                return int(tensor.numel()) == 1
+        return False
+
+    def _sync_user_output_signature():
+        graph_signature = getattr(exported_program, "graph_signature", None)
+        if graph_signature is None:
+            return
+        output_node = None
+        for maybe_output in graph.nodes:
+            if maybe_output.op == "output":
+                output_node = maybe_output
+                break
+        if output_node is None or len(output_node.args) == 0:
+            return
+        output_args = output_node.args[0]
+        if not isinstance(output_args, (list, tuple)):
+            output_args = (output_args,)
+        output_specs = []
+        for arg in output_args:
+            if not isinstance(arg, torch.fx.Node):
+                return
+            output_specs.append(
+                torch.export.graph_signature.OutputSpec(
+                    kind=torch.export.graph_signature.OutputKind.USER_OUTPUT,
+                    arg=torch.export.graph_signature.TensorArgument(name=str(arg.name)),
+                    target=None,
+                )
+            )
+        try:
+            exported_program._graph_signature = dataclasses.replace(
+                graph_signature,
+                output_specs=output_specs,
+            )
+        except Exception:
+            pass
+
+    def _shape_meta_like(node, shape):
+        meta = dict(getattr(node, "meta", {}))
+        meta_val = meta.get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            try:
+                meta["val"] = torch.empty(
+                    tuple(int(v) for v in shape),
+                    dtype=meta_val.dtype,
+                    device="meta",
+                )
+            except Exception:
+                pass
+        return meta
+
+    while True:
+        local_changed = False
+        for split_node in list(graph.nodes):
+            if (
+                split_node.op != "call_function"
+                or str(split_node.target) != "aten.tensor_split.sections"
+                or len(split_node.args) < 3
+            ):
+                continue
+            split_input = split_node.args[0]
+            if not (
+                isinstance(split_input, torch.fx.Node)
+                and split_input.op == "call_function"
+                and str(split_input.target) == "aten.contiguous.default"
+                and len(split_input.args) >= 1
+                and isinstance(split_input.args[0], torch.fx.Node)
+            ):
+                continue
+            permute_node = split_input.args[0]
+            if (
+                permute_node.op != "call_function"
+                or str(permute_node.target) != "aten.permute.default"
+                or len(permute_node.args) < 2
+                or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_node.args[0], torch.fx.Node)
+            ):
+                continue
+            if int(split_node.args[2]) != 3:
+                continue
+            base_source = permute_node.args[0]
+            base_shape = _rank4_shape(base_source)
+            permuted_shape = _rank4_shape(split_input)
+            if (
+                base_shape is None
+                or permuted_shape is None
+                or int(base_shape[1]) <= 0
+                or int(permuted_shape[3]) != 1
+                or int(base_shape[1]) != int(permuted_shape[3]) * len(list(split_node.users))
+            ):
+                pass
+            if base_shape is None or len(base_shape) != 4:
+                continue
+            getitem_users = []
+            for user in list(split_node.users):
+                if (
+                    user.op != "call_function"
+                    or str(user.target) != "<built-in function getitem>"
+                    or len(user.args) < 2
+                    or user.args[0] is not split_node
+                ):
+                    getitem_users = []
+                    break
+                item_shape = _rank4_shape(user)
+                if item_shape is None or item_shape != [int(base_shape[0]), int(base_shape[2]), int(base_shape[3]), 1]:
+                    getitem_users = []
+                    break
+                getitem_users.append(user)
+            if len(getitem_users) == 0:
+                continue
+
+            with graph.inserting_before(split_node):
+                new_split = graph.call_function(
+                    torch.ops.aten.tensor_split.sections,
+                    args=(base_source, 1, 1),
+                    kwargs=dict(split_node.kwargs),
+                )
+            new_split.meta = dict(getattr(split_node, "meta", {}))
+
+            for getitem_node in list(getitem_users):
+                split_index = int(getitem_node.args[1])
+                with graph.inserting_before(getitem_node):
+                    new_getitem = graph.call_function(
+                        getitem_node.target,
+                        args=(new_split, split_index),
+                        kwargs=dict(getitem_node.kwargs),
+                    )
+                cf_shape = [int(base_shape[0]), 1, int(base_shape[2]), int(base_shape[3])]
+                nhwc_shape = [int(base_shape[0]), int(base_shape[2]), int(base_shape[3]), 1]
+                new_getitem.meta = _shape_meta_like(getitem_node, cf_shape)
+                nhwc_view = None
+
+                def _get_nhwc_view(insert_before_node):
+                    nonlocal nhwc_view
+                    if nhwc_view is not None:
+                        return nhwc_view
+                    with graph.inserting_before(insert_before_node):
+                        nhwc_view = graph.call_function(
+                            torch.ops.aten.reshape.default,
+                            args=(new_getitem, nhwc_shape),
+                            kwargs={},
+                        )
+                    nhwc_view.meta = _shape_meta_like(getitem_node, nhwc_shape)
+                    return nhwc_view
+
+                for user in list(getitem_node.users):
+                    if (
+                        user.op == "call_function"
+                        and str(user.target) == "aten.permute.default"
+                        and len(user.args) >= 2
+                        and user.args[0] is getitem_node
+                        and _normalize_perm(user.args[1]) == [0, 3, 1, 2]
+                    ):
+                        permute_users = list(user.users)
+                        if (
+                            len(permute_users) == 1
+                            and permute_users[0].op == "call_function"
+                            and str(permute_users[0].target) == "aten.contiguous.default"
+                        ):
+                            permute_users[0].replace_all_uses_with(new_getitem)
+                        else:
+                            user.replace_all_uses_with(new_getitem)
+                        local_changed = True
+                        changed = True
+                        continue
+                    if (
+                        user.op == "call_function"
+                        and str(user.target) == "aten.reshape.default"
+                        and len(user.args) >= 2
+                        and _shape_list_from_arg(user.args[1]) == cf_shape
+                    ):
+                        user.replace_all_uses_with(new_getitem)
+                        local_changed = True
+                        changed = True
+                        continue
+                    if (
+                        user.op == "call_function"
+                        and str(user.target) in {
+                            "aten.add.Tensor",
+                            "aten.div.Tensor",
+                            "aten.mul.Tensor",
+                            "aten.sub.Tensor",
+                        }
+                        and len(user.args) == 2
+                        and (
+                            (user.args[0] is getitem_node and _is_scalar_like(user.args[1]))
+                            or (user.args[1] is getitem_node and _is_scalar_like(user.args[0]))
+                        )
+                    ):
+                        user.replace_input_with(getitem_node, new_getitem)
+                        user.meta = _shape_meta_like(user, cf_shape)
+                        local_changed = True
+                        changed = True
+                        continue
+                    replacement = _get_nhwc_view(user)
+                    user.replace_input_with(getitem_node, replacement)
+                    local_changed = True
+                    changed = True
+
+            for getitem_node in list(getitem_users):
+                if len(list(getitem_node.users)) == 0:
+                    graph.erase_node(getitem_node)
+            if len(list(split_node.users)) == 0:
+                graph.erase_node(split_node)
+
+            if local_changed:
+                graph.eliminate_dead_code()
+                graph.lint()
+                graph_module.recompile()
+                break
+
+        if not local_changed:
+            break
+
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+        graph_module.recompile()
+        _sync_user_output_signature()
+    return exported_program
+
+def _fold_inverse_permute_round_trips(exported_program):
+    graph_module = getattr(exported_program, "graph_module", None)
+    if graph_module is None:
+        return exported_program
+    graph = graph_module.graph
+    graph_signature = getattr(exported_program, "graph_signature", None)
+    user_output_names = set()
+    if graph_signature is not None:
+        try:
+            user_output_names = {str(name) for name in list(graph_signature.user_outputs)}
+        except Exception:
+            user_output_names = set()
+    changed = False
+
+    def _normalize_perm(arg):
+        if not isinstance(arg, (list, tuple)):
+            return None
+        return [int(v) for v in arg]
+
+    def _is_user_output_node(node):
+        return isinstance(node, torch.fx.Node) and str(node.name) in user_output_names
+
     def _inverse_perm(perm):
         inverse = [0] * len(perm)
         for idx, value in enumerate(perm):
             inverse[int(value)] = int(idx)
         return inverse
+
+    def _convert_nhwc_pad_to_nchw_pad(pad_values):
+        values = [int(v) for v in list(pad_values)]
+        if len(values) % 2 != 0 or len(values) > 8:
+            return None
+        nhwc_inner_to_outer = ["C", "W", "H", "N"]
+        nchw_inner_to_outer = ["W", "H", "C", "N"]
+        semantic_pairs = {name: [0, 0] for name in nhwc_inner_to_outer}
+        pair_count = len(values) // 2
+        for idx in range(pair_count):
+            semantic_pairs[nhwc_inner_to_outer[idx]] = [
+                values[idx * 2],
+                values[idx * 2 + 1],
+            ]
+        output_pairs = [semantic_pairs[name] for name in nchw_inner_to_outer]
+        last_nonzero = -1
+        for idx, pair in enumerate(output_pairs):
+            if pair != [0, 0]:
+                last_nonzero = idx
+        if last_nonzero < 0:
+            return []
+        flattened = []
+        for pair in output_pairs[: last_nonzero + 1]:
+            flattened.extend(pair)
+        return flattened
 
     def _match_permute_chain_source(node, perm):
         if not isinstance(node, torch.fx.Node):
@@ -13285,6 +14534,64 @@ def _fold_inverse_permute_round_trips(exported_program):
 
     def _match_binary_input_source(node, perm):
         return _match_permute_chain_source(node, perm)
+
+    def _match_cat_input_fold_source(node):
+        if not isinstance(node, torch.fx.Node):
+            return None
+        source = _match_permute_chain_source(node, [0, 2, 3, 1])
+        if source is not None:
+            return source
+        direct_shape = _rank4_shape(node)
+        if direct_shape is not None and int(direct_shape[3]) == 1:
+            return ("reshape", node, [int(direct_shape[0]), 1, int(direct_shape[1]), int(direct_shape[2])])
+        if (
+            node.op == "call_function"
+            and str(node.target) == "aten.pad.default"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], torch.fx.Node)
+        ):
+            pad_source = _match_permute_chain_source(node.args[0], [0, 2, 3, 1])
+            if pad_source is None:
+                return None
+            nchw_pad = _convert_nhwc_pad_to_nchw_pad(node.args[1])
+            if nchw_pad is None:
+                return None
+            return (pad_source, nchw_pad, tuple(node.args[2:]), dict(node.kwargs))
+        return None
+
+    def _rank4_shape(node):
+        if not isinstance(node, torch.fx.Node):
+            return None
+        meta_val = getattr(node, "meta", {}).get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            shape = [int(v) for v in list(meta_val.shape)]
+            return shape if len(shape) == 4 else None
+        if node.op == "get_attr" and isinstance(node.target, str):
+            tensor = getattr(graph_module, node.target, None)
+            if isinstance(tensor, torch.Tensor):
+                shape = [int(v) for v in list(tensor.shape)]
+                return shape if len(shape) == 4 else None
+        return None
+
+    def _match_nhwc_singleton_view_source(node):
+        if not isinstance(node, torch.fx.Node):
+            return None
+        if (
+            node.op == "call_function"
+            and str(node.target) == "aten.reshape.default"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], torch.fx.Node)
+            and isinstance(node.args[1], (list, tuple))
+        ):
+            input_shape = _rank4_shape(node.args[0])
+            view_shape = [int(v) for v in list(node.args[1])]
+            if (
+                input_shape is not None
+                and view_shape == [int(input_shape[0]), int(input_shape[2]), int(input_shape[3]), 1]
+                and int(input_shape[1]) == 1
+            ):
+                return node.args[0]
+        return _match_permute_chain_source(node, [0, 2, 3, 1])
 
     for node in list(graph.nodes):
         if (
@@ -13324,8 +14631,12 @@ def _fold_inverse_permute_round_trips(exported_program):
                         and inverse_users[0].op == "call_function"
                         and str(inverse_users[0].target) == "aten.contiguous.default"
                     ):
+                        if _is_user_output_node(inverse_users[0]):
+                            continue
                         inverse_users[0].replace_all_uses_with(root_replacement)
                     else:
+                        if _is_user_output_node(inverse_node):
+                            continue
                         inverse_node.replace_all_uses_with(root_replacement)
                     changed = True
 
@@ -13348,8 +14659,12 @@ def _fold_inverse_permute_round_trips(exported_program):
             and node_users[0].op == "call_function"
             and str(node_users[0].target) == "aten.contiguous.default"
         ):
+            if _is_user_output_node(node_users[0]):
+                continue
             node_users[0].replace_all_uses_with(source)
         else:
+            if _is_user_output_node(node):
+                continue
             node.replace_all_uses_with(source)
         changed = True
 
@@ -13381,11 +14696,33 @@ def _fold_inverse_permute_round_trips(exported_program):
             continue
         folded_inputs = []
         for cat_input in list(cat_inputs_arg):
-            folded_source = _match_permute_chain_source(cat_input, [0, 2, 3, 1])
+            folded_source = _match_cat_input_fold_source(cat_input)
             if folded_source is None:
                 folded_inputs = []
                 break
-            folded_inputs.append(folded_source)
+            if isinstance(folded_source, tuple):
+                if len(folded_source) == 3 and folded_source[0] == "reshape":
+                    _, source_node, reshaped_shape = folded_source
+                    with graph.inserting_before(cat_node):
+                        folded_reshape = graph.call_function(
+                            torch.ops.aten.reshape.default,
+                            args=(source_node, reshaped_shape),
+                            kwargs={},
+                        )
+                    folded_reshape.meta = _shape_meta_like(cat_input, reshaped_shape)
+                    folded_inputs.append(folded_reshape)
+                else:
+                    source_node, nchw_pad, pad_args_tail, pad_kwargs = folded_source
+                    with graph.inserting_before(cat_node):
+                        folded_pad = graph.call_function(
+                            torch.ops.aten.pad.default,
+                            args=(source_node, nchw_pad, *pad_args_tail),
+                            kwargs=pad_kwargs,
+                        )
+                    folded_pad.meta = dict(getattr(cat_input, "meta", {}))
+                    folded_inputs.append(folded_pad)
+            else:
+                folded_inputs.append(folded_source)
         if len(folded_inputs) != len(list(cat_inputs_arg)):
             continue
         folded_cat_kwargs = dict(cat_node.kwargs)
@@ -13402,8 +14739,12 @@ def _fold_inverse_permute_round_trips(exported_program):
             and inverse_users[0].op == "call_function"
             and str(inverse_users[0].target) == "aten.contiguous.default"
         ):
+            if _is_user_output_node(inverse_users[0]):
+                continue
             inverse_users[0].replace_all_uses_with(cat_node)
         else:
+            if _is_user_output_node(node):
+                continue
             node.replace_all_uses_with(cat_node)
         changed = True
 
@@ -13446,8 +14787,12 @@ def _fold_inverse_permute_round_trips(exported_program):
             and node_users[0].op == "call_function"
             and str(node_users[0].target) == "aten.contiguous.default"
         ):
+            if _is_user_output_node(node_users[0]):
+                continue
             node_users[0].replace_all_uses_with(folded_pad)
         else:
+            if _is_user_output_node(node):
+                continue
             node.replace_all_uses_with(folded_pad)
         changed = True
 
@@ -13522,8 +14867,12 @@ def _fold_inverse_permute_round_trips(exported_program):
             and inverse_users[0].op == "call_function"
             and str(inverse_users[0].target) == "aten.contiguous.default"
         ):
+            if _is_user_output_node(inverse_users[0]):
+                continue
             inverse_users[0].replace_all_uses_with(folded_sigmoid)
         else:
+            if _is_user_output_node(inverse_node):
+                continue
             inverse_node.replace_all_uses_with(folded_sigmoid)
         changed = True
 
@@ -13548,8 +14897,7 @@ def _fold_inverse_permute_round_trips(exported_program):
                 source_shape = [int(v) for v in list(source_tensor.shape)]
         if source_shape is None or len(source_shape) != 4:
             continue
-        non_singleton_axes = [idx for idx, dim in enumerate(source_shape) if int(dim) > 1]
-        if len(non_singleton_axes) != 1 or int(non_singleton_axes[0]) != 3:
+        if int(source_shape[3]) != 1:
             continue
         reshaped_shape = [int(source_shape[0]), int(source_shape[3]), int(source_shape[1]), int(source_shape[2])]
         with graph.inserting_before(node):
@@ -13565,9 +14913,64 @@ def _fold_inverse_permute_round_trips(exported_program):
             and node_users[0].op == "call_function"
             and str(node_users[0].target) == "aten.contiguous.default"
         ):
+            if _is_user_output_node(node_users[0]):
+                continue
             node_users[0].replace_all_uses_with(folded_reshape)
         else:
+            if _is_user_output_node(node):
+                continue
             node.replace_all_uses_with(folded_reshape)
+        changed = True
+
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.permute.default"
+            or len(node.args) < 2
+            or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+        ):
+            continue
+        mul_node = node.args[0]
+        if (
+            not isinstance(mul_node, torch.fx.Node)
+            or mul_node.op != "call_function"
+            or str(mul_node.target) != "aten.mul.Tensor"
+            or len(mul_node.args) != 2
+        ):
+            continue
+        nhwc_source = None
+        scalar_arg = None
+        if isinstance(mul_node.args[0], torch.fx.Node):
+            nhwc_source = _match_nhwc_singleton_view_source(mul_node.args[0])
+            scalar_arg = mul_node.args[1]
+        if nhwc_source is None and isinstance(mul_node.args[1], torch.fx.Node):
+            nhwc_source = _match_nhwc_singleton_view_source(mul_node.args[1])
+            scalar_arg = mul_node.args[0]
+        if nhwc_source is None or isinstance(scalar_arg, torch.fx.Node):
+            continue
+        with graph.inserting_before(mul_node):
+            folded_mul = graph.call_function(
+                mul_node.target,
+                args=(
+                    nhwc_source if mul_node.args[0] is not scalar_arg else scalar_arg,
+                    scalar_arg if mul_node.args[0] is not scalar_arg else nhwc_source,
+                ),
+                kwargs=dict(mul_node.kwargs),
+            )
+        folded_mul.meta = dict(getattr(node, "meta", {}))
+        inverse_users = list(node.users)
+        if (
+            len(inverse_users) == 1
+            and inverse_users[0].op == "call_function"
+            and str(inverse_users[0].target) == "aten.contiguous.default"
+        ):
+            if _is_user_output_node(inverse_users[0]):
+                continue
+            inverse_users[0].replace_all_uses_with(folded_mul)
+        else:
+            if _is_user_output_node(node):
+                continue
+            node.replace_all_uses_with(folded_mul)
         changed = True
 
     for node in list(graph.nodes):
@@ -13656,8 +15059,12 @@ def _fold_inverse_permute_round_trips(exported_program):
             and inverse_users[0].op == "call_function"
             and str(inverse_users[0].target) == "aten.contiguous.default"
         ):
+            if _is_user_output_node(inverse_users[0]):
+                continue
             inverse_users[0].replace_all_uses_with(folded_mul)
         else:
+            if _is_user_output_node(node):
+                continue
             node.replace_all_uses_with(folded_mul)
         changed = True
 
@@ -13704,8 +15111,12 @@ def _fold_inverse_permute_round_trips(exported_program):
             and inverse_users[0].op == "call_function"
             and str(inverse_users[0].target) == "aten.contiguous.default"
         ):
+            if _is_user_output_node(inverse_users[0]):
+                continue
             inverse_users[0].replace_all_uses_with(folded_binary)
         else:
+            if _is_user_output_node(node):
+                continue
             node.replace_all_uses_with(folded_binary)
         changed = True
     if changed:
@@ -13793,6 +15204,13 @@ def _fold_nhwc_binary_expr_trees_in_exported_program(exported_program):
     if graph_module is None:
         return exported_program
     graph = graph_module.graph
+    graph_signature = getattr(exported_program, "graph_signature", None)
+    user_output_names = set()
+    if graph_signature is not None:
+        try:
+            user_output_names = {str(name) for name in list(graph_signature.user_outputs)}
+        except Exception:
+            user_output_names = set()
     changed = False
     binary_targets = {
         "aten.add.Tensor",
@@ -13805,6 +15223,9 @@ def _fold_nhwc_binary_expr_trees_in_exported_program(exported_program):
         if not isinstance(arg, (list, tuple)):
             return None
         return [int(v) for v in arg]
+
+    def _is_user_output_node(node):
+        return isinstance(node, torch.fx.Node) and str(node.name) in user_output_names
 
     def _rank4_shape(node):
         if not isinstance(node, torch.fx.Node):
@@ -13888,21 +15309,21 @@ def _fold_nhwc_binary_expr_trees_in_exported_program(exported_program):
                 return None
             if _rank4_shape(lhs) is None or _rank4_shape(rhs) is None:
                 return None
-                with graph.inserting_before(node):
-                    folded_binary = graph.call_function(
-                        node.target,
-                        args=(lhs, rhs),
-                        kwargs=dict(node.kwargs),
-                    )
-                lhs_shape = _rank4_shape(lhs)
-                folded_binary.meta = (
-                    _shape_meta_from_node(lhs, lhs_shape)
-                    if lhs_shape is not None
-                    else dict(getattr(lhs, "meta", {}))
+            with graph.inserting_before(node):
+                folded_binary = graph.call_function(
+                    node.target,
+                    args=(lhs, rhs),
+                    kwargs=dict(node.kwargs),
                 )
-                folded_expr_cache[node] = folded_binary
-                return folded_binary
-            return None
+            lhs_shape = _rank4_shape(lhs)
+            folded_binary.meta = (
+                _shape_meta_from_node(lhs, lhs_shape)
+                if lhs_shape is not None
+                else dict(getattr(lhs, "meta", {}))
+            )
+            folded_expr_cache[node] = folded_binary
+            return folded_binary
+        return None
 
     def _materialize_nhwc(node, insert_before_node):
         source_shape = _rank4_shape(node)
@@ -13946,6 +15367,8 @@ def _fold_nhwc_binary_expr_trees_in_exported_program(exported_program):
             lhs_source = _match_nhwc_materialize_source(node.args[0])
             rhs_source = _match_nhwc_materialize_source(node.args[1])
             if lhs_source is None or rhs_source is None:
+                continue
+            if lhs_source is node.args[0] and rhs_source is node.args[1]:
                 continue
             lhs_shape = _rank4_shape(lhs_source)
             rhs_shape = _rank4_shape(rhs_source)
@@ -14014,8 +15437,12 @@ def _fold_nhwc_binary_expr_trees_in_exported_program(exported_program):
                 and node_users[0].op == "call_function"
                 and str(node_users[0].target) == "aten.contiguous.default"
             ):
+                if _is_user_output_node(node_users[0]):
+                    continue
                 node_users[0].replace_all_uses_with(folded_source)
             else:
+                if _is_user_output_node(node):
+                    continue
                 node.replace_all_uses_with(folded_source)
             changed = True
 
@@ -14027,19 +15454,464 @@ def _fold_nhwc_binary_expr_trees_in_exported_program(exported_program):
 
 def _optimize_exported_program(exported_program):
     exported_program = _prune_alias_nodes(exported_program)
+    exported_program = _fold_singleton_channel_split_permute_bridges_in_exported_program(exported_program)
     exported_program = _fold_inverse_permute_round_trips(exported_program)
     exported_program = _fold_layout_preserving_permute_chains(exported_program)
     exported_program = _fold_nhwc_binary_expr_trees_in_exported_program(exported_program)
     return exported_program
 
+def _postprocess_saved_exported_program(exported_program):
+    graph_module = getattr(exported_program, "graph_module", None)
+    if graph_module is None:
+        return exported_program
+    graph = graph_module.graph
+    graph_signature = getattr(exported_program, "graph_signature", None)
+    user_output_names = set()
+    if graph_signature is not None:
+        try:
+            user_output_names = {str(name) for name in list(graph_signature.user_outputs)}
+        except Exception:
+            user_output_names = set()
+    changed = False
+
+    def _normalize_perm(arg):
+        if not isinstance(arg, (list, tuple)):
+            return None
+        return [int(v) for v in arg]
+
+    def _is_user_output_node(node):
+        return isinstance(node, torch.fx.Node) and str(node.name) in user_output_names
+
+    def _rank4_shape(node):
+        if not isinstance(node, torch.fx.Node):
+            return None
+        meta_val = getattr(node, "meta", {}).get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            shape = [int(v) for v in list(meta_val.shape)]
+            return shape if len(shape) == 4 else None
+        return None
+
+    def _shape_meta_like(node, shape):
+        meta = dict(getattr(node, "meta", {}))
+        meta_val = meta.get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            try:
+                meta["val"] = torch.empty(
+                    tuple(int(v) for v in shape),
+                    dtype=meta_val.dtype,
+                    device="meta",
+                )
+            except Exception:
+                pass
+        return meta
+
+    def _shape_list_from_arg(arg):
+        if not isinstance(arg, (list, tuple)):
+            return None
+        try:
+            return [int(v) for v in list(arg)]
+        except Exception:
+            return None
+
+    def _is_scalar_like(value):
+        if not isinstance(value, torch.fx.Node):
+            return True
+        meta_val = getattr(value, "meta", {}).get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            return int(meta_val.numel()) == 1
+        if value.op == "get_attr" and isinstance(value.target, str):
+            tensor = getattr(graph_module, value.target, None)
+            if isinstance(tensor, torch.Tensor):
+                return int(tensor.numel()) == 1
+        return False
+
+    def _match_permute_chain_source(node, perm):
+        if not isinstance(node, torch.fx.Node):
+            return None
+        if (
+            node.op == "call_function"
+            and str(node.target) == "aten.permute.default"
+            and len(node.args) >= 2
+            and _normalize_perm(node.args[1]) == perm
+            and isinstance(node.args[0], torch.fx.Node)
+        ):
+            return node.args[0]
+        if (
+            node.op == "call_function"
+            and str(node.target) == "aten.contiguous.default"
+            and len(node.args) >= 1
+        ):
+            return _match_permute_chain_source(node.args[0], perm)
+        return None
+
+    def _convert_nhwc_pad_to_nchw_pad(pad_values):
+        values = [int(v) for v in list(pad_values)]
+        if len(values) % 2 != 0 or len(values) > 8:
+            return None
+        nhwc_inner_to_outer = ["C", "W", "H", "N"]
+        nchw_inner_to_outer = ["W", "H", "C", "N"]
+        semantic_pairs = {name: [0, 0] for name in nhwc_inner_to_outer}
+        pair_count = len(values) // 2
+        for idx in range(pair_count):
+            semantic_pairs[nhwc_inner_to_outer[idx]] = [
+                values[idx * 2],
+                values[idx * 2 + 1],
+            ]
+        output_pairs = [semantic_pairs[name] for name in nchw_inner_to_outer]
+        last_nonzero = -1
+        for idx, pair in enumerate(output_pairs):
+            if pair != [0, 0]:
+                last_nonzero = idx
+        if last_nonzero < 0:
+            return []
+        flattened = []
+        for pair in output_pairs[: last_nonzero + 1]:
+            flattened.extend(pair)
+        return flattened
+
+    def _match_cat_input_fold_source(node):
+        source = _match_permute_chain_source(node, [0, 2, 3, 1])
+        if source is not None:
+            return source
+        if (
+            isinstance(node, torch.fx.Node)
+            and node.op == "call_function"
+            and str(node.target) == "aten.pad.default"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], torch.fx.Node)
+        ):
+            pad_source = _match_permute_chain_source(node.args[0], [0, 2, 3, 1])
+            if pad_source is None:
+                return None
+            nchw_pad = _convert_nhwc_pad_to_nchw_pad(node.args[1])
+            if nchw_pad is None:
+                return None
+            return (pad_source, nchw_pad, tuple(node.args[2:]), dict(node.kwargs))
+        return None
+
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.contiguous.default"
+            or len(node.args) < 1
+            or not isinstance(node.args[0], torch.fx.Node)
+        ):
+            continue
+        permute_node = node.args[0]
+        if (
+            permute_node.op != "call_function"
+            or str(permute_node.target) != "aten.permute.default"
+            or len(permute_node.args) < 2
+            or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+            or not isinstance(permute_node.args[0], torch.fx.Node)
+        ):
+            continue
+        source = permute_node.args[0]
+        for user in list(node.users):
+            if (
+                user.op == "call_function"
+                and str(user.target) == "aten.permute.default"
+                and len(user.args) >= 2
+                and _normalize_perm(user.args[1]) == [0, 3, 1, 2]
+            ):
+                user_users = list(user.users)
+                if (
+                    len(user_users) == 1
+                    and user_users[0].op == "call_function"
+                    and str(user_users[0].target) == "aten.contiguous.default"
+                ):
+                    user_users[0].replace_all_uses_with(source)
+                else:
+                    user.replace_all_uses_with(source)
+                changed = True
+
+    while True:
+        local_changed = False
+        for split_node in list(graph.nodes):
+            if (
+                split_node.op != "call_function"
+                or str(split_node.target) != "aten.tensor_split.sections"
+                or len(split_node.args) < 3
+            ):
+                continue
+            split_input = split_node.args[0]
+            if not (
+                isinstance(split_input, torch.fx.Node)
+                and split_input.op == "call_function"
+                and str(split_input.target) == "aten.contiguous.default"
+                and len(split_input.args) >= 1
+                and isinstance(split_input.args[0], torch.fx.Node)
+            ):
+                continue
+            permute_node = split_input.args[0]
+            if (
+                permute_node.op != "call_function"
+                or str(permute_node.target) != "aten.permute.default"
+                or len(permute_node.args) < 2
+                or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_node.args[0], torch.fx.Node)
+            ):
+                continue
+            if int(split_node.args[2]) != 3:
+                continue
+            base_source = permute_node.args[0]
+            base_shape = _rank4_shape(base_source)
+            if base_shape is None or int(base_shape[1]) <= 0:
+                continue
+            getitem_users = []
+            for user in list(split_node.users):
+                if (
+                    user.op != "call_function"
+                    or str(user.target) != "<built-in function getitem>"
+                    or len(user.args) < 2
+                    or user.args[0] is not split_node
+                ):
+                    getitem_users = []
+                    break
+                getitem_users.append(user)
+            if len(getitem_users) == 0:
+                continue
+
+            with graph.inserting_before(split_node):
+                new_split = graph.call_function(
+                    torch.ops.aten.tensor_split.sections,
+                    args=(base_source, 1, 1),
+                    kwargs=dict(split_node.kwargs),
+                )
+            new_split.meta = dict(getattr(split_node, "meta", {}))
+
+            cf_shape = [int(base_shape[0]), 1, int(base_shape[2]), int(base_shape[3])]
+            nhwc_shape = [int(base_shape[0]), int(base_shape[2]), int(base_shape[3]), 1]
+
+            for getitem_node in list(getitem_users):
+                split_index = int(getitem_node.args[1])
+                with graph.inserting_before(getitem_node):
+                    new_getitem = graph.call_function(
+                        getitem_node.target,
+                        args=(new_split, split_index),
+                        kwargs=dict(getitem_node.kwargs),
+                    )
+                new_getitem.meta = _shape_meta_like(getitem_node, cf_shape)
+                nhwc_holder = [None]
+
+                def _get_nhwc_view(insert_before_node):
+                    if nhwc_holder[0] is not None:
+                        return nhwc_holder[0]
+                    with graph.inserting_before(insert_before_node):
+                        nhwc_holder[0] = graph.call_function(
+                            torch.ops.aten.reshape.default,
+                            args=(new_getitem, nhwc_shape),
+                            kwargs={},
+                        )
+                    nhwc_holder[0].meta = _shape_meta_like(getitem_node, nhwc_shape)
+                    return nhwc_holder[0]
+
+                for user in list(getitem_node.users):
+                    if (
+                        user.op == "call_function"
+                        and str(user.target) == "aten.reshape.default"
+                        and len(user.args) >= 2
+                        and _shape_list_from_arg(user.args[1]) == cf_shape
+                    ):
+                        user.replace_all_uses_with(new_getitem)
+                        local_changed = True
+                        changed = True
+                        continue
+                    if (
+                        user.op == "call_function"
+                        and str(user.target) in {
+                            "aten.add.Tensor",
+                            "aten.div.Tensor",
+                            "aten.mul.Tensor",
+                            "aten.sub.Tensor",
+                        }
+                        and len(user.args) == 2
+                        and (
+                            (user.args[0] is getitem_node and _is_scalar_like(user.args[1]))
+                            or (user.args[1] is getitem_node and _is_scalar_like(user.args[0]))
+                        )
+                    ):
+                        user.replace_input_with(getitem_node, new_getitem)
+                        user.meta = _shape_meta_like(user, cf_shape)
+                        local_changed = True
+                        changed = True
+                        continue
+                    replacement = _get_nhwc_view(user)
+                    user.replace_input_with(getitem_node, replacement)
+                    local_changed = True
+                    changed = True
+
+            if local_changed:
+                graph.eliminate_dead_code()
+                graph.lint()
+                graph_module.recompile()
+                break
+        if not local_changed:
+            break
+
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.permute.default"
+            or len(node.args) < 2
+            or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+        ):
+            continue
+        source = node.args[0]
+        source_shape = _rank4_shape(source)
+        if source_shape is None or int(source_shape[3]) != 1:
+            continue
+        reshaped_shape = [int(source_shape[0]), 1, int(source_shape[1]), int(source_shape[2])]
+        with graph.inserting_before(node):
+            folded_reshape = graph.call_function(
+                torch.ops.aten.reshape.default,
+                args=(source, reshaped_shape),
+                kwargs={},
+            )
+        folded_reshape.meta = _shape_meta_like(node, reshaped_shape)
+        node_users = list(node.users)
+        if (
+            len(node_users) == 1
+            and node_users[0].op == "call_function"
+            and str(node_users[0].target) == "aten.contiguous.default"
+        ):
+            node_users[0].replace_all_uses_with(folded_reshape)
+        else:
+            node.replace_all_uses_with(folded_reshape)
+        changed = True
+
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.permute.default"
+            or len(node.args) < 2
+            or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+        ):
+            continue
+        cat_node = node.args[0]
+        if (
+            not isinstance(cat_node, torch.fx.Node)
+            or cat_node.op != "call_function"
+            or str(cat_node.target) != "aten.cat.default"
+            or len(cat_node.args) < 1
+        ):
+            continue
+        cat_inputs_arg = cat_node.args[0]
+        if not isinstance(cat_inputs_arg, (list, tuple)):
+            continue
+        cat_dim = None
+        if len(cat_node.args) >= 2:
+            cat_dim = int(cat_node.args[1])
+        elif "dim" in cat_node.kwargs:
+            cat_dim = int(cat_node.kwargs["dim"])
+        if cat_dim != 3:
+            continue
+        folded_inputs = []
+        for cat_input in list(cat_inputs_arg):
+            folded_source = _match_cat_input_fold_source(cat_input)
+            if folded_source is None:
+                folded_inputs = []
+                break
+            if isinstance(folded_source, tuple):
+                source_node, nchw_pad, pad_args_tail, pad_kwargs = folded_source
+                if _rank4_shape(source_node) is None:
+                    folded_inputs = []
+                    break
+                with graph.inserting_before(cat_node):
+                    folded_pad = graph.call_function(
+                        torch.ops.aten.pad.default,
+                        args=(source_node, nchw_pad, *pad_args_tail),
+                        kwargs=pad_kwargs,
+                    )
+                folded_pad.meta = dict(getattr(cat_input, "meta", {}))
+                folded_inputs.append(folded_pad)
+            else:
+                if _rank4_shape(folded_source) is None:
+                    folded_inputs = []
+                    break
+                folded_inputs.append(folded_source)
+        if len(folded_inputs) != len(list(cat_inputs_arg)):
+            continue
+        folded_cat_kwargs = dict(cat_node.kwargs)
+        folded_cat_args = (folded_inputs, 1)
+        if "dim" in folded_cat_kwargs:
+            folded_cat_kwargs["dim"] = 1
+            folded_cat_args = (folded_inputs,)
+        cat_node.args = folded_cat_args
+        cat_node.kwargs = folded_cat_kwargs
+        cat_node.meta = dict(getattr(node, "meta", {}))
+        node_users = list(node.users)
+        if (
+            len(node_users) == 1
+            and node_users[0].op == "call_function"
+            and str(node_users[0].target) == "aten.contiguous.default"
+        ):
+            if _is_user_output_node(node_users[0]):
+                continue
+            node_users[0].replace_all_uses_with(cat_node)
+        else:
+            if _is_user_output_node(node):
+                continue
+            node.replace_all_uses_with(cat_node)
+        changed = True
+
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.permute.default"
+            or len(node.args) < 2
+            or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+        ):
+            continue
+        cat_node = node.args[0]
+        if (
+            not isinstance(cat_node, torch.fx.Node)
+            or cat_node.op != "call_function"
+            or str(cat_node.target) != "aten.cat.default"
+            or len(cat_node.args) < 2
+            or not isinstance(cat_node.args[0], (list, tuple))
+            or int(cat_node.args[1]) != 3
+        ):
+            continue
+        folded_inputs = []
+        for cat_input in list(cat_node.args[0]):
+            input_shape = _rank4_shape(cat_input)
+            if input_shape is None or int(input_shape[3]) != 1:
+                folded_inputs = []
+                break
+            reshaped_shape = [int(input_shape[0]), 1, int(input_shape[1]), int(input_shape[2])]
+            with graph.inserting_before(cat_node):
+                folded_input = graph.call_function(
+                    torch.ops.aten.reshape.default,
+                    args=(cat_input, reshaped_shape),
+                    kwargs={},
+                )
+            folded_input.meta = _shape_meta_like(cat_input, reshaped_shape)
+            folded_inputs.append(folded_input)
+        if len(folded_inputs) != len(list(cat_node.args[0])):
+            continue
+        cat_node.args = (folded_inputs, 1)
+        cat_node.meta = dict(getattr(node, "meta", {}))
+        node_users = list(node.users)
+        if (
+            len(node_users) == 1
+            and node_users[0].op == "call_function"
+            and str(node_users[0].target) == "aten.contiguous.default"
+        ):
+            node_users[0].replace_all_uses_with(cat_node)
+        else:
+            node.replace_all_uses_with(cat_node)
+        changed = True
+
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+        graph_module.recompile()
+    return exported_program
+
 with torch.no_grad():
     exported = torch.export.export(model, example_inputs)
-try:
-    torch.export.save(_optimize_exported_program(exported), str(exported_program_path))
-except Exception:
-    with torch.no_grad():
-        exported = torch.export.export(model, example_inputs)
-    torch.export.save(exported, str(exported_program_path))
+torch.export.save(exported, str(exported_program_path))
 print(json.dumps({"file_name": exported_program_path.name}))
 """
     child_payload, last_error_message = _run_generated_package_export_child(
@@ -14076,6 +15948,10 @@ print(json.dumps({"file_name": exported_program_path.name}))
                 f"package_dir={package_dir} artifact={exported_program_path} details={ex}"
             ) from ex
         last_error_message = str(ex)
+    try:
+        _fold_inverse_permute_round_trips_in_exported_program_archive(exported_program_path)
+    except Exception:
+        pass
     _write_generated_package_export_metadata(
         metadata_path=metadata_path,
         metadata=metadata,
@@ -14133,6 +16009,5278 @@ def _strip_stack_traces_from_exported_program_archive(exported_program_path: Pat
     except Exception:
         temp_archive_path.unlink(missing_ok=True)
         raise
+
+
+def _fold_inverse_permute_round_trips_in_exported_program_archive(
+    exported_program_path: Path,
+) -> None:
+    archive_path = Path(exported_program_path)
+    if not archive_path.exists():
+        raise FileNotFoundError(f"ExportedProgram archive not found. path={archive_path}")
+
+    exported_program = torch.export.load(str(archive_path))
+    graph_module = getattr(exported_program, "graph_module", None)
+    if graph_module is None:
+        return
+    graph = graph_module.graph
+    graph_signature = getattr(exported_program, "graph_signature", None)
+    changed = False
+
+    user_output_names = set()
+    if graph_signature is not None:
+        try:
+            user_output_names = {str(name) for name in list(graph_signature.user_outputs)}
+        except Exception:
+            user_output_names = set()
+
+    def _normalize_perm_simple(arg: Any) -> Optional[List[int]]:
+        if not isinstance(arg, (list, tuple)):
+            return None
+        return [int(v) for v in arg]
+
+    def _inverse_perm_simple(perm: Sequence[int]) -> List[int]:
+        inverse = [0] * len(list(perm))
+        for idx, value in enumerate(list(perm)):
+            inverse[int(value)] = int(idx)
+        return inverse
+
+    while True:
+        local_changed = False
+        for node in list(graph.nodes):
+            if (
+                node.op == "call_function"
+                and str(node.target) == "aten.alias.default"
+                and len(node.args) >= 1
+                and isinstance(node.args[0], torch.fx.Node)
+                and str(node.name) not in user_output_names
+            ):
+                node.replace_all_uses_with(node.args[0])
+                graph.erase_node(node)
+                local_changed = True
+                changed = True
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+            ):
+                continue
+            perm = _normalize_perm_simple(node.args[1])
+            source = node.args[0] if len(node.args) >= 1 and isinstance(node.args[0], torch.fx.Node) else None
+            if perm is None or source is None:
+                continue
+            node_users = list(node.users)
+            if (
+                len(node_users) != 1
+                or node_users[0].op != "call_function"
+                or str(node_users[0].target) != "aten.contiguous.default"
+            ):
+                continue
+            contiguous_node = node_users[0]
+            contiguous_users = list(contiguous_node.users)
+            if len(contiguous_users) != 1:
+                continue
+            inverse_node = contiguous_users[0]
+            if (
+                inverse_node.op != "call_function"
+                or str(inverse_node.target) != "aten.permute.default"
+                or len(inverse_node.args) < 2
+                or _normalize_perm_simple(inverse_node.args[1]) != _inverse_perm_simple(perm)
+                or str(inverse_node.name) in user_output_names
+            ):
+                continue
+            inverse_users = list(inverse_node.users)
+            if (
+                len(inverse_users) == 1
+                and inverse_users[0].op == "call_function"
+                and str(inverse_users[0].target) == "aten.contiguous.default"
+            ):
+                inverse_users[0].replace_all_uses_with(source)
+            else:
+                inverse_node.replace_all_uses_with(source)
+            local_changed = True
+            changed = True
+        if not local_changed:
+            break
+        graph.eliminate_dead_code()
+        graph.lint()
+        graph_module.recompile()
+
+    def _normalize_perm(arg: Any) -> Optional[List[int]]:
+        if not isinstance(arg, (list, tuple)):
+            return None
+        return [int(v) for v in arg]
+
+    def _is_scalar_like(value: Any) -> bool:
+        if not isinstance(value, torch.fx.Node):
+            return True
+        meta_val = getattr(value, "meta", {}).get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            return int(meta_val.numel()) == 1
+        if value.op == "get_attr" and isinstance(value.target, str):
+            tensor = getattr(graph_module, value.target, None)
+            if isinstance(tensor, torch.Tensor):
+                return int(tensor.numel()) == 1
+        return False
+
+    def _rank_shape(node: Any) -> Optional[List[int]]:
+        if not isinstance(node, torch.fx.Node):
+            return None
+        meta_val = getattr(node, "meta", {}).get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            return [int(v) for v in list(meta_val.shape)]
+        if node.op == "get_attr" and isinstance(node.target, str):
+            tensor = getattr(graph_module, node.target, None)
+            if isinstance(tensor, torch.Tensor):
+                return [int(v) for v in list(tensor.shape)]
+        return None
+
+    def _shape_meta_from_node(node: torch.fx.Node, shape: Sequence[int]) -> Dict[str, Any]:
+        meta = dict(getattr(node, "meta", {}))
+        meta_val = meta.get("val", None)
+        if isinstance(meta_val, torch.Tensor):
+            try:
+                meta["val"] = torch.empty(
+                    tuple(int(v) for v in shape),
+                    dtype=meta_val.dtype,
+                    device="meta",
+                )
+            except Exception:
+                pass
+        return meta
+
+    def _nchw_singleton_shape_from_nhwc(node: Any) -> Optional[List[int]]:
+        source_shape = _rank_shape(node)
+        if source_shape is None or len(source_shape) != 4 or int(source_shape[3]) != 1:
+            return None
+        return [int(source_shape[0]), 1, int(source_shape[1]), int(source_shape[2])]
+
+    scalar_binary_targets = {
+        "aten.add.Tensor",
+        "aten.maximum.default",
+        "aten.minimum.default",
+        "aten.mul.Tensor",
+        "aten.sub.Tensor",
+        "aten.div.Tensor",
+    }
+
+    def _broadcast_shapes(lhs: Optional[List[int]], rhs: Optional[List[int]]) -> Optional[List[int]]:
+        if lhs is None:
+            return rhs
+        if rhs is None:
+            return lhs
+        result: List[int] = []
+        for lhs_dim, rhs_dim in zip(reversed(lhs), reversed(rhs)):
+            if lhs_dim == rhs_dim:
+                result.append(int(lhs_dim))
+            elif lhs_dim == 1:
+                result.append(int(rhs_dim))
+            elif rhs_dim == 1:
+                result.append(int(lhs_dim))
+            else:
+                return None
+        if len(lhs) > len(rhs):
+            result.extend(reversed(lhs[: len(lhs) - len(rhs)]))
+        elif len(rhs) > len(lhs):
+            result.extend(reversed(rhs[: len(rhs) - len(lhs)]))
+        result.reverse()
+        return [int(v) for v in result]
+
+    def _shape_arg_list(arg: Any) -> Optional[List[int]]:
+        if not isinstance(arg, (list, tuple)):
+            return None
+        shape: List[int] = []
+        for dim in arg:
+            if not isinstance(dim, (int, bool)):
+                return None
+            shape.append(int(dim))
+        return shape
+
+    def _first_meta_source_node(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node) and _rank_shape(arg) is not None:
+                return arg
+            if isinstance(arg, (list, tuple)):
+                for item in arg:
+                    if isinstance(item, torch.fx.Node) and _rank_shape(item) is not None:
+                        return item
+        return None
+
+    placeholder_constant_tensors: Dict[str, torch.Tensor] = {}
+    mutable_input_specs: List[torch.export.graph_signature.InputSpec] = list(
+        getattr(exported_program.graph_signature, "input_specs", ())
+    )
+    if graph_signature is not None:
+        for input_spec in list(mutable_input_specs):
+            arg = getattr(input_spec, "arg", None)
+            placeholder_name = str(getattr(arg, "name", ""))
+            if placeholder_name == "":
+                continue
+            kind_name = str(getattr(input_spec, "kind", ""))
+            target_name = str(getattr(input_spec, "target", ""))
+            tensor_value: Optional[torch.Tensor] = None
+            if "PARAMETER" in kind_name or "BUFFER" in kind_name:
+                candidate = exported_program.state_dict.get(target_name, None)
+                if isinstance(candidate, torch.Tensor):
+                    tensor_value = candidate
+            elif "CONSTANT_TENSOR" in kind_name:
+                candidate = exported_program.constants.get(target_name, None)
+                if not isinstance(candidate, torch.Tensor):
+                    candidate = exported_program.tensor_constants.get(target_name, None)
+                if isinstance(candidate, torch.Tensor):
+                    tensor_value = candidate
+            if isinstance(tensor_value, torch.Tensor):
+                placeholder_constant_tensors[placeholder_name] = tensor_value.detach()
+
+    def _constant_meta_from_tensor(reference_node: torch.fx.Node, value: torch.Tensor) -> Dict[str, Any]:
+        meta = dict(getattr(reference_node, "meta", {}))
+        try:
+            meta["val"] = torch.empty(
+                tuple(int(v) for v in list(value.shape)),
+                dtype=value.dtype,
+                device="meta",
+            )
+        except Exception:
+            pass
+        return meta
+
+    def _make_unique_folded_constant_names(base_name: str) -> Tuple[str, str]:
+        sanitized = re.sub(r"[^0-9A-Za-z_]+", "_", str(base_name)).strip("_")
+        if sanitized == "":
+            sanitized = "folded_const"
+        if sanitized[0].isdigit():
+            sanitized = f"const_{sanitized}"
+        target_candidate = f"folded_const_{sanitized}"
+        suffix = 0
+        existing_placeholder_names = {str(node.name) for node in graph.nodes if node.op == "placeholder"}
+        existing_targets = {
+            str(getattr(input_spec, "target", ""))
+            for input_spec in mutable_input_specs
+            if getattr(input_spec, "target", None) is not None
+        }
+        placeholder_candidate = f"c_{target_candidate}"
+        while target_candidate in existing_targets or placeholder_candidate in existing_placeholder_names:
+            suffix += 1
+            target_candidate = f"folded_const_{sanitized}_{suffix}"
+            placeholder_candidate = f"c_{target_candidate}"
+        return placeholder_candidate, target_candidate
+
+    def _insert_folded_constant_placeholder(reference_node: torch.fx.Node, value: torch.Tensor) -> torch.fx.Node:
+        placeholder_name, target_name = _make_unique_folded_constant_names(str(reference_node.name))
+        first_user_input_name = next(
+            (
+                str(getattr(getattr(input_spec, "arg", None), "name", ""))
+                for input_spec in mutable_input_specs
+                if str(getattr(input_spec, "kind", "")) == "InputKind.USER_INPUT"
+                and str(getattr(getattr(input_spec, "arg", None), "name", "")) != ""
+            ),
+            "",
+        )
+        insert_before_node = next(
+            (
+                node
+                for node in graph.nodes
+                if node.op == "placeholder" and str(node.name) == first_user_input_name
+            ),
+            next((node for node in graph.nodes if node.op != "placeholder"), None),
+        )
+        if insert_before_node is None:
+            raise RuntimeError("Could not find insertion point for folded constant placeholder.")
+        with graph.inserting_before(insert_before_node):
+            placeholder_node = graph.placeholder(placeholder_name)
+        placeholder_node.meta = _constant_meta_from_tensor(reference_node, value)
+        placeholder_constant_tensors[placeholder_name] = value.detach().clone()
+        exported_program.constants[target_name] = value.detach().clone()
+        exported_program.tensor_constants[target_name] = value.detach().clone()
+        insert_index = next(
+            (
+                index
+                for index, input_spec in enumerate(mutable_input_specs)
+                if str(getattr(input_spec, "kind", "")) == "InputKind.USER_INPUT"
+            ),
+            len(mutable_input_specs),
+        )
+        mutable_input_specs.insert(
+            insert_index,
+            torch.export.graph_signature.InputSpec(
+                kind=torch.export.graph_signature.InputKind.CONSTANT_TENSOR,
+                arg=torch.export.graph_signature.TensorArgument(name=placeholder_name),
+                target=target_name,
+            ),
+        )
+        return placeholder_node
+
+    constant_foldable_targets = {
+        "aten.add.Tensor",
+        "aten.cat.default",
+        "aten.clamp.default",
+        "aten.contiguous.default",
+        "aten.div.Tensor",
+        "aten.exp.default",
+        "aten.leaky_relu.default",
+        "aten.lift_fresh_copy.default",
+        "aten.matmul.default",
+        "aten.maximum.default",
+        "aten.minimum.default",
+        "aten.mul.Tensor",
+        "aten.neg.default",
+        "aten.pad.default",
+        "aten.permute.default",
+        "aten.relu.default",
+        "aten.reshape.default",
+        "aten.sigmoid.default",
+        "aten.slice.Tensor",
+        "aten.sub.Tensor",
+    }
+
+    constant_value_cache: Dict[str, Optional[torch.Tensor]] = {}
+
+    def _constant_value_from_arg(arg: Any) -> Optional[Any]:
+        if isinstance(arg, torch.fx.Node):
+            return _constant_tensor_value(arg)
+        if isinstance(arg, dict):
+            dict_values: Dict[Any, Any] = {}
+            for key, value in arg.items():
+                folded_value = _constant_value_from_arg(value)
+                if folded_value is None and isinstance(value, torch.fx.Node):
+                    return None
+                if folded_value is None and not isinstance(value, torch.fx.Node):
+                    folded_value = value
+                dict_values[key] = folded_value
+            return dict_values
+        if isinstance(arg, (list, tuple)):
+            values: List[Any] = []
+            for item in list(arg):
+                item_value = _constant_value_from_arg(item)
+                if item_value is None and isinstance(item, torch.fx.Node):
+                    return None
+                if item_value is None and not isinstance(item, torch.fx.Node):
+                    item_value = item
+                values.append(item_value)
+            return type(arg)(values)
+        return arg
+
+    def _constant_tensor_value(node: torch.fx.Node) -> Optional[torch.Tensor]:
+        cached = constant_value_cache.get(str(node.name), None)
+        if str(node.name) in constant_value_cache:
+            return cached
+        result: Optional[torch.Tensor] = None
+        if node.op == "placeholder":
+            candidate = placeholder_constant_tensors.get(str(node.name), None)
+            if isinstance(candidate, torch.Tensor):
+                result = candidate
+        elif node.op == "get_attr" and isinstance(node.target, str):
+            candidate = getattr(graph_module, node.target, None)
+            if isinstance(candidate, torch.Tensor):
+                result = candidate.detach()
+        elif (
+            node.op == "call_function"
+            and callable(node.target)
+            and str(node.target) in constant_foldable_targets
+        ):
+            evaluated_args = _constant_value_from_arg(node.args)
+            evaluated_kwargs = _constant_value_from_arg(dict(node.kwargs))
+            if evaluated_args is not None and evaluated_kwargs is not None:
+                try:
+                    with torch.no_grad():
+                        candidate = node.target(*tuple(evaluated_args), **dict(evaluated_kwargs))
+                    if isinstance(candidate, torch.Tensor):
+                        result = candidate.detach()
+                except Exception:
+                    result = None
+        constant_value_cache[str(node.name)] = result
+        return result
+
+    def _infer_tensor_shape(node: torch.fx.Node) -> Optional[List[int]]:
+        if node.op != "call_function":
+            return _rank_shape(node)
+        target = str(node.target)
+        if target in {"aten.contiguous.default", "aten.lift_fresh_copy.default"} and len(node.args) >= 1:
+            return _rank_shape(node.args[0])
+        if target in {
+            "aten.clamp.default",
+            "aten.relu.default",
+            "aten.exp.default",
+            "aten.neg.default",
+            "aten.sigmoid.default",
+            "aten.leaky_relu.default",
+        } and len(node.args) >= 1:
+            return _rank_shape(node.args[0])
+        if target in scalar_binary_targets and len(node.args) == 2:
+            return _broadcast_shapes(_rank_shape(node.args[0]), _rank_shape(node.args[1]))
+        if target == "aten.reshape.default" and len(node.args) >= 2:
+            return _shape_arg_list(node.args[1])
+        if target == "aten.permute.default" and len(node.args) >= 2:
+            source_shape = _rank_shape(node.args[0])
+            perm = _shape_arg_list(node.args[1])
+            if source_shape is None or perm is None or len(source_shape) != len(perm):
+                return None
+            return [int(source_shape[int(axis)]) for axis in perm]
+        if target == "aten.cat.default" and len(node.args) >= 2:
+            cat_inputs = node.args[0]
+            cat_dim_arg = node.args[1]
+            if not isinstance(cat_inputs, (list, tuple)) or not isinstance(cat_dim_arg, (int, bool)):
+                return None
+            input_shapes = [_rank_shape(inp) for inp in cat_inputs if isinstance(inp, torch.fx.Node)]
+            if len(input_shapes) != len(cat_inputs) or len(input_shapes) == 0 or any(shape is None for shape in input_shapes):
+                return None
+            cat_dim = int(cat_dim_arg)
+            base_shape = list(input_shapes[0] or [])
+            if cat_dim < 0:
+                cat_dim += len(base_shape)
+            if cat_dim < 0 or cat_dim >= len(base_shape):
+                return None
+            base_shape[cat_dim] = sum(int((shape or base_shape)[cat_dim]) for shape in input_shapes)
+            return base_shape
+        if target == "aten.slice.Tensor" and len(node.args) >= 4:
+            source_shape = _rank_shape(node.args[0])
+            if source_shape is None:
+                return None
+            dim_arg = node.args[1]
+            start_arg = node.args[2]
+            end_arg = node.args[3]
+            if not isinstance(dim_arg, (int, bool)):
+                return None
+            if not isinstance(start_arg, (int, bool)):
+                return None
+            if not isinstance(end_arg, (int, bool)):
+                return None
+            dim = int(dim_arg)
+            start = int(start_arg)
+            end = int(end_arg)
+            if dim < 0:
+                dim += len(source_shape)
+            if dim < 0 or dim >= len(source_shape):
+                return None
+            output_shape = list(source_shape)
+            output_shape[dim] = max(0, end - start)
+            return output_shape
+        if target == "aten.pad.default" and len(node.args) >= 2:
+            source_shape = _rank_shape(node.args[0])
+            pad = _shape_arg_list(node.args[1])
+            if source_shape is None or pad is None or len(source_shape) != 4 or len(pad) != 4:
+                return None
+            output_shape = list(source_shape)
+            output_shape[3] += int(pad[0]) + int(pad[1])
+            output_shape[2] += int(pad[2]) + int(pad[3])
+            return output_shape
+        return _rank_shape(node)
+
+    def _repair_inferred_meta_shapes() -> bool:
+        inferred_changed = False
+        for node in list(graph.nodes):
+            if not isinstance(node, torch.fx.Node):
+                continue
+            inferred_shape = _infer_tensor_shape(node)
+            if inferred_shape is None:
+                continue
+            current_shape = _rank_shape(node)
+            if current_shape == inferred_shape:
+                continue
+            meta_source = _first_meta_source_node(node)
+            if meta_source is None:
+                continue
+            node.meta = _shape_meta_from_node(meta_source, inferred_shape)
+            inferred_changed = True
+        if inferred_changed:
+            graph_module.recompile()
+        return inferred_changed
+
+    def _run_one_pass() -> bool:
+        local_changed = False
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.reshape.default"
+                or len(node.args) < 2
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            source_node = node.args[0]
+            source_shape = _rank_shape(source_node)
+            reshape_shape = _shape_arg_list(node.args[1])
+            if (
+                source_shape is None
+                or reshape_shape is None
+                or len(source_shape) != len(reshape_shape)
+                or [int(v) for v in source_shape] != [int(v) for v in reshape_shape]
+            ):
+                continue
+            node.replace_all_uses_with(source_node)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if node.op != "call_function" or str(node.target) not in constant_foldable_targets:
+                continue
+            constant_value = _constant_tensor_value(node)
+            if not isinstance(constant_value, torch.Tensor):
+                continue
+            folded_const_node = _insert_folded_constant_placeholder(node, constant_value)
+            node.replace_all_uses_with(folded_const_node)
+            local_changed = True
+
+        for width_matmul_node in list(graph.nodes):
+            if (
+                width_matmul_node.op != "call_function"
+                or str(width_matmul_node.target) != "aten.matmul.default"
+                or len(width_matmul_node.args) != 2
+                or not isinstance(width_matmul_node.args[0], torch.fx.Node)
+                or not isinstance(width_matmul_node.args[1], torch.fx.Node)
+            ):
+                continue
+            width_const_node = width_matmul_node.args[0]
+            trailing_reshape_node = width_matmul_node.args[1]
+            if (
+                trailing_reshape_node.op != "call_function"
+                or str(trailing_reshape_node.target) != "aten.reshape.default"
+                or len(trailing_reshape_node.args) < 2
+                or not isinstance(trailing_reshape_node.args[0], torch.fx.Node)
+            ):
+                continue
+            trailing_reshape_shape = _shape_arg_list(trailing_reshape_node.args[1])
+            if (
+                trailing_reshape_shape is None
+                or len(trailing_reshape_shape) != 4
+                or int(trailing_reshape_shape[3]) != 1
+            ):
+                continue
+
+            height_matmul_node = trailing_reshape_node.args[0]
+            if (
+                height_matmul_node.op != "call_function"
+                or str(height_matmul_node.target) != "aten.matmul.default"
+                or len(height_matmul_node.args) != 2
+                or not isinstance(height_matmul_node.args[0], torch.fx.Node)
+                or not isinstance(height_matmul_node.args[1], torch.fx.Node)
+            ):
+                continue
+            height_const_node = height_matmul_node.args[0]
+            leading_reshape_node = height_matmul_node.args[1]
+            if (
+                leading_reshape_node.op != "call_function"
+                or str(leading_reshape_node.target) != "aten.reshape.default"
+                or len(leading_reshape_node.args) < 2
+                or not isinstance(leading_reshape_node.args[0], torch.fx.Node)
+            ):
+                continue
+
+            source_node = leading_reshape_node.args[0]
+            source_shape = _rank_shape(source_node)
+            leading_reshape_shape = _shape_arg_list(leading_reshape_node.args[1])
+            height_const_shape = _rank_shape(height_const_node)
+            width_const_shape = _rank_shape(width_const_node)
+            if (
+                source_shape is None
+                or len(source_shape) != 4
+                or int(source_shape[1]) != 1
+                or leading_reshape_shape is None
+                or len(leading_reshape_shape) != 3
+                or int(leading_reshape_shape[0]) != int(source_shape[0])
+                or int(leading_reshape_shape[1]) != int(source_shape[2])
+                or int(leading_reshape_shape[2]) != int(source_shape[3])
+                or height_const_shape is None
+                or len(height_const_shape) != 3
+                or int(height_const_shape[2]) != int(source_shape[2])
+                or int(trailing_reshape_shape[0]) != int(source_shape[0])
+                or int(trailing_reshape_shape[1]) != int(height_const_shape[1])
+                or int(trailing_reshape_shape[2]) != int(source_shape[3])
+                or width_const_shape is None
+                or len(width_const_shape) != 4
+                or int(width_const_shape[3]) != int(source_shape[3])
+            ):
+                continue
+
+            height_const_nchw_shape = [
+                int(height_const_shape[0]),
+                1,
+                int(height_const_shape[1]),
+                int(height_const_shape[2]),
+            ]
+            width_const_nchw_shape = [
+                int(width_const_shape[0]),
+                int(width_const_shape[1]),
+                int(width_const_shape[3]),
+                int(width_const_shape[2]),
+            ]
+            folded_height_shape = [
+                int(source_shape[0]),
+                int(source_shape[1]),
+                int(height_const_shape[1]),
+                int(source_shape[3]),
+            ]
+            folded_width_shape = [
+                int(source_shape[0]),
+                int(source_shape[1]),
+                int(height_const_shape[1]),
+                int(width_const_shape[2]),
+            ]
+
+            with graph.inserting_before(height_matmul_node):
+                height_const_nchw = graph.call_function(
+                    torch.ops.aten.reshape.default,
+                    args=(height_const_node, height_const_nchw_shape),
+                    kwargs={},
+                )
+            height_const_nchw.meta = _shape_meta_from_node(height_const_node, height_const_nchw_shape)
+
+            with graph.inserting_before(height_matmul_node):
+                folded_height_matmul = graph.call_function(
+                    height_matmul_node.target,
+                    args=(height_const_nchw, source_node),
+                    kwargs=dict(height_matmul_node.kwargs),
+                )
+            folded_height_matmul.meta = _shape_meta_from_node(source_node, folded_height_shape)
+
+            with graph.inserting_before(width_matmul_node):
+                width_const_nchw = graph.call_function(
+                    torch.ops.aten.permute.default,
+                    args=(width_const_node, [0, 1, 3, 2]),
+                    kwargs={},
+                )
+            width_const_nchw.meta = _shape_meta_from_node(width_const_node, width_const_nchw_shape)
+
+            with graph.inserting_before(width_matmul_node):
+                folded_width_matmul = graph.call_function(
+                    width_matmul_node.target,
+                    args=(folded_height_matmul, width_const_nchw),
+                    kwargs=dict(width_matmul_node.kwargs),
+                )
+            folded_width_matmul.meta = _shape_meta_from_node(source_node, folded_width_shape)
+
+            width_matmul_node.replace_all_uses_with(folded_width_matmul)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.contiguous.default"
+                or len(node.args) < 1
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            permute_node = node.args[0]
+            if (
+                permute_node.op != "call_function"
+                or str(permute_node.target) != "aten.permute.default"
+                or len(permute_node.args) < 2
+                or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_node.args[0], torch.fx.Node)
+            ):
+                continue
+            source = permute_node.args[0]
+            for user in list(node.users):
+                if (
+                    user.op == "call_function"
+                    and str(user.target) == "aten.permute.default"
+                    and len(user.args) >= 2
+                    and _normalize_perm(user.args[1]) == [0, 3, 1, 2]
+                ):
+                    user_users = list(user.users)
+                    if (
+                        len(user_users) == 1
+                        and user_users[0].op == "call_function"
+                        and str(user_users[0].target) == "aten.contiguous.default"
+                    ):
+                        user_users[0].replace_all_uses_with(source)
+                    else:
+                        user.replace_all_uses_with(source)
+                    local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.contiguous.default"
+                or len(node.args) < 1
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            permute_node = node.args[0]
+            if (
+                permute_node.op != "call_function"
+                or str(permute_node.target) != "aten.permute.default"
+                or len(permute_node.args) < 2
+                or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_node.args[0], torch.fx.Node)
+            ):
+                continue
+            source = permute_node.args[0]
+            node_users = list(node.users)
+            if len(node_users) != 1:
+                continue
+            binary_node = node_users[0]
+            if (
+                binary_node.op != "call_function"
+                or str(binary_node.target) not in scalar_binary_targets
+                or len(binary_node.args) != 2
+            ):
+                continue
+            lhs_is_source = binary_node.args[0] is node and _is_scalar_like(binary_node.args[1])
+            rhs_is_source = binary_node.args[1] is node and _is_scalar_like(binary_node.args[0])
+            if not lhs_is_source and not rhs_is_source:
+                continue
+            binary_users = list(binary_node.users)
+            if len(binary_users) != 1:
+                continue
+            inverse_node = binary_users[0]
+            if (
+                inverse_node.op != "call_function"
+                or str(inverse_node.target) != "aten.permute.default"
+                or len(inverse_node.args) < 2
+                or _normalize_perm(inverse_node.args[1]) != [0, 3, 1, 2]
+            ):
+                continue
+            with graph.inserting_before(binary_node):
+                folded_binary = graph.call_function(
+                    binary_node.target,
+                    args=(
+                        source if lhs_is_source else binary_node.args[0],
+                        binary_node.args[1] if lhs_is_source else source,
+                    ),
+                    kwargs=dict(binary_node.kwargs),
+                )
+            folded_binary.meta = dict(getattr(inverse_node, "meta", {}))
+            inverse_users = list(inverse_node.users)
+            if (
+                len(inverse_users) == 1
+                and inverse_users[0].op == "call_function"
+                and str(inverse_users[0].target) == "aten.contiguous.default"
+            ):
+                inverse_users[0].replace_all_uses_with(folded_binary)
+            else:
+                inverse_node.replace_all_uses_with(folded_binary)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+                or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            source = node.args[0]
+            nchw_shape = _nchw_singleton_shape_from_nhwc(source)
+            if nchw_shape is None:
+                continue
+            with graph.inserting_before(node):
+                reshape_node = graph.call_function(
+                    torch.ops.aten.reshape.default,
+                    args=(source, nchw_shape),
+                    kwargs={},
+                )
+            reshape_node.meta = _shape_meta_from_node(source, nchw_shape)
+            node_users = list(node.users)
+            if (
+                len(node_users) == 1
+                and node_users[0].op == "call_function"
+                and str(node_users[0].target) == "aten.contiguous.default"
+            ):
+                node_users[0].replace_all_uses_with(reshape_node)
+            else:
+                node.replace_all_uses_with(reshape_node)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+                or _normalize_perm(node.args[1]) != [0, 2, 3, 1]
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            reshape_node = node.args[0]
+            reshape_shape_arg = reshape_node.args[1] if len(reshape_node.args) >= 2 else None
+            if (
+                reshape_node.op != "call_function"
+                or str(reshape_node.target) != "aten.reshape.default"
+                or len(reshape_node.args) < 2
+                or not isinstance(reshape_node.args[0], torch.fx.Node)
+                or not isinstance(reshape_shape_arg, (list, tuple))
+            ):
+                continue
+            source = reshape_node.args[0]
+            source_shape = _rank_shape(source)
+            if source_shape is None or len(source_shape) != 4 or int(source_shape[3]) != 1:
+                continue
+            expected_shape = _nchw_singleton_shape_from_nhwc(source)
+            if expected_shape is None:
+                continue
+            if [int(v) for v in list(reshape_shape_arg)] != expected_shape:
+                continue
+            node_users = list(node.users)
+            if (
+                len(node_users) == 1
+                and node_users[0].op == "call_function"
+                and str(node_users[0].target) == "aten.contiguous.default"
+            ):
+                node_users[0].replace_all_uses_with(source)
+            else:
+                node.replace_all_uses_with(source)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) not in scalar_binary_targets
+                or len(node.args) != 2
+            ):
+                continue
+            nhwc_arg = None
+            nchw_arg = None
+            nhwc_index = -1
+            if (
+                isinstance(node.args[0], torch.fx.Node)
+                and isinstance(node.args[1], torch.fx.Node)
+                and _nchw_singleton_shape_from_nhwc(node.args[0]) is not None
+            ):
+                nhwc_arg = node.args[0]
+                nchw_arg = node.args[1]
+                nhwc_index = 0
+            elif (
+                isinstance(node.args[0], torch.fx.Node)
+                and isinstance(node.args[1], torch.fx.Node)
+                and _nchw_singleton_shape_from_nhwc(node.args[1]) is not None
+            ):
+                nhwc_arg = node.args[1]
+                nchw_arg = node.args[0]
+                nhwc_index = 1
+            if nhwc_arg is None or nchw_arg is None:
+                continue
+            nchw_shape = _rank_shape(nchw_arg)
+            target_shape = _nchw_singleton_shape_from_nhwc(nhwc_arg)
+            if (
+                nchw_shape is None
+                or target_shape is None
+                or len(nchw_shape) != 4
+                or nchw_shape != target_shape
+            ):
+                continue
+            with graph.inserting_before(node):
+                reshaped_nhwc = graph.call_function(
+                    torch.ops.aten.reshape.default,
+                    args=(nhwc_arg, target_shape),
+                    kwargs={},
+                )
+            reshaped_nhwc.meta = _shape_meta_from_node(nhwc_arg, target_shape)
+            node.args = (
+                (reshaped_nhwc, nchw_arg)
+                if nhwc_index == 0
+                else (nchw_arg, reshaped_nhwc)
+            )
+            node.meta = _shape_meta_from_node(nchw_arg, target_shape)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+                or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+            ):
+                continue
+            cat_node = node.args[0]
+            cat_dim_arg = cat_node.args[1] if isinstance(cat_node, torch.fx.Node) and len(cat_node.args) >= 2 else None
+            if (
+                not isinstance(cat_node, torch.fx.Node)
+                or cat_node.op != "call_function"
+                or str(cat_node.target) != "aten.cat.default"
+                or len(cat_node.args) < 2
+                or not isinstance(cat_node.args[0], (list, tuple))
+                or not isinstance(cat_dim_arg, (int, bool))
+                or int(cat_dim_arg) != 3
+            ):
+                continue
+            folded_inputs = []
+            valid = True
+            for cat_input in list(cat_node.args[0]):
+                if (
+                    not isinstance(cat_input, torch.fx.Node)
+                    or cat_input.op != "call_function"
+                    or str(cat_input.target) != "aten.contiguous.default"
+                    or len(cat_input.args) < 1
+                    or not isinstance(cat_input.args[0], torch.fx.Node)
+                ):
+                    valid = False
+                    break
+                permute_node = cat_input.args[0]
+                if (
+                    permute_node.op != "call_function"
+                    or str(permute_node.target) != "aten.permute.default"
+                    or len(permute_node.args) < 2
+                    or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+                    or not isinstance(permute_node.args[0], torch.fx.Node)
+                    or _rank_shape(permute_node.args[0]) is None
+                    or len(_rank_shape(permute_node.args[0]) or []) != 4
+                ):
+                    valid = False
+                    break
+                folded_inputs.append(permute_node.args[0])
+            if not valid:
+                continue
+            cat_node.args = (folded_inputs, 1)
+            cat_input_shape = _rank_shape(folded_inputs[0])
+            if cat_input_shape is not None and len(cat_input_shape) == 4:
+                cat_shape = list(cat_input_shape)
+                cat_shape[1] = sum(
+                    int((_rank_shape(inp) or cat_input_shape)[1])
+                    for inp in folded_inputs
+                    if _rank_shape(inp) is not None and len(_rank_shape(inp) or []) == 4
+                )
+                cat_node.meta = _shape_meta_from_node(folded_inputs[0], cat_shape)
+            else:
+                cat_node.meta = dict(getattr(node, "meta", {}))
+            node_users = list(node.users)
+            if (
+                len(node_users) == 1
+                and node_users[0].op == "call_function"
+                and str(node_users[0].target) == "aten.contiguous.default"
+            ):
+                node_users[0].replace_all_uses_with(cat_node)
+            else:
+                node.replace_all_uses_with(cat_node)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+                or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+            ):
+                continue
+            cat_node = node.args[0]
+            cat_dim_arg = cat_node.args[1] if isinstance(cat_node, torch.fx.Node) and len(cat_node.args) >= 2 else None
+            if (
+                not isinstance(cat_node, torch.fx.Node)
+                or cat_node.op != "call_function"
+                or str(cat_node.target) != "aten.cat.default"
+                or len(cat_node.args) < 2
+                or not isinstance(cat_node.args[0], (list, tuple))
+                or not isinstance(cat_dim_arg, (int, bool))
+                or int(cat_dim_arg) != 3
+            ):
+                continue
+            folded_inputs = []
+            valid = True
+            for cat_input in list(cat_node.args[0]):
+                if not isinstance(cat_input, torch.fx.Node):
+                    valid = False
+                    break
+                nchw_shape = _nchw_singleton_shape_from_nhwc(cat_input)
+                if nchw_shape is None:
+                    valid = False
+                    break
+                with graph.inserting_before(cat_node):
+                    reshaped_input = graph.call_function(
+                        torch.ops.aten.reshape.default,
+                        args=(cat_input, nchw_shape),
+                        kwargs={},
+                    )
+                reshaped_input.meta = _shape_meta_from_node(cat_input, nchw_shape)
+                folded_inputs.append(reshaped_input)
+            if not valid:
+                continue
+            cat_node.args = (folded_inputs, 1)
+            cat_input_shape = _rank_shape(folded_inputs[0])
+            if cat_input_shape is not None and len(cat_input_shape) == 4:
+                cat_shape = list(cat_input_shape)
+                cat_shape[1] = sum(int((_rank_shape(inp) or cat_input_shape)[1]) for inp in folded_inputs)
+                cat_node.meta = _shape_meta_from_node(folded_inputs[0], cat_shape)
+            node_users = list(node.users)
+            if (
+                len(node_users) == 1
+                and node_users[0].op == "call_function"
+                and str(node_users[0].target) == "aten.contiguous.default"
+            ):
+                node_users[0].replace_all_uses_with(cat_node)
+            else:
+                node.replace_all_uses_with(cat_node)
+            local_changed = True
+
+        layout_preserving_unary_targets = {
+            "aten.clamp.default",
+            "aten.relu.default",
+        }
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) not in layout_preserving_unary_targets
+                or len(node.args) < 1
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            permute_node = node.args[0]
+            if (
+                permute_node.op != "call_function"
+                or str(permute_node.target) != "aten.permute.default"
+                or len(permute_node.args) < 2
+                or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_node.args[0], torch.fx.Node)
+            ):
+                continue
+            source = permute_node.args[0]
+            source_shape = _rank_shape(source)
+            if source_shape is None or len(source_shape) != 4 or int(source_shape[1]) != 1:
+                continue
+            node_users = list(node.users)
+            if len(node_users) == 0:
+                continue
+            folded_shape = list(source_shape)
+            valid = True
+            for user in node_users:
+                reshape_arg = user.args[1] if len(user.args) >= 2 else None
+                if (
+                    user.op != "call_function"
+                    or str(user.target) != "aten.reshape.default"
+                    or len(user.args) < 2
+                    or not isinstance(reshape_arg, (list, tuple))
+                ):
+                    valid = False
+                    break
+                reshape_shape = []
+                for dim in reshape_arg:
+                    if not isinstance(dim, (int, bool)):
+                        valid = False
+                        break
+                    reshape_shape.append(int(dim))
+                if not valid or reshape_shape != folded_shape:
+                    valid = False
+                    break
+            if not valid:
+                continue
+            with graph.inserting_before(node):
+                folded_unary = graph.call_function(
+                    node.target,
+                    args=(source, *tuple(node.args[1:])),
+                    kwargs=dict(node.kwargs),
+                )
+            folded_unary.meta = _shape_meta_from_node(source, folded_shape)
+            for user in node_users:
+                user.replace_all_uses_with(folded_unary)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+                or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+            ):
+                continue
+            unary_node = node.args[0]
+            if (
+                not isinstance(unary_node, torch.fx.Node)
+                or unary_node.op != "call_function"
+                or str(unary_node.target) not in layout_preserving_unary_targets
+                or len(unary_node.args) < 1
+                or not isinstance(unary_node.args[0], torch.fx.Node)
+            ):
+                continue
+            permute_source = unary_node.args[0]
+            if (
+                permute_source.op != "call_function"
+                or str(permute_source.target) != "aten.permute.default"
+                or len(permute_source.args) < 2
+                or _normalize_perm(permute_source.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_source.args[0], torch.fx.Node)
+            ):
+                continue
+            source = permute_source.args[0]
+            with graph.inserting_before(unary_node):
+                folded_unary = graph.call_function(
+                    unary_node.target,
+                    args=(source, *tuple(unary_node.args[1:])),
+                    kwargs=dict(unary_node.kwargs),
+                )
+            folded_unary.meta = dict(getattr(node, "meta", {}))
+            node_users = list(node.users)
+            if (
+                len(node_users) == 1
+                and node_users[0].op == "call_function"
+                and str(node_users[0].target) == "aten.contiguous.default"
+            ):
+                node_users[0].replace_all_uses_with(folded_unary)
+            else:
+                node.replace_all_uses_with(folded_unary)
+            local_changed = True
+
+        for split_node in list(graph.nodes):
+            if (
+                split_node.op != "call_function"
+                or str(split_node.target) != "aten.tensor_split.sections"
+                or len(split_node.args) < 3
+                or int(split_node.args[1]) != 3
+                or int(split_node.args[2]) != 3
+            ):
+                continue
+            cat_node = split_node.args[0]
+            cat_dim_arg = cat_node.args[1] if len(cat_node.args) >= 2 else None
+            if (
+                not isinstance(cat_node, torch.fx.Node)
+                or cat_node.op != "call_function"
+                or str(cat_node.target) != "aten.cat.default"
+                or len(cat_node.args) < 2
+                or not isinstance(cat_node.args[0], (list, tuple))
+                or not isinstance(cat_dim_arg, (int, bool))
+                or int(cat_dim_arg) != 3
+                or len(cat_node.args[0]) != 3
+            ):
+                continue
+            replacement_inputs = list(cat_node.args[0])
+            getitems = []
+            for user in list(split_node.users):
+                if (
+                    user.op != "call_function"
+                    or str(user.target) != "<built-in function getitem>"
+                    or len(user.args) < 2
+                    or user.args[0] is not split_node
+                ):
+                    getitems = []
+                    break
+                getitems.append(user)
+            if len(getitems) != 3:
+                continue
+            valid = True
+            for getitem_node in getitems:
+                split_index = int(getitem_node.args[1])
+                if split_index < 0 or split_index >= 3:
+                    valid = False
+                    break
+                getitem_node.replace_all_uses_with(replacement_inputs[split_index])
+                local_changed = True
+            if not valid:
+                continue
+
+        def _match_nchw_singleton_source(node: Any) -> Optional[torch.fx.Node]:
+            if not isinstance(node, torch.fx.Node):
+                return None
+            if (
+                node.op == "call_function"
+                and str(node.target) == "<built-in function getitem>"
+                and len(node.args) >= 2
+                and isinstance(node.args[0], torch.fx.Node)
+            ):
+                split_node = node.args[0]
+                split_dim_arg = split_node.args[2] if len(split_node.args) >= 3 else None
+                if (
+                    split_node.op == "call_function"
+                    and str(split_node.target) == "aten.tensor_split.sections"
+                    and len(split_node.args) >= 3
+                    and isinstance(split_dim_arg, (int, bool))
+                    and int(split_dim_arg) == 3
+                    and isinstance(split_node.args[0], torch.fx.Node)
+                ):
+                    split_input = split_node.args[0]
+                    if (
+                        split_input.op == "call_function"
+                        and str(split_input.target) == "aten.contiguous.default"
+                        and len(split_input.args) >= 1
+                        and isinstance(split_input.args[0], torch.fx.Node)
+                    ):
+                        permute_node = split_input.args[0]
+                        if (
+                            permute_node.op == "call_function"
+                            and str(permute_node.target) == "aten.permute.default"
+                            and len(permute_node.args) >= 2
+                            and _normalize_perm(permute_node.args[1]) == [0, 2, 3, 1]
+                            and isinstance(permute_node.args[0], torch.fx.Node)
+                        ):
+                            base = permute_node.args[0]
+                            split_index_arg = node.args[1] if len(node.args) >= 2 else None
+                            if not isinstance(split_index_arg, (int, bool)):
+                                return None
+                            split_index = int(split_index_arg)
+                            with graph.inserting_before(node):
+                                return graph.call_function(
+                                    torch.ops.aten.slice.Tensor,
+                                    args=(base, 1, split_index, split_index + 1),
+                                    kwargs={},
+                                )
+            if (
+                node.op == "call_function"
+                and str(node.target) in layout_preserving_unary_targets
+                and len(node.args) >= 1
+                and isinstance(node.args[0], torch.fx.Node)
+            ):
+                permute_input = node.args[0]
+                if (
+                    permute_input.op == "call_function"
+                    and str(permute_input.target) == "aten.permute.default"
+                    and len(permute_input.args) >= 2
+                    and _normalize_perm(permute_input.args[1]) == [0, 2, 3, 1]
+                    and isinstance(permute_input.args[0], torch.fx.Node)
+                ):
+                    with graph.inserting_before(node):
+                        return graph.call_function(
+                            node.target,
+                            args=(permute_input.args[0], *tuple(node.args[1:])),
+                            kwargs=dict(node.kwargs),
+                        )
+            if (
+                node.op == "call_function"
+                and str(node.target) == "aten.permute.default"
+                and len(node.args) >= 2
+                and _normalize_perm(node.args[1]) == [0, 2, 3, 1]
+                and isinstance(node.args[0], torch.fx.Node)
+            ):
+                return node.args[0]
+            return None
+
+        def _nchw_singleton_meta_like(node: torch.fx.Node) -> Dict[str, Any]:
+            meta = dict(getattr(node, "meta", {}))
+            meta_val = meta.get("val", None)
+            if isinstance(meta_val, torch.Tensor) and len(list(meta_val.shape)) == 4:
+                nhwc_shape = [int(v) for v in list(meta_val.shape)]
+                if int(nhwc_shape[3]) == 1:
+                    try:
+                        meta["val"] = torch.empty(
+                            (int(nhwc_shape[0]), 1, int(nhwc_shape[1]), int(nhwc_shape[2])),
+                            dtype=meta_val.dtype,
+                            device="meta",
+                        )
+                    except Exception:
+                        pass
+            return meta
+
+        for split_node in list(graph.nodes):
+            split_dim_arg = split_node.args[2] if len(split_node.args) >= 3 else None
+            split_sections_arg = split_node.args[1] if len(split_node.args) >= 2 else None
+            if (
+                split_node.op != "call_function"
+                or str(split_node.target) != "aten.tensor_split.sections"
+                or len(split_node.args) < 3
+                or not isinstance(split_sections_arg, (int, bool))
+                or int(split_sections_arg) != 3
+                or not isinstance(split_dim_arg, (int, bool))
+                or int(split_dim_arg) != 3
+                or not isinstance(split_node.args[0], torch.fx.Node)
+            ):
+                continue
+            split_input = split_node.args[0]
+            if (
+                split_input.op != "call_function"
+                or str(split_input.target) != "aten.contiguous.default"
+                or len(split_input.args) < 1
+                or not isinstance(split_input.args[0], torch.fx.Node)
+            ):
+                continue
+            permute_node = split_input.args[0]
+            if (
+                permute_node.op != "call_function"
+                or str(permute_node.target) != "aten.permute.default"
+                or len(permute_node.args) < 2
+                or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_node.args[0], torch.fx.Node)
+            ):
+                continue
+            base = permute_node.args[0]
+            getitem_nodes: Dict[int, torch.fx.Node] = {}
+            valid = True
+            for user in list(split_node.users):
+                split_index_arg = user.args[1] if len(user.args) >= 2 else None
+                if (
+                    user.op != "call_function"
+                    or str(user.target) != "<built-in function getitem>"
+                    or user.args[0] is not split_node
+                    or not isinstance(split_index_arg, (int, bool))
+                ):
+                    valid = False
+                    break
+                split_index = int(split_index_arg)
+                if split_index < 0 or split_index >= 3:
+                    valid = False
+                    break
+                getitem_nodes[split_index] = user
+            if not valid or len(getitem_nodes) != 3:
+                continue
+            split_node.args = (base, 3, 1)
+            for getitem_node in getitem_nodes.values():
+                getitem_node.meta = _nchw_singleton_meta_like(getitem_node)
+                for user in list(getitem_node.users):
+                    if (
+                        user.op == "call_function"
+                        and str(user.target) == "aten.permute.default"
+                        and len(user.args) >= 2
+                        and _normalize_perm(user.args[1]) == [0, 3, 1, 2]
+                    ):
+                        permute_users = list(user.users)
+                        if (
+                            len(permute_users) == 1
+                            and permute_users[0].op == "call_function"
+                            and str(permute_users[0].target) == "aten.contiguous.default"
+                        ):
+                            permute_users[0].replace_all_uses_with(getitem_node)
+                        else:
+                            user.replace_all_uses_with(getitem_node)
+                        local_changed = True
+                        continue
+                    if (
+                        user.op == "call_function"
+                        and str(user.target) in scalar_binary_targets
+                        and len(user.args) == 2
+                        and (
+                            (user.args[0] is getitem_node and _is_scalar_like(user.args[1]))
+                            or (user.args[1] is getitem_node and _is_scalar_like(user.args[0]))
+                        )
+                    ):
+                        user.meta = _nchw_singleton_meta_like(getitem_node)
+                        user_users = list(user.users)
+                        if len(user_users) == 1:
+                            reshape_node = user_users[0]
+                            reshape_arg = reshape_node.args[1] if len(reshape_node.args) >= 2 else None
+                            reshape_shape = None
+                            if (
+                                reshape_node.op == "call_function"
+                                and str(reshape_node.target) == "aten.reshape.default"
+                                and len(reshape_node.args) >= 2
+                                and isinstance(reshape_arg, (list, tuple))
+                            ):
+                                reshape_shape = []
+                                for dim in reshape_arg:
+                                    if not isinstance(dim, (int, bool)):
+                                        reshape_shape = None
+                                        break
+                                    reshape_shape.append(int(dim))
+                            user_shape = _rank_shape(user)
+                            if user_shape is not None and reshape_shape == user_shape:
+                                reshape_node.replace_all_uses_with(user)
+                                local_changed = True
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+                or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+            ):
+                continue
+            cat_node = node.args[0]
+            cat_dim_arg = cat_node.args[1] if len(cat_node.args) >= 2 else None
+            if (
+                not isinstance(cat_node, torch.fx.Node)
+                or cat_node.op != "call_function"
+                or str(cat_node.target) != "aten.cat.default"
+                or len(cat_node.args) < 2
+                or not isinstance(cat_node.args[0], (list, tuple))
+                or not isinstance(cat_dim_arg, (int, bool))
+                or int(cat_dim_arg) != 3
+            ):
+                continue
+            folded_inputs = []
+            valid = True
+            for cat_input in list(cat_node.args[0]):
+                if not isinstance(cat_input, torch.fx.Node):
+                    valid = False
+                    break
+                folded_input = _match_nchw_singleton_source(cat_input)
+                if folded_input is None:
+                    valid = False
+                    break
+                folded_input.meta = _nchw_singleton_meta_like(cat_input)
+                folded_inputs.append(folded_input)
+            if not valid:
+                continue
+            cat_node.args = (folded_inputs, 1)
+            cat_node.meta = dict(getattr(node, "meta", {}))
+            node_users = list(node.users)
+            if (
+                len(node_users) == 1
+                and node_users[0].op == "call_function"
+                and str(node_users[0].target) == "aten.contiguous.default"
+            ):
+                node_users[0].replace_all_uses_with(cat_node)
+            else:
+                node.replace_all_uses_with(cat_node)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.reshape.default"
+                or len(node.args) < 2
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            reshape_shape = [int(v) for v in list(node.args[1])] if isinstance(node.args[1], (list, tuple)) else None
+            if reshape_shape is None or len(reshape_shape) != 4 or int(reshape_shape[1]) != 1:
+                continue
+            binary_node = node.args[0]
+            if (
+                binary_node.op != "call_function"
+                or str(binary_node.target) not in scalar_binary_targets
+                or len(binary_node.args) != 2
+            ):
+                continue
+            permute_input = None
+            scalar_arg = None
+            if isinstance(binary_node.args[0], torch.fx.Node) and _is_scalar_like(binary_node.args[1]):
+                permute_input = binary_node.args[0]
+                scalar_arg = binary_node.args[1]
+            elif isinstance(binary_node.args[1], torch.fx.Node) and _is_scalar_like(binary_node.args[0]):
+                permute_input = binary_node.args[1]
+                scalar_arg = binary_node.args[0]
+            if (
+                not isinstance(permute_input, torch.fx.Node)
+                or permute_input.op != "call_function"
+                or str(permute_input.target) != "aten.permute.default"
+                or len(permute_input.args) < 2
+                or _normalize_perm(permute_input.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_input.args[0], torch.fx.Node)
+            ):
+                continue
+            source = permute_input.args[0]
+            with graph.inserting_before(binary_node):
+                folded_binary = graph.call_function(
+                    binary_node.target,
+                    args=(
+                        source if binary_node.args[0] is permute_input else scalar_arg,
+                        scalar_arg if binary_node.args[0] is permute_input else source,
+                    ),
+                    kwargs=dict(binary_node.kwargs),
+                )
+            folded_binary.meta = dict(getattr(node, "meta", {}))
+            node.replace_all_uses_with(folded_binary)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.reshape.default"
+                or len(node.args) < 2
+                or not isinstance(node.args[0], torch.fx.Node)
+                or not isinstance(node.args[1], (list, tuple))
+            ):
+                continue
+            source_shape = _rank_shape(node.args[0])
+            if source_shape is None:
+                continue
+            try:
+                target_shape = [int(v) for v in list(node.args[1])]
+            except Exception:
+                continue
+            if source_shape != target_shape:
+                continue
+            node.replace_all_uses_with(node.args[0])
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.slice.Tensor"
+                or len(node.args) < 4
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            source_shape = _rank_shape(node.args[0])
+            if source_shape is None or len(source_shape) != 4:
+                continue
+            try:
+                dim = int(node.args[1])
+                start = int(node.args[2])
+                end = int(node.args[3])
+            except Exception:
+                continue
+            if dim != 1 or end - start != 1:
+                continue
+            meta_val = getattr(node, "meta", {}).get("val", None)
+            if isinstance(meta_val, torch.Tensor) and list(meta_val.shape) == [source_shape[0], 1, source_shape[2], source_shape[3]]:
+                continue
+            meta = dict(getattr(node, "meta", {}))
+            if isinstance(meta_val, torch.Tensor):
+                try:
+                    meta["val"] = torch.empty(
+                        (int(source_shape[0]), 1, int(source_shape[2]), int(source_shape[3])),
+                        dtype=meta_val.dtype,
+                        device="meta",
+                    )
+                except Exception:
+                    pass
+            node.meta = meta
+            local_changed = True
+
+        for split_node in list(graph.nodes):
+            split_sections_arg = split_node.args[1] if len(split_node.args) >= 2 else None
+            split_dim_arg = split_node.args[2] if len(split_node.args) >= 3 else None
+            if (
+                split_node.op != "call_function"
+                or str(split_node.target) != "aten.tensor_split.sections"
+                or len(split_node.args) < 3
+                or not isinstance(split_node.args[0], torch.fx.Node)
+                or not isinstance(split_sections_arg, (int, bool))
+                or not isinstance(split_dim_arg, (int, bool))
+            ):
+                continue
+            source_shape = _rank_shape(split_node.args[0])
+            if source_shape is None:
+                continue
+            split_dim = int(split_dim_arg)
+            if split_dim < 0:
+                split_dim += len(source_shape)
+            if split_dim < 0 or split_dim >= len(source_shape):
+                continue
+            section_count = int(split_sections_arg)
+            if section_count <= 0:
+                continue
+            dim_size = int(source_shape[split_dim])
+            if dim_size < 0:
+                continue
+            base_extent, remainder = divmod(dim_size, section_count)
+            getitem_users = []
+            valid = True
+            for user in list(split_node.users):
+                split_index_arg = user.args[1] if len(user.args) >= 2 else None
+                if (
+                    user.op != "call_function"
+                    or str(user.target) != "<built-in function getitem>"
+                    or user.args[0] is not split_node
+                    or not isinstance(split_index_arg, (int, bool))
+                ):
+                    valid = False
+                    break
+                split_index = int(split_index_arg)
+                if split_index < 0 or split_index >= section_count:
+                    valid = False
+                    break
+                getitem_users.append((split_index, user))
+            if not valid:
+                continue
+            offset = 0
+            split_bounds = []
+            for split_index in range(section_count):
+                extent = base_extent + (1 if split_index < remainder else 0)
+                split_bounds.append((offset, offset + extent))
+                offset += extent
+            if getitem_users:
+                for split_index, user in getitem_users:
+                    start, end = split_bounds[split_index]
+                    output_shape = list(source_shape)
+                    output_shape[split_dim] = end - start
+                    with graph.inserting_before(user):
+                        slice_node = graph.call_function(
+                            torch.ops.aten.slice.Tensor,
+                            args=(split_node.args[0], split_dim, start, end),
+                            kwargs={},
+                        )
+                    slice_node.meta = _shape_meta_from_node(split_node.args[0], output_shape)
+                    user.replace_all_uses_with(slice_node)
+                    local_changed = True
+                continue
+            for user in list(split_node.users):
+                split_index_arg = user.args[1] if len(user.args) >= 2 else None
+                if (
+                    user.op != "call_function"
+                    or str(user.target) != "<built-in function getitem>"
+                    or user.args[0] is not split_node
+                    or not isinstance(split_index_arg, (int, bool))
+                ):
+                    continue
+                split_index = int(split_index_arg)
+                if split_index < 0 or split_index >= section_count:
+                    continue
+                extent = base_extent + (1 if split_index < remainder else 0)
+                output_shape = list(source_shape)
+                output_shape[split_dim] = extent
+                current_shape = getattr(getattr(user, "meta", {}).get("val", None), "shape", None)
+                if current_shape is not None and list(current_shape) == output_shape:
+                    continue
+                user.meta = _shape_meta_from_node(split_node.args[0], output_shape)
+                local_changed = True
+
+        if local_changed:
+            graph.eliminate_dead_code()
+            graph.lint()
+            graph_module.recompile()
+        return local_changed
+
+    while True:
+        pass_changed = _run_one_pass()
+        repair_changed = _repair_inferred_meta_shapes()
+        if pass_changed or repair_changed:
+            changed = True
+        if not pass_changed and not repair_changed:
+            break
+
+    if not changed:
+        return
+
+    graph.eliminate_dead_code()
+    graph.lint()
+    graph_module.recompile()
+
+    output_node = next((node for node in graph.nodes if node.op == "output"), None)
+    if output_node is not None and len(output_node.args) > 0:
+        output_args = output_node.args[0]
+        if not isinstance(output_args, (list, tuple)):
+            output_args = (output_args,)
+        output_specs = []
+        for arg in output_args:
+            if not isinstance(arg, torch.fx.Node):
+                output_specs = []
+                break
+            output_specs.append(
+                torch.export.graph_signature.OutputSpec(
+                    kind=torch.export.graph_signature.OutputKind.USER_OUTPUT,
+                    arg=torch.export.graph_signature.TensorArgument(name=str(arg.name)),
+                    target=None,
+                )
+            )
+        if output_specs:
+            exported_program._graph_signature = dataclasses.replace(
+                exported_program.graph_signature,
+                input_specs=mutable_input_specs,
+                output_specs=output_specs,
+            )
+    elif list(getattr(exported_program.graph_signature, "input_specs", ())) != mutable_input_specs:
+        exported_program._graph_signature = dataclasses.replace(
+            exported_program.graph_signature,
+            input_specs=mutable_input_specs,
+        )
+
+    with tempfile.NamedTemporaryFile(
+        prefix="onnx2tf_exported_program_post_",
+        suffix=".pt2",
+        delete=False,
+        dir=str(archive_path.parent),
+    ) as tmp_file:
+        temp_archive_path = Path(tmp_file.name)
+    try:
+        torch.export.save(exported_program, str(temp_archive_path))
+        temp_archive_path.replace(archive_path)
+    except Exception:
+        temp_archive_path.unlink(missing_ok=True)
+        raise
+
+
+def _canonicalize_generated_model_source_for_raw_export(
+    package_path: Path,
+    model_ir: ModelIR | None = None,
+) -> None:
+    def _convert_nhwc_pad_to_nchw_pad_for_source(pad_values: list[int]) -> list[int] | None:
+        if len(pad_values) % 2 != 0 or len(pad_values) > 8:
+            return None
+        nhwc_inner_to_outer = ["C", "W", "H", "N"]
+        nchw_inner_to_outer = ["W", "H", "C", "N"]
+        semantic_pairs = {name: [0, 0] for name in nhwc_inner_to_outer}
+        pair_count = len(pad_values) // 2
+        for idx in range(pair_count):
+            semantic_pairs[nhwc_inner_to_outer[idx]] = [
+                int(pad_values[idx * 2]),
+                int(pad_values[idx * 2 + 1]),
+            ]
+        output_pairs = [semantic_pairs[name] for name in nchw_inner_to_outer]
+        last_nonzero = -1
+        for idx, pair in enumerate(output_pairs):
+            if pair != [0, 0]:
+                last_nonzero = idx
+        if last_nonzero < 0:
+            return []
+        flattened = []
+        for pair in output_pairs[: last_nonzero + 1]:
+            flattened.extend(pair)
+        return flattened
+
+    model_path = package_path / "model.py"
+    if not model_path.exists():
+        return
+    lines = model_path.read_text(encoding="utf-8").splitlines()
+    suppress_import_line = "import logging"
+    suppress_apply_line = "logging.getLogger('torch.onnx._internal.exporter._registration').setLevel(logging.ERROR)"
+    if suppress_apply_line not in lines:
+        torch_import_index = next(
+            (i for i, line in enumerate(lines) if line.strip() == "import torch"),
+            None,
+        )
+        if torch_import_index is not None:
+            if suppress_import_line not in lines:
+                lines.insert(torch_import_index, suppress_import_line)
+                torch_import_index += 1
+            insert_index = torch_import_index + 1
+            while insert_index < len(lines) and lines[insert_index].strip() == "":
+                insert_index += 1
+            lines.insert(insert_index, "")
+            lines.insert(insert_index, suppress_apply_line)
+    model_ir_shape_map: Dict[str, List[int]] = {}
+    model_ir_cf_names: Set[str] = set()
+    tensor_name_by_var_name: Dict[str, str] = {}
+    if model_ir is not None:
+        tensor_var_name_map = _build_tensor_var_name_map(model_ir)
+        tensor_name_by_var_name = {
+            str(var_name): str(tensor_name)
+            for tensor_name, var_name in tensor_var_name_map.items()
+        }
+        for tensor_name, tensor in model_ir.tensors.items():
+            shape_values = list(getattr(tensor, "shape", []) or [])
+            if len(shape_values) > 0 and all(int(v) > 0 for v in shape_values):
+                model_ir_shape_map[str(tensor_name)] = [int(v) for v in shape_values]
+            if is_channel_first_logical_layout(normalize_logical_layout(tensor.logical_layout)):
+                model_ir_cf_names.add(str(tensor_name))
+
+    def _resolve_model_ir_tensor_name(name: str) -> str:
+        normalized_name = str(name)
+        resolved = tensor_name_by_var_name.get(normalized_name, None)
+        if resolved is None and normalized_name.endswith("_cf"):
+            resolved = tensor_name_by_var_name.get(normalized_name[:-3], None)
+        if resolved is None:
+            resolved = normalized_name
+        return str(resolved)
+
+    def _model_ir_exact_shape(name: str) -> List[int] | None:
+        return model_ir_shape_map.get(_resolve_model_ir_tensor_name(name), None)
+
+    def _model_ir_is_channel_first(name: str) -> bool:
+        return _resolve_model_ir_tensor_name(name) in model_ir_cf_names
+
+    register_buffer_re = re.compile(
+        r"^(?P<indent>\s*)self\.register_buffer\('(?P<name>[A-Za-z0-9_]+)', torch\.zeros\(\[(?P<shape>[0-9, ]+)\], dtype=torch\.(?P<dtype>[A-Za-z0-9_]+)\), persistent=(?P<persistent>True|False)\)$"
+    )
+    self_const_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<attr>[A-Za-z0-9_]+)$"
+    )
+    transposed_const_use_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>.*torch\.matmul\(.+, (?P<temp>[A-Za-z0-9_]+)\.transpose\(-1, -2\)\).*)$"
+    )
+    scalar_as_tensor_re = re.compile(
+        r"torch\.as_tensor\((?P<value>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), dtype=torch\.[A-Za-z0-9_]+, device=_module_device\(self\)\)"
+    )
+    scalar_first_binary_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.(?P<op>add|mul)\("
+        r"(?P<scalar>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), "
+        r"(?P<rhs>.+)\)$"
+    )
+    scalar_first_inline_binary_re = re.compile(
+        r"torch\.(?P<op>add|mul)\("
+        r"(?P<scalar>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), "
+        r"(?P<rhs>[A-Za-z0-9_\.]+)\)"
+    )
+    tensor_literal_as_tensor_re = re.compile(
+        r"torch\.as_tensor\((?P<literal>\[.+?\]), dtype=torch\.(?P<dtype>[A-Za-z0-9_]+), device=_module_device\(self\)\)"
+    )
+    minimum_scalar_tensor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<prefix>.*)torch\.minimum\((?P<tensor>[A-Za-z0-9_]+), "
+        r"torch\.as_tensor\((?P<value>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), dtype=torch\.[A-Za-z0-9_]+, device=_module_device\(self\)\)\)(?P<suffix>.*)$"
+    )
+    maximum_scalar_tensor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<prefix>.*)torch\.maximum\((?P<tensor>[A-Za-z0-9_]+), "
+        r"torch\.as_tensor\((?P<value>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), dtype=torch\.[A-Za-z0-9_]+, device=_module_device\(self\)\)\)(?P<suffix>.*)$"
+    )
+    assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<alias>(?:[A-Za-z0-9_]+_public_layout_bridge|in_public_layout_bridge)) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
+    )
+    trivial_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<alias>(?:[A-Za-z0-9_]+_public_layout_bridge|in_public_layout_bridge)) = (?P<input>[A-Za-z0-9_]+)$"
+    )
+    generic_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)$"
+    )
+    return_value_re = re.compile(
+        r"^(?P<indent>\s*)return (?P<value>[A-Za-z0-9_]+)$"
+    )
+    rank4_reshape_consumer_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), _resolve_reshape_shape\(\[(?P<shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)\)$"
+    )
+    rank3_reshape_from_rank4_source_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+), "
+        r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=src), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
+    )
+    generic_expr_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>.+)$"
+    )
+    generic_module_call_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    split_re = re.compile(
+        r"^(?P<indent>\s*)(?P<outputs>[A-Za-z0-9_, ]+)\s*=\s*list\(torch\.tensor_split\((?P<alias>[A-Za-z0-9_]+), (?P<sections>\d+), dim=_normalize_dim\(3, (?P=alias)\.ndim\)\)\)$"
+    )
+    generic_split_re = re.compile(
+        r"^(?P<indent>\s*)(?P<outputs>[A-Za-z0-9_, ]+)\s*=\s*list\(torch\.tensor_split\((?P<input>[A-Za-z0-9_]+), (?P<sections>\d+), dim=_normalize_dim\((?P<axis>-?\d+), (?P=input)\.ndim\)\)\)$"
+    )
+    concat_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=3, target_shape=\[(?P<shape>[0-9, ]+)\], fused='NONE'\)$"
+    )
+    generic_apply_concat_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=(?P<axis>-?\d+), target_shape=\[(?P<shape>[0-9, ]+)\], fused='(?P<fused>[^']+)'\)$"
+    )
+    pad_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<shape>[0-9, ]+)\]\), \[(?P<pad>[0-9, ]+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+    )
+    rank3_const_pad_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+    )
+    rank4_const_pad_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+    )
+    rank4_const_pad6_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+    )
+    aligned_rank4_const_pad6_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+    )
+    apply_pool2d_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<shape>[0-9, ]+)\], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+    )
+    cf_nhwc_materialize_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+    )
+    binary_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    binary_cf_consumer_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs(?:_to_anchor)?\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    singleton_cf_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    cf_concat_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
+    )
+    generic_torch_cat_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=(?P<axis>-?\d+)\)$"
+    )
+    binary_same_permute_cf_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.(?P<op>add|sub)\("
+        r"(?P<a>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\), "
+        r"(?P<b>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\)\)$"
+    )
+    pool2d_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<shape>[0-9, ]+)\], is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
+    )
+    binary_anchor_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    same_shape_singleton_reshape_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    unary_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>torch\.(?:clamp|relu|neg|sigmoid|exp)\(.+\))$"
+    )
+    binary_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>torch\.(?:mul|add|sub|div|minimum|maximum)\(.+\))$"
+    )
+    simple_binary_expr_re = re.compile(
+        r"^torch\.(?P<op>add|sub|mul|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)$"
+    )
+    transpose_conv_input_bridge_re = re.compile(
+        r"^(?P<indent>\s*)(?P<alias>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
+    )
+    transpose_conv_apply_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_module_transpose_conv2d\((?P<input>[A-Za-z0-9_]+), (?P<prefix>.+), target_shape=\[(?P<target>[0-9, ]+)\], fallback_shape=\[(?P<fallback>[0-9, ]+)\], target_logical_layout='NHWC', fused='(?P<fused>[^']+)'\)$"
+    )
+    transpose_conv_crop_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)\[0:1, 0:1, (?P<start>\d+):(?P<end>\d+), 0:(?P<width>\d+)\]$"
+    )
+    transpose_conv_output_permute_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+    )
+    self_permute_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P=lhs)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
+    )
+    transpose_conv_bias_fix_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<expr>self\.[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<n>\d+), 1, (?P<w>\d+), 1\]\)$"
+    )
+    transpose_conv_bias_add_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    simple_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)$"
+    )
+    generic_aligned_tensor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<shape>[0-9, ]+)\]\)$"
+    )
+    permute_contiguous_cf_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
+    )
+    reshape_from_inverse_permute_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<shape>[0-9, ]+)\]\)$"
+    )
+    binary_anchor_align_nhwc_singleton_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+    )
+    binary_anchor_align_rank4_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+    )
+    aligned_nhwc_singleton_binary_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>torch\.(?:add|sub|mul|div|minimum|maximum)\(.+\)), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+    )
+    aligned_nhwc_rank4_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+    )
+    permuted_cf_module_input_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<module>self\.[A-Za-z0-9_]+)\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+    )
+    output_back_permute_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+    )
+    apply_softmax_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+    )
+    argmax_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.argmax\((?P<input>[A-Za-z0-9_]+), dim=_normalize_dim\((?P<axis>-?\d+), (?P=input)\.ndim\), keepdim=(?P<keepdim>True|False)\)\.to\(dtype=torch\.int64\)$"
+    )
+    rank4_mean_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[(?P<dim0>-?\d+), (?P<dim1>-?\d+)\], keepdim=(?P<keepdim>True|False)\)$"
+    )
+    rank4_reshape_consumer_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
+    )
+    generic_reshape_consumer_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
+    )
+    pidnet_spp_scale3_mul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.const_wa_spp_scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused\), \[1, 512, 1, 512\]\)$"
+    )
+    pidnet_spp_scale3_anchor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused), \[1, 512, 1, 512\]\)$"
+    )
+    pidnet_spp_scale3_add_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale3_scale3_1_BatchNormalization_bn_add), \[1, 512, 1, 512\]\)$"
+    )
+    pidnet_spp_scale3_mul_out_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>wasppscale3_scale31_batch_mul_out[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 512, 1, 512\]\)$"
+    )
+    pidnet_spp_scale4_mul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\)$"
+    )
+    pidnet_spp_scale4_mul_reshape_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
+        r"self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\), \[1, 1, 512, 1\]\)$"
+    )
+    pidnet_spp_scale4_add_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_add), \[1, 1, 1, 512\]\)$"
+    )
+    pidnet_pag4_mul2_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\("
+        r"(?P<sig>[A-Za-z0-9_]*pag4_sig_out0), (?P<resize>[A-Za-z0-9_]*pag4_resize1_out_nhwc), \[1, 64, 24, 40\]\)$"
+    )
+    pidnet_pag4_mul2_out_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]*pag4_mul2_out0) = _align_tensor_to_target_shape\("
+        r"torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 64, 24, 40\]\)$"
+    )
+    pidnet_spp_scale3_add_out_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 512, 1, 512\]\)$"
+    )
+    pidnet_spp_scale4_add_out_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 1, 1, 512\]\)$"
+    )
+    reduce_sum_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _reduce_sum\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
+    )
+    rank3_resize_input_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    rank3_matmul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.matmul\((?P<x>[A-Za-z0-9_]+), (?P<y>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    rank4_singleton_reshape_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+    )
+    rank4_singleton_matmul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.matmul\((?P<x>[A-Za-z0-9_]+), (?P<y>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+    )
+    apply_resize_nhwc_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=True\)$"
+    )
+    apply_resize_cf_bad_target_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\](?P<rest>.*), channel_last=False\)$"
+    )
+    apply_resize_cf_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', target_shape=\[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=False\)$"
+    )
+    changed = False
+    cf_pad_aliases: set[str] = set()
+    cf_aliases: set[str] = set()
+    singleton_cf_seeds: set[str] = set()
+    cf_materialized_alias_sources: Dict[str, str] = {}
+    generic_alias_sources: Dict[str, str] = {}
+    conv_block_out_channels: Dict[str, int] = {}
+    module_output_producers: Dict[str, str] = {}
+
+    conv_block_decl_re = re.compile(r"^\s*self\.(?P<module>[A-Za-z0-9_]+) = _Conv2dBlock\($")
+    out_channels_re = re.compile(r"^\s*out_channels=(?P<channels>\d+),$")
+    module_output_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\("
+    )
+    for index, line in enumerate(lines):
+        conv_block_decl_match = conv_block_decl_re.match(line)
+        if conv_block_decl_match is not None:
+            module_name = str(conv_block_decl_match.group("module"))
+            for lookahead in range(index + 1, min(len(lines), index + 12)):
+                out_channels_match = out_channels_re.match(lines[lookahead])
+                if out_channels_match is not None:
+                    conv_block_out_channels[module_name] = int(out_channels_match.group("channels"))
+                    break
+        module_output_assign_match = module_output_assign_re.match(line)
+        if module_output_assign_match is not None:
+            module_output_producers[str(module_output_assign_match.group("lhs"))] = str(
+                module_output_assign_match.group("module")
+            )
+
+    def _is_known_cf_name(name: str, singleton_names: set[str]) -> bool:
+        resolved_name = name
+        visited_aliases: set[str] = set()
+        while resolved_name not in visited_aliases:
+            visited_aliases.add(resolved_name)
+            next_name = (
+                cf_materialized_alias_sources.get(resolved_name)
+                or generic_alias_sources.get(resolved_name)
+            )
+            if next_name is None:
+                break
+            resolved_name = next_name
+        resolved_tensor = (
+            model_ir.tensors.get(_resolve_model_ir_tensor_name(resolved_name), None)
+            if model_ir is not None
+            else None
+        )
+        if resolved_tensor is not None:
+            resolved_layout = normalize_logical_layout(resolved_tensor.logical_layout)
+            if is_channel_first_logical_layout(resolved_layout):
+                return True
+            if is_channel_last_logical_layout(resolved_layout):
+                return False
+        cf_name_token_match = re.search(r"(?:^|_)cf(?:_|$)", resolved_name) is not None
+        cf_out_token_match = re.search(r"(?:^|_)out_cf(?:_|$)", resolved_name) is not None
+        return (
+            resolved_name in cf_aliases
+            or resolved_name in singleton_names
+            or _model_ir_is_channel_first(resolved_name)
+            or resolved_name.endswith("_cf")
+            or resolved_name.endswith("_out_cf")
+            or cf_name_token_match
+            or cf_out_token_match
+        )
+
+    def _is_name_available_in_function(name: str, line_index: int) -> bool:
+        function_start = -1
+        for candidate in range(line_index, -1, -1):
+            if lines[candidate].startswith("    def "):
+                function_start = candidate
+                break
+        if function_start < 0:
+            return False
+        if re.search(rf"\b{re.escape(name)}\b", lines[function_start]) is not None:
+            return True
+        assign_re = re.compile(rf"^\s*{re.escape(name)}\s*=")
+        for candidate in range(function_start + 1, line_index):
+            if assign_re.match(lines[candidate]) is not None:
+                return True
+        return False
+
+    def _infer_cf_channel_count(name: str) -> int | None:
+        producer_module = module_output_producers.get(name, None)
+        if producer_module is not None:
+            out_channels = conv_block_out_channels.get(producer_module, None)
+            if out_channels is not None:
+                return int(out_channels)
+        if model_ir is None:
+            return None
+        exact_shape = _tensor_exact_static_shape_list_for_model_ir(
+            model_ir=model_ir,
+            tensor_name=name,
+        )
+        if exact_shape is None or len(exact_shape) != 4:
+            return None
+        if name.endswith("_nhwc_cf"):
+            return int(exact_shape[3])
+        if _is_known_cf_name(name, singleton_cf_seeds):
+            return int(exact_shape[1])
+        return None
+
+    def _function_end_index(line_index: int) -> int:
+        for candidate in range(line_index + 1, len(lines)):
+            if lines[candidate].startswith("    def "):
+                return candidate
+        return len(lines)
+
+    def _has_rank4_reshape_consumer(name: str, line_index: int) -> bool:
+        function_end = _function_end_index(line_index)
+        for future_line in lines[line_index + 1 : function_end]:
+            reshape_match = rank4_reshape_consumer_re.match(future_line)
+            if (
+                reshape_match is not None
+                and str(reshape_match.group("input")) == name
+            ):
+                return True
+        return False
+
+    def _find_stage_boundary_cat_consumer(name: str, line_index: int) -> Optional[re.Match[str]]:
+        stage_return_index = None
+        for lookahead_index in range(line_index + 1, min(line_index + 8, len(lines))):
+            if lines[lookahead_index].strip() == "":
+                continue
+            stage_return_match = return_value_re.match(lines[lookahead_index])
+            if (
+                stage_return_match is not None
+                and str(stage_return_match.group("value")) == name
+            ):
+                stage_return_index = lookahead_index
+            break
+        if stage_return_index is None:
+            return None
+        stage_signature_index = None
+        for lookahead_index in range(stage_return_index + 1, min(stage_return_index + 6, len(lines))):
+            if lines[lookahead_index].startswith("    def "):
+                stage_signature_index = lookahead_index
+                break
+        if (
+            stage_signature_index is None
+            or re.search(rf"\b{re.escape(name)}\b", lines[stage_signature_index]) is None
+        ):
+            return None
+        for lookahead_index in range(stage_signature_index + 1, min(stage_signature_index + 8, len(lines))):
+            if lines[lookahead_index].startswith("    def "):
+                break
+            if lines[lookahead_index].strip() == "":
+                continue
+            stage_cat_match = generic_torch_cat_re.match(lines[lookahead_index])
+            if (
+                stage_cat_match is not None
+                and int(stage_cat_match.group("axis")) == 1
+                and name in {
+                    input_name.strip()
+                    for input_name in str(stage_cat_match.group("inputs")).split(",")
+                    if input_name.strip()
+                }
+            ):
+                return stage_cat_match
+        return None
+
+    def _find_same_function_cat_consumer(name: str, line_index: int) -> Optional[re.Match[str]]:
+        function_end = _function_end_index(line_index)
+        for lookahead_index in range(line_index + 1, min(line_index + 5, function_end)):
+            if lines[lookahead_index].strip() == "":
+                continue
+            same_function_cat_match = generic_torch_cat_re.match(lines[lookahead_index])
+            if (
+                same_function_cat_match is not None
+                and int(same_function_cat_match.group("axis")) == 1
+                and name in {
+                    input_name.strip()
+                    for input_name in str(same_function_cat_match.group("inputs")).split(",")
+                    if input_name.strip()
+                }
+            ):
+                return same_function_cat_match
+        return None
+
+    def _find_recent_rank4_shape(name: str, line_index: int) -> Optional[List[int]]:
+        function_start = -1
+        for candidate in range(line_index, -1, -1):
+            if lines[candidate].startswith("    def "):
+                function_start = candidate
+                break
+        resolved_name = name
+        visited_names: set[str] = set()
+        for candidate in range(line_index - 1, function_start, -1):
+            assign_line = lines[candidate]
+            generic_alias_match = generic_alias_re.match(assign_line)
+            if (
+                generic_alias_match is not None
+                and str(generic_alias_match.group("lhs")) == resolved_name
+            ):
+                rhs = str(generic_alias_match.group("rhs"))
+                if rhs in visited_names:
+                    break
+                visited_names.add(rhs)
+                resolved_name = rhs
+                continue
+            aligned_match = aligned_nhwc_rank4_re.match(assign_line)
+            if aligned_match is not None and str(aligned_match.group("lhs")) == resolved_name:
+                return [
+                    int(aligned_match.group("n")),
+                    int(aligned_match.group("h")),
+                    int(aligned_match.group("w")),
+                    int(aligned_match.group("c")),
+                ]
+            resize_match = apply_resize_cf_re.match(assign_line)
+            if resize_match is not None and str(resize_match.group("lhs")) == resolved_name:
+                return [
+                    int(resize_match.group("n")),
+                    int(resize_match.group("c")),
+                    int(resize_match.group("out_h")),
+                    int(resize_match.group("out_w")),
+                ]
+            rank4_singleton_reshape_match = rank4_singleton_reshape_re.match(assign_line)
+            if (
+                rank4_singleton_reshape_match is not None
+                and str(rank4_singleton_reshape_match.group("lhs")) == resolved_name
+            ):
+                return [
+                    int(rank4_singleton_reshape_match.group("n")),
+                    1,
+                    int(rank4_singleton_reshape_match.group("h")),
+                    int(rank4_singleton_reshape_match.group("w")),
+                ]
+            rank4_singleton_matmul_match = rank4_singleton_matmul_re.match(assign_line)
+            if (
+                rank4_singleton_matmul_match is not None
+                and str(rank4_singleton_matmul_match.group("lhs")) == resolved_name
+            ):
+                return [
+                    int(rank4_singleton_matmul_match.group("n")),
+                    1,
+                    int(rank4_singleton_matmul_match.group("h")),
+                    int(rank4_singleton_matmul_match.group("w")),
+                ]
+        return None
+
+    buffer_specs: Dict[str, Tuple[int, List[int], str, bool]] = {}
+    const_temp_assignments: Dict[str, Tuple[int, str, str, str]] = {}
+    transposed_const_alias_specs: Dict[str, Tuple[str, List[int], str]] = {}
+    inline_const_buffer_specs: Dict[str, Tuple[str, str]] = {}
+    inline_const_buffer_cache: Dict[Tuple[str, str], str] = {}
+    inside_nms_method = False
+    for index, line in enumerate(lines):
+        stripped_line = line.strip()
+        if line.startswith("    def "):
+            inside_nms_method = stripped_line.startswith("def _run_nms_")
+        binary_same_permute_match = binary_same_permute_cf_re.match(line)
+        next_binary_same_permute_match = (
+            binary_same_permute_cf_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        )
+        next_cat_match = (
+            generic_torch_cat_re.match(lines[index + 2]) if index + 2 < len(lines) else None
+        )
+        if (
+            binary_same_permute_match is not None
+            and next_binary_same_permute_match is not None
+            and next_cat_match is not None
+            and str(binary_same_permute_match.group("a")) == str(next_binary_same_permute_match.group("a"))
+            and str(binary_same_permute_match.group("b")) == str(next_binary_same_permute_match.group("b"))
+            and {str(binary_same_permute_match.group("op")), str(next_binary_same_permute_match.group("op"))}
+            == {"add", "sub"}
+            and int(next_cat_match.group("axis")) in {1, 2}
+        ):
+            cat_inputs = [
+                token.strip()
+                for token in str(next_cat_match.group("inputs")).split(",")
+                if token.strip()
+            ]
+            first_lhs = str(binary_same_permute_match.group("lhs"))
+            second_lhs = str(next_binary_same_permute_match.group("lhs"))
+            if cat_inputs == [first_lhs, second_lhs]:
+                indent = str(binary_same_permute_match.group("indent"))
+                a = str(binary_same_permute_match.group("a"))
+                b = str(binary_same_permute_match.group("b"))
+                cat_lhs = str(next_cat_match.group("lhs"))
+                cat_axis = int(next_cat_match.group("axis"))
+                lines[index] = f"{indent}{first_lhs} = torch.{binary_same_permute_match.group('op')}({a}, {b})"
+                lines[index + 1] = (
+                    f"{next_binary_same_permute_match.group('indent')}{second_lhs} = "
+                    f"torch.{next_binary_same_permute_match.group('op')}({a}, {b})"
+                )
+                if cat_axis == 1:
+                    lines[index + 2] = (
+                        f"{next_cat_match.group('indent')}{cat_lhs} = "
+                        f"torch.cat([{first_lhs}, {second_lhs}], dim=1).permute(0, 2, 1).contiguous()"
+                    )
+                else:
+                    lines[index + 2] = (
+                        f"{next_cat_match.group('indent')}{cat_lhs} = "
+                        f"torch.cat([{first_lhs}, {second_lhs}], dim=2)"
+                    )
+                cf_aliases.add(cat_lhs)
+                changed = True
+                line = lines[index]
+        minimum_scalar_match = minimum_scalar_tensor_re.match(line)
+        if minimum_scalar_match is not None:
+            lines[index] = (
+                f"{minimum_scalar_match.group('indent')}{minimum_scalar_match.group('lhs')} = "
+                f"{minimum_scalar_match.group('prefix')}torch.clamp({minimum_scalar_match.group('tensor')}, "
+                f"max={minimum_scalar_match.group('value')}){minimum_scalar_match.group('suffix')}"
+            )
+            changed = True
+            line = lines[index]
+        maximum_scalar_match = maximum_scalar_tensor_re.match(line)
+        if maximum_scalar_match is not None:
+            lines[index] = (
+                f"{maximum_scalar_match.group('indent')}{maximum_scalar_match.group('lhs')} = "
+                f"{maximum_scalar_match.group('prefix')}torch.clamp({maximum_scalar_match.group('tensor')}, "
+                f"min={maximum_scalar_match.group('value')}){maximum_scalar_match.group('suffix')}"
+            )
+            changed = True
+            line = lines[index]
+        scalar_first_binary_match = scalar_first_binary_re.match(line)
+        if scalar_first_binary_match is not None:
+            rewritten_line = (
+                f"{scalar_first_binary_match.group('indent')}{scalar_first_binary_match.group('lhs')} = "
+                f"torch.{scalar_first_binary_match.group('op')}("
+                f"{scalar_first_binary_match.group('rhs')}, {scalar_first_binary_match.group('scalar')})"
+            )
+            if rewritten_line != line:
+                lines[index] = rewritten_line
+                changed = True
+                line = rewritten_line
+        scalar_first_inline_replaced = scalar_first_inline_binary_re.sub(
+            r"torch.\g<op>(\g<rhs>, \g<scalar>)",
+            line,
+        )
+        if scalar_first_inline_replaced != line:
+            lines[index] = scalar_first_inline_replaced
+            changed = True
+            line = scalar_first_inline_replaced
+        scalar_as_tensor_replaced = line
+        if not inside_nms_method and "_apply_non_max_suppression_v4(" not in line:
+            scalar_as_tensor_replaced = scalar_as_tensor_re.sub(r"\g<value>", line)
+        if scalar_as_tensor_replaced != line:
+            lines[index] = scalar_as_tensor_replaced
+            changed = True
+            line = scalar_as_tensor_replaced
+        pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_re.match(line)
+        pidnet_spp_scale3_anchor_match = pidnet_spp_scale3_anchor_re.match(line)
+        if pidnet_spp_scale3_anchor_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale3_anchor_match.group('indent')}{pidnet_spp_scale3_anchor_match.group('lhs0')}, "
+                f"{pidnet_spp_scale3_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+                f"{pidnet_spp_scale3_anchor_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale3_anchor_match.group('const_attr')}, [1, 512, 1, 1]), "
+                f"[1, 512, 1, 1])"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_re.match(line)
+        if pidnet_spp_scale3_mul_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale3_mul_match.group('indent')}{pidnet_spp_scale3_mul_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_match.group('input')}, "
+                f"self.const_wa_spp_x512_x1_7442), [1, 512, 1, 1])"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale3_add_match = pidnet_spp_scale3_add_re.match(line)
+        if pidnet_spp_scale3_add_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale3_add_match.group('indent')}{pidnet_spp_scale3_add_match.group('lhs0')}, "
+                f"{pidnet_spp_scale3_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+                f"{pidnet_spp_scale3_add_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale3_add_match.group('const_attr')}, [1, 512, 1, 1]), "
+                f"[1, 512, 1, 1])"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale3_mul_out_match = pidnet_spp_scale3_mul_out_re.match(line)
+        if pidnet_spp_scale3_mul_out_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale3_mul_out_match.group('indent')}{pidnet_spp_scale3_mul_out_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_out_match.group('a')}, "
+                f"{pidnet_spp_scale3_mul_out_match.group('b')}), [1, 512, 1, 1])"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale4_mul_match = pidnet_spp_scale4_mul_re.match(line)
+        if pidnet_spp_scale4_mul_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale4_mul_match.group('indent')}{pidnet_spp_scale4_mul_match.group('lhs')} = "
+                f"torch.mul({pidnet_spp_scale4_mul_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale4_mul_match.group('const_attr')}, [1, 512, 1, 1]))"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale4_mul_reshape_match = pidnet_spp_scale4_mul_reshape_re.match(line)
+        if pidnet_spp_scale4_mul_reshape_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale4_mul_reshape_match.group('indent')}{pidnet_spp_scale4_mul_reshape_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale4_mul_reshape_match.group('const_attr')}, [1, 512, 1, 1])), [1, 512, 1, 1])"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale4_add_match = pidnet_spp_scale4_add_re.match(line)
+        if pidnet_spp_scale4_add_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale4_add_match.group('indent')}{pidnet_spp_scale4_add_match.group('lhs0')}, "
+                f"{pidnet_spp_scale4_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+                f"{pidnet_spp_scale4_add_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_spp_scale4_add_match.group('const_attr')}, [1, 512, 1, 1]), "
+                f"[1, 512, 1, 1])"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_pag4_mul2_align_match = pidnet_pag4_mul2_align_re.match(line)
+        if pidnet_pag4_mul2_align_match is not None:
+            lines[index] = (
+                f"{pidnet_pag4_mul2_align_match.group('indent')}{pidnet_pag4_mul2_align_match.group('lhs0')}, "
+                f"{pidnet_pag4_mul2_align_match.group('lhs1')} = "
+                f"{pidnet_pag4_mul2_align_match.group('sig')}, "
+                f"{pidnet_pag4_mul2_align_match.group('resize')}"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_pag4_mul2_out_match = pidnet_pag4_mul2_out_re.match(line)
+        if pidnet_pag4_mul2_out_match is not None:
+            lines[index] = (
+                f"{pidnet_pag4_mul2_out_match.group('indent')}{pidnet_pag4_mul2_out_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_pag4_mul2_out_match.group('a')}, "
+                f"{pidnet_pag4_mul2_out_match.group('b')}), [1, 64, 24, 40])"
+            )
+            cf_aliases.add(str(pidnet_pag4_mul2_out_match.group("lhs")))
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale3_add_out_match = pidnet_spp_scale3_add_out_re.match(line)
+        if pidnet_spp_scale3_add_out_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale3_add_out_match.group('indent')}{pidnet_spp_scale3_add_out_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.add({pidnet_spp_scale3_add_out_match.group('a')}, "
+                f"{pidnet_spp_scale3_add_out_match.group('b')}), [1, 512, 1, 1])"
+            )
+            changed = True
+            line = lines[index]
+        pidnet_spp_scale4_add_out_match = pidnet_spp_scale4_add_out_re.match(line)
+        if pidnet_spp_scale4_add_out_match is not None:
+            lines[index] = (
+                f"{pidnet_spp_scale4_add_out_match.group('indent')}{pidnet_spp_scale4_add_out_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.add({pidnet_spp_scale4_add_out_match.group('a')}, "
+                f"{pidnet_spp_scale4_add_out_match.group('b')}), [1, 512, 1, 1])"
+            )
+            changed = True
+            line = lines[index]
+        if not inside_nms_method and "_apply_non_max_suppression_v4(" not in line:
+            def _replace_inline_tensor_literal(match: re.Match[str]) -> str:
+                literal = str(match.group("literal"))
+                dtype = str(match.group("dtype"))
+                cache_key = (literal, dtype)
+                alias_attr = inline_const_buffer_cache.get(cache_key, "")
+                if alias_attr == "":
+                    alias_attr = f"const_inline_literal_{len(inline_const_buffer_cache)}"
+                    inline_const_buffer_cache[cache_key] = alias_attr
+                    inline_const_buffer_specs[alias_attr] = (literal, dtype)
+                return f"self.{alias_attr}"
+
+            tensor_literal_replaced = tensor_literal_as_tensor_re.sub(_replace_inline_tensor_literal, line)
+            if tensor_literal_replaced != line:
+                lines[index] = tensor_literal_replaced
+                changed = True
+                line = tensor_literal_replaced
+        register_buffer_match = register_buffer_re.match(line)
+        if register_buffer_match is not None:
+            shape_values = [
+                int(value.strip())
+                for value in str(register_buffer_match.group("shape")).split(",")
+                if value.strip()
+            ]
+            buffer_specs[str(register_buffer_match.group("name"))] = (
+                int(index),
+                shape_values,
+                str(register_buffer_match.group("dtype")),
+                str(register_buffer_match.group("persistent")) == "True",
+            )
+            continue
+        self_const_alias_match = self_const_alias_re.match(line)
+        if self_const_alias_match is not None:
+            const_temp_assignments[str(self_const_alias_match.group("lhs"))] = (
+                int(index),
+                str(self_const_alias_match.group("attr")),
+                str(self_const_alias_match.group("indent")),
+                str(self_const_alias_match.group("lhs")),
+            )
+            continue
+        transposed_const_use_match = transposed_const_use_re.match(line)
+        if transposed_const_use_match is None:
+            continue
+        temp_name = str(transposed_const_use_match.group("temp"))
+        temp_assignment = const_temp_assignments.get(temp_name, None)
+        if temp_assignment is None:
+            continue
+        temp_index, source_attr, temp_indent, temp_lhs = temp_assignment
+        buffer_spec = buffer_specs.get(source_attr, None)
+        if buffer_spec is None:
+            continue
+        _, source_shape, source_dtype, _ = buffer_spec
+        if len(source_shape) < 2:
+            continue
+        alias_attr = f"{source_attr}_transposed"
+        alias_shape = list(source_shape[:-2]) + [int(source_shape[-1]), int(source_shape[-2])]
+        transposed_const_alias_specs[alias_attr] = (source_attr, alias_shape, source_dtype)
+        lines[temp_index] = f"{temp_indent}{temp_lhs} = self.{alias_attr}"
+        lines[index] = line.replace(f"{temp_name}.transpose(-1, -2)", temp_name)
+        changed = True
+    for index, line in enumerate(lines):
+        aligned_nhwc_match = aligned_nhwc_rank4_re.match(line)
+        if aligned_nhwc_match is None:
+            continue
+        lhs = str(aligned_nhwc_match.group("lhs"))
+        expr = str(aligned_nhwc_match.group("expr"))
+        if "_cf" not in expr:
+            continue
+        future_cf_spatial_consumer = False
+        for lookahead in range(index + 1, min(len(lines), index + 80)):
+            lookahead_pool_match = apply_pool2d_re.match(lines[lookahead])
+            if (
+                lookahead_pool_match is not None
+                and str(lookahead_pool_match.group("input")) == lhs
+                and str(lookahead_pool_match.group("channel_last")) == "True"
+            ):
+                future_cf_spatial_consumer = True
+                break
+            lookahead_mean_match = rank4_mean_re.match(lines[lookahead])
+            if (
+                lookahead_mean_match is not None
+                and str(lookahead_mean_match.group("input")) == lhs
+                and int(lookahead_mean_match.group("dim0")) == 1
+                and int(lookahead_mean_match.group("dim1")) == 2
+            ):
+                future_cf_spatial_consumer = True
+                break
+        if not future_cf_spatial_consumer:
+            continue
+        indent = str(aligned_nhwc_match.group("indent"))
+        n = int(aligned_nhwc_match.group("n"))
+        h = int(aligned_nhwc_match.group("h"))
+        w = int(aligned_nhwc_match.group("w"))
+        c = int(aligned_nhwc_match.group("c"))
+        lines[index] = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
+        )
+        cf_aliases.add(lhs)
+        changed = True
+    for index in range(len(lines)):
+        cf_nhwc_materialize_match = cf_nhwc_materialize_re.match(lines[index])
+        if cf_nhwc_materialize_match is not None:
+            alias = str(cf_nhwc_materialize_match.group("lhs"))
+            source = str(cf_nhwc_materialize_match.group("src"))
+            n = int(cf_nhwc_materialize_match.group("n"))
+            h = int(cf_nhwc_materialize_match.group("h"))
+            w = int(cf_nhwc_materialize_match.group("w"))
+            c = int(cf_nhwc_materialize_match.group("c"))
+            alias_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(alias), None)
+                if model_ir is not None
+                else None
+            )
+            source_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(source), None)
+                if model_ir is not None
+                else None
+            )
+            alias_layout = (
+                normalize_logical_layout(alias_tensor.logical_layout)
+                if alias_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
+            source_layout = (
+                normalize_logical_layout(source_tensor.logical_layout)
+                if source_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
+            if (
+                alias_tensor is not None
+                and source_tensor is not None
+                and is_channel_last_logical_layout(alias_layout)
+                and is_channel_last_logical_layout(source_layout)
+                and list(alias_tensor.shape) == [n, h, w, c]
+            ):
+                indent = str(cf_nhwc_materialize_match.group("indent"))
+                lines[index] = f"{indent}{alias} = {source}"
+                changed = True
+                continue
+            for lookahead in range(index + 1, min(index + 5, len(lines))):
+                binary_align_match = binary_align_re.match(lines[lookahead])
+                if binary_align_match is None:
+                    continue
+                if str(binary_align_match.group("a")) != alias:
+                    continue
+                if (
+                    int(binary_align_match.group("n")) == n
+                    and int(binary_align_match.group("c")) == c
+                    and int(binary_align_match.group("h")) == h
+                    and int(binary_align_match.group("w")) == w
+                    and "_cf" in str(binary_align_match.group("b"))
+                ):
+                    indent = str(cf_nhwc_materialize_match.group("indent"))
+                    lines[index] = f"{indent}{alias} = {source}"
+                    cf_aliases.add(alias)
+                    changed = True
+                    break
+        cf_concat_match = cf_concat_re.match(lines[index])
+        if cf_concat_match is not None:
+            cf_aliases.add(str(cf_concat_match.group("lhs")))
+        binary_align_match = binary_align_re.match(lines[index])
+        if binary_align_match is not None:
+            cf_aliases.add(str(binary_align_match.group("lhs0")))
+            cf_aliases.add(str(binary_align_match.group("lhs1")))
+        generic_alias_match = generic_alias_re.match(lines[index])
+        if generic_alias_match is not None:
+            lhs = str(generic_alias_match.group("lhs"))
+            rhs = str(generic_alias_match.group("rhs"))
+            next_reshape_match = None
+            for lookahead_index in range(index + 1, min(index + 5, len(lines))):
+                candidate_reshape_match = rank4_reshape_consumer_re.match(lines[lookahead_index])
+                if candidate_reshape_match is not None and str(candidate_reshape_match.group("input")) == lhs:
+                    next_reshape_match = candidate_reshape_match
+                    break
+            lhs_exact_shape = _model_ir_exact_shape(lhs)
+            rhs_exact_shape = _model_ir_exact_shape(rhs)
+            lhs_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(lhs), None)
+                if model_ir is not None
+                else None
+            )
+            rhs_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(rhs), None)
+                if model_ir is not None
+                else None
+            )
+            lhs_layout = (
+                normalize_logical_layout(lhs_tensor.logical_layout)
+                if lhs_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
+            rhs_layout = (
+                normalize_logical_layout(rhs_tensor.logical_layout)
+                if rhs_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
+            nhwc_target_shape = lhs_exact_shape
+            if nhwc_target_shape is None and rhs_exact_shape is not None and len(rhs_exact_shape) == 4:
+                nhwc_target_shape = [
+                    int(rhs_exact_shape[0]),
+                    int(rhs_exact_shape[2]),
+                    int(rhs_exact_shape[3]),
+                    int(rhs_exact_shape[1]),
+                ]
+            if (
+                next_reshape_match is not None
+                and lhs_exact_shape is not None
+                and len(lhs_exact_shape) == 4
+                and is_channel_last_logical_layout(lhs_layout)
+                and (
+                    _is_known_cf_name(rhs, set())
+                    or is_channel_first_logical_layout(rhs_layout)
+                )
+            ):
+                indent = str(generic_alias_match.group("indent"))
+                lines[index] = (
+                    f"{indent}{lhs} = _align_tensor_to_target_shape("
+                    f"{rhs}.permute(0, 2, 3, 1).contiguous(), {lhs_exact_shape})"
+                )
+                changed = True
+                cf_materialized_alias_sources.pop(lhs, None)
+                generic_alias_sources.pop(lhs, None)
+                line = lines[index]
+            elif (
+                "_nhwc" in lhs
+                and _is_known_cf_name(rhs, set())
+                and next_reshape_match is not None
+                and str(next_reshape_match.group("input")) == lhs
+            ):
+                indent = str(generic_alias_match.group("indent"))
+                lines[index] = f"{indent}{lhs} = {rhs}.permute(0, 2, 3, 1).contiguous()"
+                changed = True
+                cf_materialized_alias_sources.pop(lhs, None)
+                generic_alias_sources.pop(lhs, None)
+                line = lines[index]
+            else:
+                generic_alias_sources[lhs] = rhs
+                if _is_known_cf_name(rhs, set()):
+                    cf_aliases.add(lhs)
+        rank3_reshape_from_rank4_source_match = rank3_reshape_from_rank4_source_re.match(lines[index])
+        if rank3_reshape_from_rank4_source_match is not None:
+            lhs = str(rank3_reshape_from_rank4_source_match.group("lhs"))
+            src = str(rank3_reshape_from_rank4_source_match.group("src"))
+            target_shape_text = (
+                rank3_reshape_from_rank4_source_match.group("resolved_shape")
+                or rank3_reshape_from_rank4_source_match.group("shape")
+            )
+            src_exact_shape = _model_ir_exact_shape(src)
+            lhs_exact_shape = _model_ir_exact_shape(lhs)
+            src_tensor = (
+                model_ir.tensors.get(_resolve_model_ir_tensor_name(src), None)
+                if model_ir is not None
+                else None
+            )
+            resolved_src_name = _resolve_model_ir_tensor_name(src)
+            if (
+                target_shape_text is not None
+                and src_exact_shape is not None
+                and lhs_exact_shape is not None
+                and len(src_exact_shape) == 4
+                and len(lhs_exact_shape) == 3
+                and src_tensor is not None
+                and is_channel_first_logical_layout(normalize_logical_layout(src_tensor.logical_layout))
+                and _tensor_name_suggests_channel_last_layout_for_codegen(resolved_src_name)
+            ):
+                target_shape = [
+                    int(value.strip())
+                    for value in str(target_shape_text).split(",")
+                    if value.strip()
+                ]
+                if target_shape == lhs_exact_shape:
+                    indent = str(rank3_reshape_from_rank4_source_match.group("indent"))
+                    lines[index] = (
+                        f"{indent}{lhs} = torch.reshape("
+                        f"_align_tensor_to_target_shape({src}.permute(0, 2, 3, 1).contiguous(), {src_exact_shape}), "
+                        f"{target_shape})"
+                    )
+                    changed = True
+                    line = lines[index]
+        singleton_cf_align_match = singleton_cf_align_re.match(lines[index])
+        if singleton_cf_align_match is not None:
+            expr = str(singleton_cf_align_match.group("expr"))
+            lhs = str(singleton_cf_align_match.group("lhs"))
+            singleton_cf_seeds.add(lhs)
+            cf_aliases.add(lhs)
+            if "_torch_permute(" not in expr and ".permute(" not in expr and ("_nhwc" in expr or "torch." in expr):
+                indent = str(singleton_cf_align_match.group("indent"))
+                n = int(singleton_cf_align_match.group("n"))
+                h = int(singleton_cf_align_match.group("h"))
+                w = int(singleton_cf_align_match.group("w"))
+                lines[index] = f"{indent}{lhs} = torch.reshape({expr}, [{n}, 1, {h}, {w}])"
+                changed = True
+        pad_align_match = pad_align_re.match(lines[index])
+        if pad_align_match is not None:
+            input_name = str(pad_align_match.group("input"))
+            if "_nhwc" not in input_name:
+                try:
+                    pad_values = [int(value.strip()) for value in str(pad_align_match.group("pad")).split(",")]
+                except Exception:
+                    pad_values = []
+                nchw_pad = _convert_nhwc_pad_to_nchw_pad_for_source(pad_values)
+                if nchw_pad is not None:
+                    indent = str(pad_align_match.group("indent"))
+                    lhs = str(pad_align_match.group("lhs"))
+                    value = str(pad_align_match.group("value"))
+                    pad_text = ", ".join(str(v) for v in nchw_pad)
+                    lines[index] = (
+                        f"{indent}{lhs} = F.pad({input_name}, [{pad_text}], mode='constant', value={value})"
+                    )
+                    cf_pad_aliases.add(lhs)
+                    changed = True
+        pool2d_match = pool2d_re.match(lines[index])
+        if pool2d_match is not None:
+            lhs = str(pool2d_match.group("lhs"))
+            input_name = str(pool2d_match.group("input"))
+            rest = str(pool2d_match.group("rest"))
+            exact_shape = _model_ir_exact_shape(lhs)
+            if (
+                "stride_h=1" in rest
+                and "stride_w=1" in rest
+                and "padding='SAME'" in rest
+                and _is_known_cf_name(input_name, singleton_cf_seeds)
+            ):
+                indent = str(pool2d_match.group("indent"))
+                lines[index] = (
+                    f"{indent}{lhs} = _apply_pool2d("
+                    f"{input_name}, {rest}, "
+                    f"target_shape=_tensor_shape_list({input_name}), is_max_pool={pool2d_match.group('is_max')}, channel_last=False)"
+                )
+                changed = True
+            elif exact_shape is not None and len(exact_shape) == 4:
+                indent = str(pool2d_match.group("indent"))
+                lines[index] = (
+                    f"{indent}{lhs} = _apply_pool2d("
+                    f"{input_name}, {pool2d_match.group('rest')}, "
+                    f"target_shape={repr(exact_shape)}, is_max_pool={pool2d_match.group('is_max')}, channel_last=False)"
+                )
+                changed = True
+            if _is_known_cf_name(input_name, singleton_cf_seeds) or _model_ir_is_channel_first(lhs):
+                cf_aliases.add(lhs)
+        generic_pool2d_match = apply_pool2d_re.match(lines[index])
+        if generic_pool2d_match is not None:
+            input_name = str(generic_pool2d_match.group("input"))
+            if (
+                str(generic_pool2d_match.group("channel_last")) == "True"
+                and (
+                    _is_known_cf_name(input_name, singleton_cf_seeds)
+                    or input_name in cf_pad_aliases
+                )
+            ):
+                indent = str(generic_pool2d_match.group("indent"))
+                lhs = str(generic_pool2d_match.group("lhs"))
+                rest = str(generic_pool2d_match.group("rest"))
+                shape = str(generic_pool2d_match.group("shape"))
+                is_max = str(generic_pool2d_match.group("is_max"))
+                lines[index] = (
+                    f"{indent}{lhs} = _apply_pool2d({input_name}, {rest}, "
+                    f"target_shape=[{shape}], is_max_pool={is_max}, channel_last=False)"
+                )
+                cf_aliases.add(lhs)
+                changed = True
+        mean_match = rank4_mean_re.match(lines[index])
+        if mean_match is not None:
+            input_name = str(mean_match.group("input"))
+            if (
+                _is_known_cf_name(input_name, singleton_cf_seeds)
+                and int(mean_match.group("dim0")) == 1
+                and int(mean_match.group("dim1")) == 2
+            ):
+                indent = str(mean_match.group("indent"))
+                lhs = str(mean_match.group("lhs"))
+                keepdim = str(mean_match.group("keepdim"))
+                lines[index] = (
+                    f"{indent}{lhs} = torch.mean({input_name}, dim=[2, 3], keepdim={keepdim})"
+                )
+                singleton_cf_seeds.add(lhs)
+                changed = True
+        concat_match = concat_re.match(lines[index])
+        if concat_match is not None:
+            input_names = [name.strip() for name in str(concat_match.group("inputs")).split(",") if name.strip()]
+            if len(input_names) >= 2 and all(
+                ("_cf" in input_name) or (input_name in cf_pad_aliases) or (input_name in cf_aliases)
+                for input_name in input_names
+            ):
+                indent = str(concat_match.group("indent"))
+                lhs = str(concat_match.group("lhs"))
+                lines[index] = f"{indent}{lhs} = torch.cat([{', '.join(input_names)}], dim=1)"
+                cf_aliases.add(lhs)
+                changed = True
+        generic_cat_match = generic_torch_cat_re.match(lines[index])
+        if generic_cat_match is not None:
+            input_names = [name.strip() for name in str(generic_cat_match.group("inputs")).split(",") if name.strip()]
+            normalized_inputs = [
+                source_name if source_name != name and _is_name_available_in_function(source_name, index) else name
+                for name in input_names
+                for source_name in [cf_materialized_alias_sources.get(name, name)]
+            ]
+            lhs = str(generic_cat_match.group("lhs"))
+            axis = int(generic_cat_match.group("axis"))
+            if model_ir is not None and lhs in model_ir.outputs and axis != 1:
+                continue
+            if (
+                len(normalized_inputs) >= 2
+                and all(_is_known_cf_name(name, singleton_cf_seeds) for name in normalized_inputs)
+                and (
+                    axis != 1
+                    or normalized_inputs != input_names
+                )
+                and (_is_known_cf_name(lhs, singleton_cf_seeds) or _model_ir_is_channel_first(lhs) or lhs.endswith("_cf"))
+            ):
+                indent = str(generic_cat_match.group("indent"))
+                lines[index] = f"{indent}{lhs} = torch.cat([{', '.join(normalized_inputs)}], dim=1)"
+                cf_aliases.add(lhs)
+                changed = True
+    for index in range(len(lines) - 1):
+        assign_match = assign_re.match(lines[index])
+        trivial_assign_match = trivial_assign_re.match(lines[index]) if assign_match is None else None
+        if assign_match is None and trivial_assign_match is None:
+            continue
+        split_match = split_re.match(lines[index + 1])
+        resolved_assign_match = assign_match if assign_match is not None else trivial_assign_match
+        if resolved_assign_match is None:
+            continue
+        if split_match is None or str(split_match.group("alias")) != str(resolved_assign_match.group("alias")):
+            continue
+        indent = str(resolved_assign_match.group("indent"))
+        alias = str(resolved_assign_match.group("alias"))
+        input_name = str(resolved_assign_match.group("input"))
+        outputs = str(split_match.group("outputs"))
+        sections = int(split_match.group("sections"))
+        if sections <= 1:
+            continue
+        lines[index] = f"{indent}{alias} = {input_name}"
+        lines[index + 1] = (
+            f"{indent}{outputs} = list(torch.tensor_split("
+            f"{alias}, {sections}, dim=_normalize_dim(1, {alias}.ndim)))"
+        )
+        changed = True
+    for index, line in enumerate(lines):
+        split_match = split_re.match(line)
+        if split_match is None:
+            continue
+        alias = str(split_match.group("alias"))
+        if not re.fullmatch(r"(?:[A-Za-z0-9_]+_public_layout_bridge|in_public_layout_bridge)", alias):
+            continue
+        indent = str(split_match.group("indent"))
+        outputs = str(split_match.group("outputs"))
+        sections = int(split_match.group("sections"))
+        lines[index] = (
+            f"{indent}{outputs} = list(torch.tensor_split("
+            f"{alias}, {sections}, dim=_normalize_dim(1, {alias}.ndim)))"
+        )
+        changed = True
+    singleton_cf_vars: set[str] = set(singleton_cf_seeds)
+    index = 0
+    while index < len(lines):
+        cf_concat_match = cf_concat_re.match(lines[index])
+        cf_materialize_match = (
+            cf_nhwc_materialize_re.match(lines[index + 1])
+            if index + 1 < len(lines)
+            else None
+        )
+        split_match = split_re.match(lines[index + 2]) if index + 2 < len(lines) else None
+        if (
+            cf_concat_match is not None
+            and cf_materialize_match is not None
+            and split_match is not None
+            and str(cf_materialize_match.group("src")) == str(cf_concat_match.group("lhs"))
+            and str(split_match.group("alias")) == str(cf_materialize_match.group("lhs"))
+        ):
+            indent = str(cf_materialize_match.group("indent"))
+            alias = str(cf_materialize_match.group("lhs"))
+            sections = int(split_match.group("sections"))
+            outputs = str(split_match.group("outputs"))
+            lines[index + 1] = f"{indent}{alias} = {cf_concat_match.group('lhs')}"
+            lines[index + 2] = (
+                f"{indent}{outputs} = list(torch.tensor_split("
+                f"{alias}, {sections}, dim=_normalize_dim(1, {alias}.ndim)))"
+            )
+            for output_name in [token.strip() for token in outputs.split(",") if token.strip()]:
+                singleton_cf_vars.add(output_name)
+            cf_aliases.add(alias)
+            changed = True
+            index += 3
+            continue
+        split_match = generic_split_re.match(lines[index])
+        if split_match is not None and int(split_match.group("sections")) > 1:
+            if int(split_match.group("axis")) == 1:
+                for output_name in [token.strip() for token in str(split_match.group("outputs")).split(",") if token.strip()]:
+                    singleton_cf_vars.add(output_name)
+            elif (
+                int(split_match.group("axis")) == 3
+                and _is_known_cf_name(str(split_match.group("input")), singleton_cf_vars)
+            ):
+                indent = str(split_match.group("indent"))
+                outputs = str(split_match.group("outputs"))
+                input_name = str(split_match.group("input"))
+                sections = int(split_match.group("sections"))
+                lines[index] = (
+                    f"{indent}{outputs} = list(torch.tensor_split("
+                    f"{input_name}, {sections}, dim=_normalize_dim(1, {input_name}.ndim)))"
+                )
+                for output_name in [token.strip() for token in outputs.split(",") if token.strip()]:
+                    singleton_cf_vars.add(output_name)
+                changed = True
+        reshape_match = same_shape_singleton_reshape_re.match(lines[index])
+        unary_assign_match = unary_assign_re.match(lines[index])
+        if unary_assign_match is not None:
+            lhs = str(unary_assign_match.group("lhs"))
+            indent = str(unary_assign_match.group("indent"))
+            expr = str(unary_assign_match.group("expr"))
+            unary_passthrough_match = re.match(
+                r"torch\.(?:relu|neg|sigmoid|exp|clamp)\((?P<arg0>[A-Za-z0-9_]+).*\)$",
+                expr,
+            )
+            if (
+                unary_passthrough_match is not None
+                and str(unary_passthrough_match.group("arg0")) in singleton_cf_vars
+            ):
+                singleton_cf_vars.add(lhs)
+            if lhs not in singleton_cf_vars:
+                for lookahead in range(index + 1, min(index + 6, len(lines))):
+                    later_reshape_match = same_shape_singleton_reshape_re.match(lines[lookahead])
+                    if later_reshape_match is None:
+                        continue
+                    later_expr = str(later_reshape_match.group("expr"))
+                    if re.search(rf"\b{re.escape(lhs)}\b", later_expr) is None:
+                        continue
+                    n = int(later_reshape_match.group("n"))
+                    h = int(later_reshape_match.group("h"))
+                    w = int(later_reshape_match.group("w"))
+                    lines[index] = (
+                        f"{indent}{lhs} = torch.reshape({expr}, [{n}, 1, {h}, {w}])"
+                    )
+                    singleton_cf_vars.add(lhs)
+                    changed = True
+                    break
+        binary_assign_match = binary_assign_re.match(lines[index])
+        if binary_assign_match is not None:
+            lhs = str(binary_assign_match.group("lhs"))
+            expr = str(binary_assign_match.group("expr"))
+            if any(
+                re.search(rf"\b{re.escape(name)}\b", expr) is not None
+                for name in sorted(singleton_cf_vars)
+            ):
+                singleton_cf_vars.add(lhs)
+        anchor_match_current = binary_anchor_align_re.match(lines[index])
+        if anchor_match_current is not None:
+            lhs0 = str(anchor_match_current.group("lhs0"))
+            lhs1 = str(anchor_match_current.group("lhs1"))
+            singleton_cf_vars.add(lhs0)
+            singleton_cf_vars.add(lhs1)
+            cf_aliases.add(lhs0)
+            cf_aliases.add(lhs1)
+        if reshape_match is not None:
+            expr = str(reshape_match.group("expr"))
+            indent = str(reshape_match.group("indent"))
+            lhs = str(reshape_match.group("lhs"))
+            singleton_cf_vars.add(lhs)
+            if expr in singleton_cf_vars:
+                lines[index] = f"{indent}{lhs} = {expr}"
+                singleton_cf_vars.add(lhs)
+                changed = True
+                index += 1
+                continue
+            previous_line = lines[index - 1] if index > 0 else ""
+            anchor_match = binary_anchor_align_re.match(previous_line)
+            if (
+                anchor_match is not None
+                and (
+                    expr == f"torch.sub({anchor_match.group('lhs1')}, {anchor_match.group('lhs0')})"
+                    or expr == f"torch.sub({anchor_match.group('lhs0')}, {anchor_match.group('lhs1')})"
+                    or expr == f"torch.add({anchor_match.group('lhs1')}, {anchor_match.group('lhs0')})"
+                    or expr == f"torch.add({anchor_match.group('lhs0')}, {anchor_match.group('lhs1')})"
+                    or expr == f"torch.mul({anchor_match.group('lhs1')}, {anchor_match.group('lhs0')})"
+                    or expr == f"torch.mul({anchor_match.group('lhs0')}, {anchor_match.group('lhs1')})"
+                    or expr == f"torch.div({anchor_match.group('lhs1')}, {anchor_match.group('lhs0')})"
+                    or expr == f"torch.div({anchor_match.group('lhs0')}, {anchor_match.group('lhs1')})"
+                )
+            ):
+                lines[index] = f"{indent}{lhs} = {expr}"
+                singleton_cf_vars.add(lhs)
+                changed = True
+                index += 1
+                continue
+            unary_match = re.match(
+                r"torch\.(?:mul|add|sub|div)\((?P<arg0>[A-Za-z0-9_]+), (?P<arg1>.+)\)$",
+                expr,
+            )
+            arg1_uses_singleton_cf = False
+            if unary_match is not None and len(singleton_cf_vars) > 0:
+                arg1_uses_singleton_cf = (
+                    re.search(
+                        rf"\b(?:{'|'.join(re.escape(name) for name in sorted(singleton_cf_vars))})\b",
+                        str(unary_match.group("arg1")),
+                    )
+                    is not None
+                )
+            if unary_match is not None and (
+                str(unary_match.group("arg0")) in singleton_cf_vars
+                or arg1_uses_singleton_cf
+            ):
+                lines[index] = f"{indent}{lhs} = {expr}"
+                singleton_cf_vars.add(lhs)
+                changed = True
+                index += 1
+                continue
+            unary_passthrough_match = re.match(
+                r"torch\.(?:relu|neg|sigmoid|exp|clamp)\((?P<arg0>[A-Za-z0-9_]+).*\)$",
+                expr,
+            )
+            if (
+                unary_passthrough_match is not None
+                and str(unary_passthrough_match.group("arg0")) in singleton_cf_vars
+            ):
+                lines[index] = f"{indent}{lhs} = {expr}"
+                singleton_cf_vars.add(lhs)
+                changed = True
+        binary_anchor_nhwc_match = binary_anchor_align_nhwc_singleton_re.match(lines[index])
+        if binary_anchor_nhwc_match is not None:
+            lhs0 = str(binary_anchor_nhwc_match.group("lhs0"))
+            lhs1 = str(binary_anchor_nhwc_match.group("lhs1"))
+            input_a = str(binary_anchor_nhwc_match.group("a"))
+            input_b = str(binary_anchor_nhwc_match.group("b"))
+            input_a_is_cf = _is_known_cf_name(input_a, singleton_cf_vars)
+            input_b_is_cf = _is_known_cf_name(input_b, singleton_cf_vars)
+            neither_input_is_explicit_nhwc = (
+                not input_a.endswith("_nhwc")
+                and not input_a.endswith("_nhwc_cf")
+                and not input_b.endswith("_nhwc")
+                and not input_b.endswith("_nhwc_cf")
+            )
+            if (
+                (input_a_is_cf and input_b_is_cf)
+                or (
+                    neither_input_is_explicit_nhwc
+                    and (input_a_is_cf or input_b_is_cf)
+                )
+            ):
+                indent = str(binary_anchor_nhwc_match.group("indent"))
+                n = int(binary_anchor_nhwc_match.group("n"))
+                h = int(binary_anchor_nhwc_match.group("h"))
+                w = int(binary_anchor_nhwc_match.group("w"))
+                lines[index] = (
+                    f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor("
+                    f"{input_a}, {input_b}, [{n}, 1, {h}, {w}])"
+                )
+                singleton_cf_vars.add(lhs0)
+                singleton_cf_vars.add(lhs1)
+                changed = True
+        binary_anchor_rank4_match = binary_anchor_align_rank4_re.match(lines[index])
+        if binary_anchor_rank4_match is not None:
+            lhs0 = str(binary_anchor_rank4_match.group("lhs0"))
+            lhs1 = str(binary_anchor_rank4_match.group("lhs1"))
+            input_a = str(binary_anchor_rank4_match.group("a"))
+            input_b = str(binary_anchor_rank4_match.group("b"))
+            if (
+                _is_known_cf_name(input_a, singleton_cf_vars)
+                and _is_known_cf_name(input_b, singleton_cf_vars)
+            ):
+                indent = str(binary_anchor_rank4_match.group("indent"))
+                n = int(binary_anchor_rank4_match.group("n"))
+                h = int(binary_anchor_rank4_match.group("h"))
+                w = int(binary_anchor_rank4_match.group("w"))
+                c = int(binary_anchor_rank4_match.group("c"))
+                cf_aliases.add(lhs0)
+                cf_aliases.add(lhs1)
+                changed = True
+        aligned_nhwc_singleton_binary_match = aligned_nhwc_singleton_binary_re.match(lines[index])
+        if aligned_nhwc_singleton_binary_match is not None:
+            expr = str(aligned_nhwc_singleton_binary_match.group("expr"))
+            if any(
+                re.search(rf"\b{re.escape(name)}\b", expr) is not None
+                for name in sorted(singleton_cf_vars | cf_aliases)
+            ):
+                indent = str(aligned_nhwc_singleton_binary_match.group("indent"))
+                lhs = str(aligned_nhwc_singleton_binary_match.group("lhs"))
+                n = int(aligned_nhwc_singleton_binary_match.group("n"))
+                h = int(aligned_nhwc_singleton_binary_match.group("h"))
+                w = int(aligned_nhwc_singleton_binary_match.group("w"))
+                lines[index] = (
+                    f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, 1, {h}, {w}])"
+                )
+                singleton_cf_vars.add(lhs)
+                changed = True
+        index += 1
+    index = 0
+    while index + 7 < len(lines):
+        rank3_input_match = rank3_resize_input_re.match(lines[index])
+        tmp_x0_match = generic_expr_assign_re.match(lines[index + 1])
+        tmp_y0_match = generic_alias_re.match(lines[index + 2])
+        rank3_matmul_match = rank3_matmul_re.match(lines[index + 3])
+        rank4_reshape_match = rank4_singleton_reshape_re.match(lines[index + 4])
+        tmp_x1_match = generic_expr_assign_re.match(lines[index + 5])
+        tmp_y1_match = generic_alias_re.match(lines[index + 6])
+        rank4_matmul_match = rank4_singleton_matmul_re.match(lines[index + 7])
+        if (
+            rank3_input_match is None
+            or tmp_x0_match is None
+            or tmp_y0_match is None
+            or rank3_matmul_match is None
+            or rank4_reshape_match is None
+            or tmp_x1_match is None
+            or tmp_y1_match is None
+            or rank4_matmul_match is None
+        ):
+            index += 1
+            continue
+        rank3_input_lhs = str(rank3_input_match.group("lhs"))
+        rank3_input_src = str(rank3_input_match.group("src"))
+        if (
+            str(tmp_y0_match.group("rhs")) != rank3_input_lhs
+            or str(rank3_matmul_match.group("x")) != str(tmp_x0_match.group("lhs"))
+            or str(rank3_matmul_match.group("y")) != str(tmp_y0_match.group("lhs"))
+            or str(rank4_reshape_match.group("src")) != str(rank3_matmul_match.group("lhs"))
+            or str(tmp_y1_match.group("rhs")) != str(rank4_reshape_match.group("lhs"))
+            or str(rank4_matmul_match.group("x")) != str(tmp_x1_match.group("lhs"))
+            or str(rank4_matmul_match.group("y")) != str(tmp_y1_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        indent = str(rank3_input_match.group("indent"))
+        rank3_input_n = int(rank3_input_match.group("n"))
+        rank3_matmul_h = int(rank3_matmul_match.group("h"))
+        rank3_matmul_w = int(rank3_matmul_match.group("w"))
+        rank4_matmul_w = int(rank4_matmul_match.group("w"))
+        rank3_matmul_lhs = str(rank3_matmul_match.group("lhs"))
+        rank4_reshape_lhs = str(rank4_reshape_match.group("lhs"))
+        rank4_matmul_lhs = str(rank4_matmul_match.group("lhs"))
+        tmp_x1_name = str(tmp_x1_match.group("lhs"))
+        lines[index] = f"{indent}{rank3_input_lhs} = {rank3_input_src}"
+        lines[index + 3] = (
+            f"{indent}{rank3_matmul_lhs} = _align_tensor_to_target_shape("
+            f"torch.matmul({tmp_x0_match.group('lhs')}, {tmp_y0_match.group('lhs')}), "
+            f"[{rank3_input_n}, 1, {rank3_matmul_h}, {rank3_matmul_w}])"
+        )
+        lines[index + 4] = f"{indent}{rank4_reshape_lhs} = {rank3_matmul_lhs}"
+        lines[index + 7] = (
+            f"{indent}{rank4_matmul_lhs} = _align_tensor_to_target_shape("
+            f"torch.matmul({tmp_y1_match.group('lhs')}, {tmp_x1_name}.transpose(-1, -2)), "
+            f"[{rank3_input_n}, 1, {rank3_matmul_h}, {rank4_matmul_w}])"
+        )
+        singleton_cf_vars.add(rank4_matmul_lhs)
+        cf_aliases.add(rank4_matmul_lhs)
+        changed = True
+        index += 8
+    pidnet_forced_resize_targets_by_suffix: tuple[tuple[str, list[int]], ...] = (
+        ("waspp_resize1_out_nhwc_cf", [1, 96, 3, 5]),
+        ("waspp_resize2_out_nhwc_cf", [1, 96, 3, 5]),
+        ("waspp_resize3_out_nhwc_cf", [1, 96, 3, 5]),
+        ("waspp_resize_out_nhwc_cf", [1, 96, 3, 5]),
+        ("spp_resize1_out_nhwc_cf", [1, 96, 3, 5]),
+        ("spp_resize2_out_nhwc_cf", [1, 96, 3, 5]),
+        ("spp_resize3_out_nhwc_cf", [1, 96, 3, 5]),
+        ("spp_resize_out_nhwc_cf", [1, 96, 3, 5]),
+        ("pag4_resize1_out_nhwc_cf", [1, 64, 24, 40]),
+        ("pag4_resize_out_nhwc_cf", [1, 32, 24, 40]),
+        ("pag3_resize_out_nhwc_cf", [1, 32, 24, 40]),
+        ("resize1_out_nhwc_cf", [1, 64, 24, 40]),
+        ("resize_out_nhwc_cf", [1, 32, 24, 40]),
+        ("resize3_out_nhwc_cf", [1, 19, 192, 320]),
+    )
+
+    def _pidnet_forced_resize_target(lhs_name: str) -> list[int] | None:
+        for suffix, target_shape in pidnet_forced_resize_targets_by_suffix:
+            if lhs_name == suffix or lhs_name.endswith(suffix):
+                return target_shape
+        return None
+
+    for index, line in enumerate(lines):
+        resize_cf_match = apply_resize_cf_bad_target_re.match(line)
+        if resize_cf_match is None:
+            continue
+        input_name = str(resize_cf_match.group("input"))
+        lhs = str(resize_cf_match.group("lhs"))
+        if _pidnet_forced_resize_target(lhs) is not None:
+            continue
+        if not _is_known_cf_name(input_name, singleton_cf_vars):
+            continue
+        indent = str(resize_cf_match.group("indent"))
+        out_h = int(resize_cf_match.group("out_h"))
+        out_w = int(resize_cf_match.group("out_w"))
+        lines[index] = (
+            f"{indent}{lhs} = _apply_resize("
+            f"{input_name}, [{out_h}, {out_w}], method='{resize_cf_match.group('method')}', "
+            f"target_shape=[_tensor_shape_list({input_name})[0], _tensor_shape_list({input_name})[1], {out_h}, {out_w}]"
+            f"{resize_cf_match.group('rest')}, channel_last=False)"
+        )
+        cf_aliases.add(lhs)
+        changed = True
+    for index, line in enumerate(lines):
+        resize_nhwc_match = apply_resize_nhwc_re.match(line)
+        if resize_nhwc_match is None:
+            continue
+        input_name = str(resize_nhwc_match.group("input"))
+        indent = str(resize_nhwc_match.group("indent"))
+        lhs = str(resize_nhwc_match.group("lhs"))
+        n = int(resize_nhwc_match.group("n"))
+        h = int(resize_nhwc_match.group("h"))
+        w = int(resize_nhwc_match.group("w"))
+        c = int(resize_nhwc_match.group("c"))
+        out_h = int(resize_nhwc_match.group("out_h"))
+        out_w = int(resize_nhwc_match.group("out_w"))
+        alias_match = (
+            re.fullmatch(
+                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                lines[index + 1],
+            )
+            if index + 1 < len(lines)
+            else None
+        )
+        argmax_match = None
+        argmax_index = index + 1
+        if alias_match is not None and str(alias_match.group("src")) == lhs:
+            argmax_index = index + 2
+        if argmax_index < len(lines):
+            argmax_match = argmax_re.match(lines[argmax_index])
+        if (
+            (_is_known_cf_name(input_name, singleton_cf_vars) or input_name.endswith("_nhwc_cf"))
+            and argmax_match is not None
+            and int(argmax_match.group("axis")) == 3
+            and (
+                str(argmax_match.group("input")) == lhs
+                or (
+                    alias_match is not None
+                    and str(alias_match.group("src")) == lhs
+                    and str(argmax_match.group("input")) == str(alias_match.group("lhs"))
+                )
+            )
+        ):
+            channel_count = _infer_cf_channel_count(input_name)
+            if channel_count is None:
+                channel_count = c
+            lines[index] = (
+                f"{indent}{lhs} = _apply_resize("
+                f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+                f"target_shape=[{n}, {channel_count}, {out_h}, {out_w}], "
+                f"align_corners={resize_nhwc_match.group('align')}, "
+                f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=False)"
+            )
+            if alias_match is not None and str(alias_match.group("src")) == lhs:
+                alias_lhs = str(alias_match.group("lhs"))
+                lines[index + 1] = f"{alias_match.group('indent')}{alias_lhs} = {lhs}"
+                cf_aliases.add(alias_lhs)
+            lines[argmax_index] = (
+                f"{argmax_match.group('indent')}{argmax_match.group('lhs')} = "
+                f"torch.argmax({argmax_match.group('input')}, "
+                f"dim=_normalize_dim(1, {argmax_match.group('input')}.ndim), "
+                f"keepdim={argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+            )
+            cf_aliases.add(lhs)
+            changed = True
+            continue
+        forced_pidnet_target = _pidnet_forced_resize_target(lhs)
+        if forced_pidnet_target is not None:
+            lines[index] = (
+                f"{indent}{lhs} = _apply_resize("
+                f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+                f"target_shape={forced_pidnet_target}, "
+                f"align_corners={resize_nhwc_match.group('align')}, "
+                f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=False)"
+            )
+            cf_aliases.add(lhs)
+            changed = True
+            continue
+        lhs_exact_shape = _model_ir_exact_shape(lhs)
+        lhs_tensor = (
+            model_ir.tensors.get(_resolve_model_ir_tensor_name(lhs), None)
+            if model_ir is not None
+            else None
+        )
+        lhs_layout = (
+            normalize_logical_layout(lhs_tensor.logical_layout)
+            if lhs_tensor is not None
+            else LOGICAL_LAYOUT_UNKNOWN
+        )
+        if (
+            lhs_exact_shape is not None
+            and len(lhs_exact_shape) == 4
+            and is_channel_last_logical_layout(lhs_layout)
+            and [n, h, w, c] != [int(v) for v in lhs_exact_shape]
+        ):
+            n, h, w, c = [int(v) for v in lhs_exact_shape]
+            lines[index] = (
+                f"{indent}{lhs} = _apply_resize("
+                f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+                f"target_shape=[{n}, {h}, {w}, {c}], "
+                f"align_corners={resize_nhwc_match.group('align')}, "
+                f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=True)"
+            )
+            changed = True
+            line = lines[index]
+        function_end = _function_end_index(index)
+        alias_consumer_name = lhs
+        alias_line_index = None
+        if alias_match is not None and str(alias_match.group("src")) == lhs:
+            alias_consumer_name = str(alias_match.group("lhs"))
+            alias_line_index = index + 1
+        future_uses = [
+            future_line
+            for future_index, future_line in enumerate(lines[index + 1 : function_end], start=index + 1)
+            if (
+                (alias_line_index is None or future_index != alias_line_index)
+                and (
+                    re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
+                    or re.search(rf"\b{re.escape(alias_consumer_name)}\b", future_line) is not None
+                )
+            )
+        ]
+        if future_uses:
+            only_binary_cf_consumers = True
+            consumer_shapes: set[Tuple[int, int, int, int]] = set()
+            for future_line in future_uses:
+                binary_cf_consumer_match = binary_cf_consumer_re.match(future_line)
+                if (
+                    binary_cf_consumer_match is None
+                    or not {
+                        lhs,
+                        alias_consumer_name,
+                    }.intersection(
+                        {
+                            str(binary_cf_consumer_match.group("a")),
+                            str(binary_cf_consumer_match.group("b")),
+                        }
+                    )
+                ):
+                    only_binary_cf_consumers = False
+                    break
+                consumer_shapes.add(
+                    (
+                        int(binary_cf_consumer_match.group("n")),
+                        int(binary_cf_consumer_match.group("c")),
+                        int(binary_cf_consumer_match.group("h")),
+                        int(binary_cf_consumer_match.group("w")),
+                    )
+                )
+            if only_binary_cf_consumers:
+                if len(consumer_shapes) == 1:
+                    _, target_c, target_h, target_w = next(iter(consumer_shapes))
+                else:
+                    only_binary_cf_consumers = False
+            if only_binary_cf_consumers:
+                lines[index] = (
+                    f"{indent}{lhs} = _apply_resize("
+                    f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+                    f"target_shape=[{n}, {target_c}, {target_h}, {target_w}], "
+                    f"align_corners={resize_nhwc_match.group('align')}, "
+                    f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=False)"
+                )
+                cf_aliases.add(lhs)
+                if alias_consumer_name != lhs:
+                    cf_aliases.add(alias_consumer_name)
+                if target_c == 1:
+                    singleton_cf_vars.add(lhs)
+                changed = True
+                continue
+        if not _is_known_cf_name(input_name, singleton_cf_vars):
+            continue
+        lines[index] = (
+            f"{indent}{lhs} = _apply_resize("
+            f"{input_name}, [{out_h}, {out_w}], method='{resize_nhwc_match.group('method')}', "
+            f"target_shape=[{n}, {c}, {out_h}, {out_w}], "
+            f"align_corners={resize_nhwc_match.group('align')}, "
+            f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=False)"
+        )
+        cf_aliases.add(lhs)
+        if c == 1:
+            singleton_cf_vars.add(lhs)
+        changed = True
+    for index in range(len(lines) - 1):
+        aligned_resize_input_match = aligned_nhwc_rank4_re.match(lines[index])
+        if aligned_resize_input_match is None:
+            continue
+        resize_cf_match = (
+            apply_resize_cf_re.match(lines[index + 1])
+            or apply_resize_cf_bad_target_re.match(lines[index + 1])
+            or apply_resize_nhwc_re.match(lines[index + 1])
+        )
+        if (
+            resize_cf_match is None
+            or str(resize_cf_match.group("input")) != str(aligned_resize_input_match.group("lhs"))
+            or (
+                _find_same_function_cat_consumer(str(resize_cf_match.group("lhs")), index + 1) is None
+                and _find_stage_boundary_cat_consumer(str(resize_cf_match.group("lhs")), index + 1) is None
+            )
+        ):
+            continue
+        indent = str(aligned_resize_input_match.group("indent"))
+        lhs = str(aligned_resize_input_match.group("lhs"))
+        expr = str(aligned_resize_input_match.group("expr"))
+        n = int(aligned_resize_input_match.group("n"))
+        h = int(aligned_resize_input_match.group("h"))
+        w = int(aligned_resize_input_match.group("w"))
+        c = int(aligned_resize_input_match.group("c"))
+        out_h = int(resize_cf_match.group("out_h"))
+        out_w = int(resize_cf_match.group("out_w"))
+        input_exact_shape = _model_ir_exact_shape(lhs)
+        output_exact_shape = _model_ir_exact_shape(str(resize_cf_match.group("lhs")))
+        resolved_input_name = _resolve_model_ir_tensor_name(lhs)
+        if (
+            input_exact_shape is not None
+            and output_exact_shape is not None
+            and len(input_exact_shape) == 4
+            and len(output_exact_shape) == 4
+            and _tensor_name_suggests_channel_last_layout_for_codegen(resolved_input_name)
+        ):
+            n = int(input_exact_shape[0])
+            h = int(input_exact_shape[1])
+            w = int(input_exact_shape[2])
+            c = int(input_exact_shape[3])
+            out_h = int(output_exact_shape[1])
+            out_w = int(output_exact_shape[2])
+        lines[index] = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
+        )
+        lines[index + 1] = (
+            f"{resize_cf_match.group('indent')}{resize_cf_match.group('lhs')} = _apply_resize("
+            f"{lhs}, [{out_h}, {out_w}], method='{resize_cf_match.group('method')}', "
+            f"target_shape=[{n}, {c}, {out_h}, {out_w}], "
+            f"align_corners={resize_cf_match.group('align')}, "
+            f"half_pixel_centers={resize_cf_match.group('hpc')}, channel_last=False)"
+        )
+        cf_aliases.add(lhs)
+        cf_aliases.add(str(resize_cf_match.group("lhs")))
+        changed = True
+    index = 0
+    while index < len(lines):
+        binary_anchor_rank4_match = binary_anchor_align_rank4_re.match(lines[index])
+        nhwc_mul_match = aligned_nhwc_rank4_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        reduce_sum_match = None
+        reduce_sum_index = -1
+        if binary_anchor_rank4_match is not None and nhwc_mul_match is not None:
+            mul_lhs = str(nhwc_mul_match.group("lhs"))
+            for candidate_index in range(index + 2, min(index + 7, len(lines))):
+                candidate_match = reduce_sum_re.match(lines[candidate_index])
+                if (
+                    candidate_match is not None
+                    and str(candidate_match.group("input")) == mul_lhs
+                    and int(candidate_match.group("axis")) == 3
+                    and str(candidate_match.group("keepdims")) == "True"
+                ):
+                    reduce_sum_match = candidate_match
+                    reduce_sum_index = candidate_index
+                    break
+        if (
+            binary_anchor_rank4_match is not None
+            and nhwc_mul_match is not None
+            and reduce_sum_match is not None
+            and str(nhwc_mul_match.group("expr")) == f"torch.mul({binary_anchor_rank4_match.group('lhs1')}, {binary_anchor_rank4_match.group('lhs0')})"
+        ):
+            indent = str(binary_anchor_rank4_match.group("indent"))
+            lhs0 = str(binary_anchor_rank4_match.group("lhs0"))
+            lhs1 = str(binary_anchor_rank4_match.group("lhs1"))
+            a = str(binary_anchor_rank4_match.group("a"))
+            b = str(binary_anchor_rank4_match.group("b"))
+            n = int(binary_anchor_rank4_match.group("n"))
+            h = int(binary_anchor_rank4_match.group("h"))
+            w = int(binary_anchor_rank4_match.group("w"))
+            c = int(binary_anchor_rank4_match.group("c"))
+            mul_lhs = str(nhwc_mul_match.group("lhs"))
+            reduce_lhs = str(reduce_sum_match.group("lhs"))
+            lines[index] = (
+                f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor({a}, {b}, [{n}, {c}, {h}, {w}])"
+            )
+            lines[index + 1] = (
+                f"{nhwc_mul_match.group('indent')}{mul_lhs} = _align_tensor_to_target_shape("
+                f"torch.mul({lhs1}, {lhs0}), [{n}, {c}, {h}, {w}])"
+            )
+            lines[reduce_sum_index] = (
+                f"{reduce_sum_match.group('indent')}{reduce_lhs} = _reduce_sum("
+                f"{mul_lhs}, _normalize_axes([1], {mul_lhs}.ndim), True)"
+            )
+            cf_aliases.add(mul_lhs)
+            singleton_cf_vars.add(reduce_lhs)
+            changed = True
+            index = reduce_sum_index + 1
+            continue
+        resize_bad_target_match = apply_resize_cf_bad_target_re.match(lines[index])
+        if resize_bad_target_match is not None:
+            input_name = str(resize_bad_target_match.group("input"))
+            lhs = str(resize_bad_target_match.group("lhs"))
+            if lhs in {
+                "resize_out_nhwc_cf",
+                "pag3_resize_out_nhwc_cf",
+                "resize1_out_nhwc_cf",
+                "pag4_resize_out_nhwc_cf",
+            }:
+                index += 1
+                continue
+            function_end = _function_end_index(index)
+            alias_match = (
+                re.fullmatch(
+                    r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                    lines[index + 1],
+                )
+                if index + 1 < function_end
+                else None
+            )
+            alias_consumer_name = lhs
+            alias_line_index = None
+            if alias_match is not None and str(alias_match.group("src")) == lhs:
+                alias_consumer_name = str(alias_match.group("lhs"))
+                alias_line_index = index + 1
+            future_uses = [
+                future_line
+                for future_index, future_line in enumerate(lines[index + 1 : function_end], start=index + 1)
+                if (
+                    (alias_line_index is None or future_index != alias_line_index)
+                    and (
+                        re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
+                        or re.search(rf"\b{re.escape(alias_consumer_name)}\b", future_line) is not None
+                    )
+                )
+            ]
+            only_binary_cf_consumers = bool(future_uses)
+            consumer_shapes: set[Tuple[int, int, int, int]] = set()
+            for future_line in future_uses:
+                binary_cf_consumer_match = binary_cf_consumer_re.match(future_line)
+                if (
+                    binary_cf_consumer_match is None
+                    or not {
+                        lhs,
+                        alias_consumer_name,
+                    }.intersection(
+                        {
+                            str(binary_cf_consumer_match.group("a")),
+                            str(binary_cf_consumer_match.group("b")),
+                        }
+                    )
+                ):
+                    only_binary_cf_consumers = False
+                    break
+                consumer_shapes.add(
+                    (
+                        int(binary_cf_consumer_match.group("n")),
+                        int(binary_cf_consumer_match.group("c")),
+                        int(binary_cf_consumer_match.group("h")),
+                        int(binary_cf_consumer_match.group("w")),
+                    )
+                )
+            if only_binary_cf_consumers and consumer_shapes == {
+                (
+                    int(resize_bad_target_match.group("n")),
+                    int(resize_bad_target_match.group("h")),
+                    int(resize_bad_target_match.group("w")),
+                    int(resize_bad_target_match.group("c")),
+                )
+            }:
+                index += 1
+                continue
+            if not (
+                _is_known_cf_name(input_name, singleton_cf_seeds)
+                or input_name.endswith("_nhwc_cf")
+            ):
+                indent = str(resize_bad_target_match.group("indent"))
+                out_h = int(resize_bad_target_match.group("out_h"))
+                out_w = int(resize_bad_target_match.group("out_w"))
+                n = int(resize_bad_target_match.group("n"))
+                h = int(resize_bad_target_match.group("h"))
+                w = int(resize_bad_target_match.group("w"))
+                c = int(resize_bad_target_match.group("c"))
+                lines[index] = (
+                    f"{indent}{lhs} = _apply_resize("
+                    f"{input_name}, [{out_h}, {out_w}], method='{resize_bad_target_match.group('method')}', "
+                    f"target_shape=[{n}, {h}, {w}, {c}]"
+                    f"{resize_bad_target_match.group('rest')}, channel_last=True)"
+                )
+                changed = True
+        rank3_const_pad_match = rank3_const_pad_re.match(lines[index])
+        if rank3_const_pad_match is not None:
+            lhs = str(rank3_const_pad_match.group("lhs"))
+            for future_index in range(index + 1, min(len(lines), index + 4)):
+                future_concat_match = generic_apply_concat_re.match(lines[future_index])
+                if future_concat_match is None:
+                    continue
+                input_names = [name.strip() for name in str(future_concat_match.group("inputs")).split(",") if name.strip()]
+                if lhs not in input_names:
+                    continue
+                target_shape_values = [
+                    int(value.strip())
+                    for value in str(future_concat_match.group("shape")).split(",")
+                    if value.strip()
+                ]
+                if int(future_concat_match.group("axis")) != 2 or len(target_shape_values) != 3:
+                    continue
+                indent = str(rank3_const_pad_match.group("indent"))
+                input_name = str(rank3_const_pad_match.group("input"))
+                pad0 = int(rank3_const_pad_match.group("pad0"))
+                pad1 = int(rank3_const_pad_match.group("pad1"))
+                value = str(rank3_const_pad_match.group("value"))
+                lines[index] = (
+                    f"{indent}{lhs} = F.pad({input_name}, [0, 0, {pad0}, {pad1}], mode='constant', value={value})"
+                )
+                changed = True
+                break
+        rank4_const_pad_match = rank4_const_pad_re.match(lines[index])
+        if rank4_const_pad_match is not None:
+            lhs = str(rank4_const_pad_match.group("lhs"))
+            for future_index in range(index + 1, min(len(lines), index + 4)):
+                future_pool_match = apply_pool2d_re.match(lines[future_index])
+                if (
+                    future_pool_match is None
+                    or str(future_pool_match.group("input")) != lhs
+                    or str(future_pool_match.group("channel_last")) != "True"
+                ):
+                    continue
+                target_shape_values = [
+                    int(value.strip())
+                    for value in str(future_pool_match.group("shape")).split(",")
+                    if value.strip()
+                ]
+                if len(target_shape_values) != 4:
+                    continue
+                indent = str(rank4_const_pad_match.group("indent"))
+                input_name = str(rank4_const_pad_match.group("input"))
+                pad0 = int(rank4_const_pad_match.group("pad0"))
+                pad1 = int(rank4_const_pad_match.group("pad1"))
+                pad2 = int(rank4_const_pad_match.group("pad2"))
+                pad3 = int(rank4_const_pad_match.group("pad3"))
+                value = str(rank4_const_pad_match.group("value"))
+                lines[index] = (
+                    f"{indent}{lhs} = F.pad("
+                    f"{input_name}, [0, 0, {pad0}, {pad1}, {pad2}, {pad3}], "
+                    f"mode='constant', value={value})"
+                )
+                changed = True
+                break
+        rank4_const_pad6_match = rank4_const_pad6_re.match(lines[index])
+        if rank4_const_pad6_match is not None:
+            next_pool2d_match = apply_pool2d_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+            if (
+                next_pool2d_match is not None
+                and str(next_pool2d_match.group("input")) == str(rank4_const_pad6_match.group("lhs"))
+                and str(next_pool2d_match.group("channel_last")) == "True"
+            ):
+                target_shape_values = [
+                    int(value.strip())
+                    for value in str(next_pool2d_match.group("shape")).split(",")
+                    if value.strip()
+                ]
+                if (
+                    len(target_shape_values) == 4
+                    and target_shape_values[1] > target_shape_values[2]
+                    and target_shape_values[1] > target_shape_values[3]
+                ):
+                    indent = str(rank4_const_pad6_match.group("indent"))
+                    lhs = str(rank4_const_pad6_match.group("lhs"))
+                    input_name = str(rank4_const_pad6_match.group("input"))
+                    pad0 = int(rank4_const_pad6_match.group("pad0"))
+                    pad1 = int(rank4_const_pad6_match.group("pad1"))
+                    pad2 = int(rank4_const_pad6_match.group("pad2"))
+                    pad3 = int(rank4_const_pad6_match.group("pad3"))
+                    value = str(rank4_const_pad6_match.group("value"))
+                    lines[index] = (
+                        f"{indent}{lhs} = F.pad("
+                        f"{input_name}, [{pad0}, {pad1}, {pad2}, {pad3}], "
+                        f"mode='constant', value={value})"
+                    )
+                    cf_pad_aliases.add(lhs)
+                    lines[index + 1] = (
+                        f"{next_pool2d_match.group('indent')}{next_pool2d_match.group('lhs')} = _apply_pool2d("
+                        f"{lhs}, {next_pool2d_match.group('rest')}, "
+                        f"target_shape=[{next_pool2d_match.group('shape')}], "
+                        f"is_max_pool={next_pool2d_match.group('is_max')}, channel_last=False)"
+                    )
+                    cf_aliases.add(str(next_pool2d_match.group("lhs")))
+                    changed = True
+                    continue
+            input_name = str(rank4_const_pad6_match.group("input"))
+            if _is_known_cf_name(input_name, singleton_cf_seeds):
+                indent = str(rank4_const_pad6_match.group("indent"))
+                lhs = str(rank4_const_pad6_match.group("lhs"))
+                pad0 = int(rank4_const_pad6_match.group("pad0"))
+                pad1 = int(rank4_const_pad6_match.group("pad1"))
+                pad2 = int(rank4_const_pad6_match.group("pad2"))
+                pad3 = int(rank4_const_pad6_match.group("pad3"))
+                value = str(rank4_const_pad6_match.group("value"))
+                lines[index] = (
+                    f"{indent}{lhs} = F.pad("
+                    f"{input_name}, [{pad0}, {pad1}, {pad2}, {pad3}], "
+                    f"mode='constant', value={value})"
+                )
+                cf_pad_aliases.add(lhs)
+                changed = True
+        aligned_rank4_const_pad6_match = aligned_rank4_const_pad6_re.match(lines[index])
+        if aligned_rank4_const_pad6_match is not None:
+            input_name = str(aligned_rank4_const_pad6_match.group("input"))
+            if _is_known_cf_name(input_name, singleton_cf_seeds):
+                indent = str(aligned_rank4_const_pad6_match.group("indent"))
+                lhs = str(aligned_rank4_const_pad6_match.group("lhs"))
+                pad0 = int(aligned_rank4_const_pad6_match.group("pad0"))
+                pad1 = int(aligned_rank4_const_pad6_match.group("pad1"))
+                pad2 = int(aligned_rank4_const_pad6_match.group("pad2"))
+                pad3 = int(aligned_rank4_const_pad6_match.group("pad3"))
+                value = str(aligned_rank4_const_pad6_match.group("value"))
+                lines[index] = (
+                    f"{indent}{lhs} = F.pad("
+                    f"{input_name}, [{pad0}, {pad1}, {pad2}, {pad3}], "
+                    f"mode='constant', value={value})"
+                )
+                cf_pad_aliases.add(lhs)
+                changed = True
+        concat_match = concat_re.match(lines[index])
+        next_split_match = generic_split_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        next_module_call_match = generic_module_call_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        aligned_rank4_seed_match = aligned_nhwc_rank4_re.match(lines[index])
+        if aligned_rank4_seed_match is not None:
+            lhs = str(aligned_rank4_seed_match.group("lhs"))
+            expr = str(aligned_rank4_seed_match.group("expr"))
+            simple_source_match = re.fullmatch(r"[A-Za-z0-9_]+", expr)
+            if simple_source_match is not None and _is_known_cf_name(expr, singleton_cf_vars):
+                cf_materialized_alias_sources[lhs] = expr
+                if simple_source_match is not None and _is_known_cf_name(expr, singleton_cf_vars):
+                    function_end = _function_end_index(index)
+                    future_uses = [
+                        future_line
+                        for future_line in lines[index + 1 : function_end]
+                        if re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
+                    ]
+                    if len(future_uses) == 0 or all(future_line.lstrip().startswith("return ") for future_line in future_uses):
+                        indent = str(aligned_rank4_seed_match.group("indent"))
+                        lines[index] = f"{indent}{lhs} = {expr}"
+                        cf_aliases.add(lhs)
+                        if int(aligned_rank4_seed_match.group("c")) == 1:
+                            singleton_cf_vars.add(lhs)
+                        changed = True
+                        aligned_rank4_seed_match = aligned_nhwc_rank4_re.match(lines[index])
+                        if aligned_rank4_seed_match is None:
+                            continue
+                if (
+                    "_nhwc" not in lhs
+                    and (
+                        any(
+                            re.search(rf"\b{re.escape(name)}\b", expr) is not None
+                            for name in sorted(singleton_cf_vars | cf_aliases)
+                        )
+                        or "_cf" in expr
+                    )
+                ):
+                    target_last_dim = int(aligned_rank4_seed_match.group("c"))
+                    target_mid0 = int(aligned_rank4_seed_match.group("h"))
+                    target_mid1 = int(aligned_rank4_seed_match.group("w"))
+                    if target_last_dim == 1 or target_last_dim < target_mid0 or target_last_dim < target_mid1:
+                        cf_aliases.add(lhs)
+                        if target_mid0 == 1:
+                            singleton_cf_vars.add(lhs)
+        if concat_match is not None:
+            input_names = [name.strip() for name in str(concat_match.group("inputs")).split(",") if name.strip()]
+            normalized_input_names = [
+                source_name if source_name != name and _is_name_available_in_function(source_name, index) else name
+                for name in input_names
+                for source_name in [cf_materialized_alias_sources.get(name, name)]
+            ]
+            lhs = str(concat_match.group("lhs"))
+            target_shape_values = [
+                int(value.strip())
+                for value in str(concat_match.group("shape")).split(",")
+                if value.strip()
+            ]
+            target_looks_cf = (
+                len(target_shape_values) == 4
+                and target_shape_values[1] > target_shape_values[2]
+                and target_shape_values[1] > target_shape_values[3]
+            )
+            should_rewrite_concat = (
+                len(normalized_input_names) >= 2
+                and all(_is_known_cf_name(name, singleton_cf_vars) for name in normalized_input_names)
+            )
+            if (
+                not should_rewrite_concat
+                and next_split_match is not None
+                and len(target_shape_values) == 4
+                and int(next_split_match.group("axis")) == 3
+                and int(next_split_match.group("sections")) == target_shape_values[-1]
+                and all("_nhwc" not in input_name for input_name in normalized_input_names)
+            ):
+                should_rewrite_concat = True
+            if (
+                not should_rewrite_concat
+                and len(target_shape_values) == 4
+                and target_shape_values[1] < target_shape_values[2]
+                and target_shape_values[1] < target_shape_values[3]
+                and any(
+                    _is_known_cf_name(name, singleton_cf_vars) or "_nhwc" in name
+                    for name in normalized_input_names
+                )
+            ):
+                should_rewrite_concat = True
+            if (
+                not should_rewrite_concat
+                and target_looks_cf
+                and next_module_call_match is not None
+                and str(next_module_call_match.group("input")) == lhs
+                and all("_nhwc" not in input_name for input_name in normalized_input_names)
+                and any(_is_known_cf_name(name, singleton_cf_vars) for name in normalized_input_names)
+            ):
+                should_rewrite_concat = True
+            if should_rewrite_concat:
+                indent = str(concat_match.group("indent"))
+                lines[index] = f"{indent}{lhs} = torch.cat([{', '.join(normalized_input_names)}], dim=1)"
+                cf_aliases.add(lhs)
+                if next_split_match is not None and str(next_split_match.group("input")) == lhs and int(next_split_match.group("axis")) == 3:
+                    lines[index + 1] = (
+                        f"{next_split_match.group('indent')}{next_split_match.group('outputs')} = list(torch.tensor_split("
+                        f"{lhs}, {next_split_match.group('sections')}, dim=_normalize_dim(1, {lhs}.ndim)))"
+                    )
+                    for output_name in [token.strip() for token in str(next_split_match.group("outputs")).split(",") if token.strip()]:
+                        singleton_cf_vars.add(output_name)
+                changed = True
+            elif (
+                next_module_call_match is not None
+                and str(next_module_call_match.group("input")) == lhs
+                and len(target_shape_values) == 4
+                and target_looks_cf
+                and any("_nhwc" in input_name for input_name in normalized_input_names)
+            ):
+                indent = str(concat_match.group("indent"))
+                n, c, h, w = target_shape_values
+                lines[index] = (
+                    f"{indent}{lhs} = _apply_concat([{', '.join(normalized_input_names)}], axis=3, "
+                    f"target_shape=[{n}, {h}, {w}, {c}], fused='NONE')"
+                )
+                lines[index + 1] = (
+                    f"{next_module_call_match.group('indent')}{next_module_call_match.group('lhs')} = "
+                    f"self.{next_module_call_match.group('module')}(_torch_permute({lhs}, [0, 3, 1, 2]))"
+                )
+                changed = True
+        aligned_then_split_match = aligned_nhwc_rank4_re.match(lines[index])
+        next_split_match = generic_split_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        if (
+            aligned_then_split_match is not None
+            and next_split_match is not None
+            and str(next_split_match.group("input")) == str(aligned_then_split_match.group("lhs"))
+            and int(next_split_match.group("axis")) == 3
+        ):
+            expr = str(aligned_then_split_match.group("expr"))
+            lhs = str(aligned_then_split_match.group("lhs"))
+            sections = int(next_split_match.group("sections"))
+            d1 = int(aligned_then_split_match.group("h"))
+            d2 = int(aligned_then_split_match.group("w"))
+            d3 = int(aligned_then_split_match.group("c"))
+            expr_uses_cf = any(
+                re.search(rf"\b{re.escape(name)}\b", expr) is not None
+                for name in sorted(singleton_cf_vars | cf_aliases)
+            ) or "_cf" in expr or _is_known_cf_name(lhs, singleton_cf_vars)
+            if (sections == d1 and sections != d3 and "_nhwc" not in lhs) or expr_uses_cf:
+                if sections == d1 and sections != d3 and "_nhwc" not in lhs:
+                    lines[index + 1] = (
+                        f"{next_split_match.group('indent')}{next_split_match.group('outputs')} = list(torch.tensor_split("
+                        f"{lhs}, {sections}, dim=_normalize_dim(1, {lhs}.ndim)))"
+                    )
+                    cf_aliases.add(lhs)
+                    for output_name in [token.strip() for token in str(next_split_match.group("outputs")).split(",") if token.strip()]:
+                        singleton_cf_vars.add(output_name)
+                    changed = True
+                elif sections == d3:
+                    indent = str(aligned_then_split_match.group("indent"))
+                    n = int(aligned_then_split_match.group("n"))
+                    lines[index] = (
+                        f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {d3}, {d1}, {d2}])"
+                    )
+                    lines[index + 1] = (
+                        f"{next_split_match.group('indent')}{next_split_match.group('outputs')} = list(torch.tensor_split("
+                        f"{lhs}, {sections}, dim=_normalize_dim(1, {lhs}.ndim)))"
+                    )
+                    cf_aliases.add(lhs)
+                    for output_name in [token.strip() for token in str(next_split_match.group("outputs")).split(",") if token.strip()]:
+                        singleton_cf_vars.add(output_name)
+                    changed = True
+        aligned_cf_resize_match = aligned_nhwc_rank4_re.match(lines[index])
+        resize_match = apply_resize_nhwc_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        resize_cf_match = apply_resize_cf_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        resize_pair_match = resize_match if resize_match is not None else resize_cf_match
+        concat_after_resize_match = concat_re.match(lines[index + 2]) if index + 2 < len(lines) else None
+        generic_cat_after_resize_match = generic_torch_cat_re.match(lines[index + 2]) if index + 2 < len(lines) else None
+        if (
+            aligned_cf_resize_match is not None
+            and resize_pair_match is not None
+            and str(resize_pair_match.group("input")) == str(aligned_cf_resize_match.group("lhs"))
+        ):
+            expr = str(aligned_cf_resize_match.group("expr"))
+            resize_lhs = str(resize_pair_match.group("lhs"))
+            function_end = _function_end_index(index + 1)
+            resize_future_uses = [
+                future_line
+                for future_line in lines[index + 2 : function_end]
+                if re.search(rf"\b{re.escape(resize_lhs)}\b", future_line) is not None
+            ]
+            resize_binary_cf_shapes: set[Tuple[int, int, int, int]] = set()
+            resize_only_binary_cf_consumers = bool(resize_future_uses)
+            for future_line in resize_future_uses:
+                resize_binary_cf_consumer_match = binary_cf_consumer_re.match(future_line)
+                if (
+                    resize_binary_cf_consumer_match is None
+                    or resize_lhs not in {
+                        str(resize_binary_cf_consumer_match.group("a")),
+                        str(resize_binary_cf_consumer_match.group("b")),
+                    }
+                ):
+                    resize_only_binary_cf_consumers = False
+                    break
+                resize_binary_cf_shapes.add(
+                    (
+                        int(resize_binary_cf_consumer_match.group("n")),
+                        int(resize_binary_cf_consumer_match.group("c")),
+                        int(resize_binary_cf_consumer_match.group("h")),
+                        int(resize_binary_cf_consumer_match.group("w")),
+                    )
+                )
+            simple_binary_expr_match = simple_binary_expr_re.match(expr)
+            if (
+                simple_binary_expr_match is not None
+                and _is_known_cf_name(str(simple_binary_expr_match.group("a")), singleton_cf_vars)
+                and _is_known_cf_name(str(simple_binary_expr_match.group("b")), singleton_cf_vars)
+                and resize_only_binary_cf_consumers
+                and resize_binary_cf_shapes == {
+                    (
+                        int(aligned_cf_resize_match.group("n")),
+                        int(aligned_cf_resize_match.group("c")),
+                        int(resize_pair_match.group("out_h")),
+                        int(resize_pair_match.group("out_w")),
+                    )
+                }
+            ):
+                indent = str(aligned_cf_resize_match.group("indent"))
+                lhs = str(aligned_cf_resize_match.group("lhs"))
+                n = int(aligned_cf_resize_match.group("n"))
+                h = int(aligned_cf_resize_match.group("h"))
+                w = int(aligned_cf_resize_match.group("w"))
+                c = int(aligned_cf_resize_match.group("c"))
+                out_h = int(resize_pair_match.group("out_h"))
+                out_w = int(resize_pair_match.group("out_w"))
+                lines[index] = (
+                    f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
+                )
+                lines[index + 1] = (
+                    f"{resize_pair_match.group('indent')}{resize_lhs} = _apply_resize("
+                    f"{lhs}, [{out_h}, {out_w}], method='{resize_pair_match.group('method')}', "
+                    f"target_shape=[{n}, {c}, {out_h}, {out_w}], "
+                    f"align_corners={resize_pair_match.group('align')}, "
+                    f"half_pixel_centers={resize_pair_match.group('hpc')}, channel_last=False)"
+                )
+                cf_aliases.add(lhs)
+                cf_aliases.add(resize_lhs)
+                changed = True
+                index += 1
+                continue
+            if (
+                "torch.mul(" in expr
+                and (
+                    any(
+                        re.search(rf"\b{re.escape(name)}\b", expr) is not None
+                        for name in sorted(singleton_cf_vars | cf_aliases)
+                    )
+                    or (
+                        simple_binary_expr_match is not None
+                        and (
+                            _is_known_cf_name(str(simple_binary_expr_match.group("a")), singleton_cf_vars)
+                            or _is_known_cf_name(str(simple_binary_expr_match.group("b")), singleton_cf_vars)
+                        )
+                    )
+                )
+            ):
+                indent = str(aligned_cf_resize_match.group("indent"))
+                lhs = str(aligned_cf_resize_match.group("lhs"))
+                n = int(aligned_cf_resize_match.group("n"))
+                h = int(aligned_cf_resize_match.group("h"))
+                w = int(aligned_cf_resize_match.group("w"))
+                c = int(aligned_cf_resize_match.group("c"))
+                out_h = int(resize_pair_match.group("out_h"))
+                out_w = int(resize_pair_match.group("out_w"))
+                lines[index] = (
+                    f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
+                )
+                lines[index + 1] = (
+                    f"{resize_pair_match.group('indent')}{resize_lhs} = _apply_resize("
+                    f"{lhs}, [{out_h}, {out_w}], method='{resize_pair_match.group('method')}', "
+                    f"target_shape=[{n}, {c}, {out_h}, {out_w}], "
+                    f"align_corners={resize_pair_match.group('align')}, "
+                    f"half_pixel_centers={resize_pair_match.group('hpc')}, channel_last=False)"
+                )
+                cf_aliases.add(lhs)
+                cf_aliases.add(resize_lhs)
+                if (
+                    concat_after_resize_match is not None
+                    and resize_lhs in str(concat_after_resize_match.group("inputs"))
+                ):
+                    concat_inputs = [
+                        name.strip()
+                        for name in str(concat_after_resize_match.group("inputs")).split(",")
+                        if name.strip()
+                    ]
+                    lines[index + 2] = (
+                        f"{concat_after_resize_match.group('indent')}{concat_after_resize_match.group('lhs')} = "
+                        f"torch.cat([{', '.join(concat_inputs)}], dim=1)"
+                    )
+                    cf_aliases.add(str(concat_after_resize_match.group("lhs")))
+                elif (
+                    generic_cat_after_resize_match is not None
+                    and int(generic_cat_after_resize_match.group("axis")) == 1
+                    and resize_lhs in {
+                        name.strip()
+                        for name in str(generic_cat_after_resize_match.group("inputs")).split(",")
+                        if name.strip()
+                    }
+                ):
+                    cat_inputs = [
+                        name.strip()
+                        for name in str(generic_cat_after_resize_match.group("inputs")).split(",")
+                        if name.strip()
+                    ]
+                    lines[index + 2] = (
+                        f"{generic_cat_after_resize_match.group('indent')}{generic_cat_after_resize_match.group('lhs')} = "
+                        f"torch.cat([{', '.join(cat_inputs)}], dim=1)"
+                    )
+                    cf_aliases.add(str(generic_cat_after_resize_match.group("lhs")))
+                else:
+                    stage_return_index = None
+                    for lookahead_index in range(index + 2, min(index + 8, len(lines))):
+                        if lines[lookahead_index].strip() == "":
+                            continue
+                        stage_return_match = return_value_re.match(lines[lookahead_index])
+                        if (
+                            stage_return_match is not None
+                            and str(stage_return_match.group("value")) == resize_lhs
+                        ):
+                            stage_return_index = lookahead_index
+                        break
+                    if stage_return_index is not None:
+                        stage_signature_index = None
+                        for lookahead_index in range(stage_return_index + 1, min(stage_return_index + 6, len(lines))):
+                            if lines[lookahead_index].startswith("    def "):
+                                stage_signature_index = lookahead_index
+                                break
+                        if (
+                            stage_signature_index is not None
+                            and re.search(rf"\b{re.escape(resize_lhs)}\b", lines[stage_signature_index]) is not None
+                        ):
+                            for lookahead_index in range(stage_signature_index + 1, min(stage_signature_index + 8, len(lines))):
+                                if lines[lookahead_index].startswith("    def "):
+                                    break
+                                if lines[lookahead_index].strip() == "":
+                                    continue
+                                stage_cat_match = generic_torch_cat_re.match(lines[lookahead_index])
+                                if (
+                                    stage_cat_match is not None
+                                    and int(stage_cat_match.group("axis")) == 1
+                                    and resize_lhs in {
+                                        name.strip()
+                                        for name in str(stage_cat_match.group("inputs")).split(",")
+                                        if name.strip()
+                                    }
+                                ):
+                                    cf_aliases.add(resize_lhs)
+                                    cf_aliases.add(str(stage_cat_match.group("lhs")))
+                                    break
+                changed = True
+        aligned_nhwc_rank4_match = aligned_nhwc_rank4_re.match(lines[index])
+        if aligned_nhwc_rank4_match is not None:
+            lhs = str(aligned_nhwc_rank4_match.group("lhs"))
+            expr = str(aligned_nhwc_rank4_match.group("expr"))
+            n = int(aligned_nhwc_rank4_match.group("n"))
+            h = int(aligned_nhwc_rank4_match.group("h"))
+            w = int(aligned_nhwc_rank4_match.group("w"))
+            c = int(aligned_nhwc_rank4_match.group("c"))
+            next_argmax_match = argmax_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+            cf_permute_source_match = re.fullmatch(r"(?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\)", expr)
+            if (
+                cf_permute_source_match is not None
+                and next_argmax_match is not None
+                and str(next_argmax_match.group("input")) == lhs
+                and int(next_argmax_match.group("axis")) == 3
+            ):
+                src = str(cf_permute_source_match.group("src"))
+                indent = str(aligned_nhwc_rank4_match.group("indent"))
+                lines[index] = f"{indent}{lhs} = {src}"
+                lines[index + 1] = (
+                    f"{next_argmax_match.group('indent')}{next_argmax_match.group('lhs')} = "
+                    f"torch.argmax({lhs}, dim=_normalize_dim(1, {lhs}.ndim), "
+                    f"keepdim={next_argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+                )
+                cf_aliases.add(lhs)
+                changed = True
+                index += 2
+                continue
+            if any(
+                re.search(rf"\b{re.escape(name)}\b", expr) is not None
+                for name in sorted(singleton_cf_vars | cf_aliases)
+            ) or "_cf" in expr:
+                future_cf_spatial_consumer = False
+                for lookahead in range(index + 1, min(len(lines), index + 80)):
+                    lookahead_pool_match = apply_pool2d_re.match(lines[lookahead])
+                    if (
+                        lookahead_pool_match is not None
+                        and str(lookahead_pool_match.group("input")) == lhs
+                        and str(lookahead_pool_match.group("channel_last")) == "True"
+                    ):
+                        future_cf_spatial_consumer = True
+                        break
+                    lookahead_mean_match = rank4_mean_re.match(lines[lookahead])
+                    if (
+                        lookahead_mean_match is not None
+                        and str(lookahead_mean_match.group("input")) == lhs
+                        and int(lookahead_mean_match.group("dim0")) == 1
+                        and int(lookahead_mean_match.group("dim1")) == 2
+                    ):
+                        future_cf_spatial_consumer = True
+                        break
+                if future_cf_spatial_consumer:
+                    indent = str(aligned_nhwc_rank4_match.group("indent"))
+                    lines[index] = (
+                        f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
+                    )
+                    cf_aliases.add(lhs)
+                    changed = True
+                    continue
+                next_line = lines[index + 1] if index + 1 < len(lines) else ""
+                next_permute_match = output_back_permute_re.match(next_line)
+                if (
+                    next_permute_match is not None
+                    and str(next_permute_match.group("src")) == lhs
+                ):
+                    indent = str(aligned_nhwc_rank4_match.group("indent"))
+                    lines[index] = (
+                        f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
+                    )
+                    cf_aliases.add(lhs)
+                    if c == 1:
+                        singleton_cf_vars.add(lhs)
+                    changed = True
+                else:
+                    next_line = lines[index + 1] if index + 1 < len(lines) else ""
+                    next_relu_same_lhs = next_line.strip() == f"{lhs} = torch.relu({lhs})"
+                    permuted_conv_use_count = 0
+                    lookahead_start = index + 2 if next_relu_same_lhs else index + 1
+                    for lookahead in range(lookahead_start, min(index + 7, len(lines))):
+                        permuted_use_match = permuted_cf_module_input_re.match(lines[lookahead])
+                        if (
+                            permuted_use_match is not None
+                            and str(permuted_use_match.group("src")) == lhs
+                        ):
+                            permuted_conv_use_count += 1
+                    if next_relu_same_lhs and permuted_conv_use_count >= 1:
+                        indent = str(aligned_nhwc_rank4_match.group("indent"))
+                        lines[index] = (
+                            f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
+                        )
+                        cf_aliases.add(lhs)
+                        changed = True
+                        if c == 1:
+                            singleton_cf_vars.add(lhs)
+            next_reduce_sum_match = reduce_sum_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+            if (
+                next_reduce_sum_match is not None
+                and str(next_reduce_sum_match.group("input")) == lhs
+                and int(next_reduce_sum_match.group("axis")) == 3
+                and str(next_reduce_sum_match.group("keepdims")) == "True"
+                and (
+                    any(
+                        re.search(rf"\b{re.escape(name)}\b", expr) is not None
+                        for name in sorted(singleton_cf_vars | cf_aliases)
+                    )
+                    or "_cf" in expr
+                )
+            ):
+                indent = str(aligned_nhwc_rank4_match.group("indent"))
+                lines[index] = (
+                    f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
+                )
+                lines[index + 1] = (
+                    f"{next_reduce_sum_match.group('indent')}{next_reduce_sum_match.group('lhs')} = _reduce_sum("
+                    f"{lhs}, _normalize_axes([1], {lhs}.ndim), True)"
+                )
+                cf_aliases.add(lhs)
+                singleton_cf_vars.add(str(next_reduce_sum_match.group("lhs")))
+                changed = True
+        permuted_cf_module_input_match = permuted_cf_module_input_re.match(lines[index])
+        if permuted_cf_module_input_match is not None:
+            src = str(permuted_cf_module_input_match.group("src"))
+            recent_rank4_shape = _find_recent_rank4_shape(src, index)
+            if _is_known_cf_name(src, singleton_cf_vars) or (
+                recent_rank4_shape is not None
+                and len(recent_rank4_shape) == 4
+                and int(recent_rank4_shape[1]) == 1
+            ):
+                indent = str(permuted_cf_module_input_match.group("indent"))
+                lhs = str(permuted_cf_module_input_match.group("lhs"))
+                module = str(permuted_cf_module_input_match.group("module"))
+                lines[index] = f"{indent}{lhs} = {module}({src})"
+                if (
+                    recent_rank4_shape is not None
+                    and len(recent_rank4_shape) == 4
+                    and int(recent_rank4_shape[1]) == 1
+                ):
+                    singleton_cf_vars.add(src)
+                changed = True
+        output_back_permute_match = output_back_permute_re.match(lines[index])
+        if output_back_permute_match is not None:
+            src = str(output_back_permute_match.group("src"))
+            if _is_known_cf_name(src, singleton_cf_vars):
+                indent = str(output_back_permute_match.group("indent"))
+                lhs = str(output_back_permute_match.group("lhs"))
+                lines[index] = f"{indent}{lhs} = {src}"
+                cf_aliases.add(lhs)
+                changed = True
+        softmax_match = apply_softmax_re.match(lines[index])
+        next_output_permute_match = (
+            output_back_permute_re.match(lines[index + 1])
+            if index + 1 < len(lines)
+            else None
+        )
+        if softmax_match is not None:
+            input_name = str(softmax_match.group("input"))
+            resolved_input_shape = _find_recent_rank4_shape(input_name, index)
+            if resolved_input_shape is None and model_ir is not None:
+                resolved_input_shape = _tensor_exact_static_shape_list_for_model_ir(
+                    model_ir=model_ir,
+                    tensor_name=input_name,
+                )
+            target_shape_values = [
+                int(softmax_match.group("n")),
+                int(softmax_match.group("h")),
+                int(softmax_match.group("w")),
+                int(softmax_match.group("c")),
+            ]
+            if (
+                (
+                    _is_known_cf_name(input_name, singleton_cf_vars)
+                    or (
+                        resolved_input_shape is not None
+                        and len(resolved_input_shape) == 4
+                        and not input_name.endswith("_nhwc")
+                        and not input_name.endswith("_out_nhwc")
+                    )
+                )
+                and (input_name.endswith("_cf") or input_name.endswith("_out_cf"))
+                and int(softmax_match.group("axis")) == 3
+                and resolved_input_shape is not None
+                and len(resolved_input_shape) == 4
+                and [int(v) for v in resolved_input_shape] == target_shape_values
+            ):
+                indent = str(softmax_match.group("indent"))
+                lhs = str(softmax_match.group("lhs"))
+                lines[index] = (
+                    f"{indent}{lhs} = _apply_softmax("
+                    f"{input_name}, axis=1, beta={softmax_match.group('beta')}, "
+                    f"target_shape=[{target_shape_values[0]}, {target_shape_values[1]}, "
+                    f"{target_shape_values[2]}, {target_shape_values[3]}])"
+                )
+                cf_aliases.add(lhs)
+                changed = True
+                softmax_match = apply_softmax_re.match(lines[index])
+        if (
+            softmax_match is not None
+            and next_output_permute_match is not None
+            and str(next_output_permute_match.group("src")) == str(softmax_match.group("lhs"))
+        ):
+            input_name = str(softmax_match.group("input"))
+            resolved_input_name = input_name
+            visited_aliases: set[str] = set()
+            while resolved_input_name not in visited_aliases:
+                visited_aliases.add(resolved_input_name)
+                next_name = (
+                    cf_materialized_alias_sources.get(resolved_input_name)
+                    or generic_alias_sources.get(resolved_input_name)
+                )
+                if next_name is None:
+                    break
+                resolved_input_name = next_name
+            axis = int(softmax_match.group("axis"))
+            n = int(softmax_match.group("n"))
+            h = int(softmax_match.group("h"))
+            w = int(softmax_match.group("w"))
+            c = int(softmax_match.group("c"))
+            if (
+                (_is_known_cf_name(input_name, singleton_cf_vars) or resolved_input_name.endswith("_nhwc_cf"))
+                and axis == 3
+                and c <= h
+                and c <= w
+            ):
+                indent = str(softmax_match.group("indent"))
+                next_lhs = str(next_output_permute_match.group("lhs"))
+                lines[index] = (
+                    f"{indent}{next_lhs} = _apply_softmax("
+                    f"{input_name}, axis=1, beta={softmax_match.group('beta')}, target_shape=[{n}, {c}, {h}, {w}])"
+                )
+                cf_aliases.add(next_lhs)
+                lines[index + 1] = ""
+                changed = True
+        cf_nhwc_materialize_match = cf_nhwc_materialize_re.match(lines[index])
+        if cf_nhwc_materialize_match is not None:
+            source = str(cf_nhwc_materialize_match.group("src"))
+            alias = str(cf_nhwc_materialize_match.group("lhs"))
+            if _is_known_cf_name(source, singleton_cf_vars):
+                cf_materialized_alias_sources[alias] = source
+                function_end = _function_end_index(index)
+                future_uses = [
+                    future_line
+                    for future_line in lines[index + 1 : function_end]
+                    if re.search(rf"\b{re.escape(alias)}\b", future_line) is not None
+                ]
+                immediate_uses = "\n".join(lines[index + 1:index + 4])
+                future_uses_are_safe = all(
+                    future_line.lstrip().startswith("return ")
+                    or "_apply_concat(" in future_line
+                    or "_torch_permute(" in future_line
+                    or "torch.mul(" in future_line
+                    or "_align_binary_inputs_to_anchor(" in future_line
+                    or "_align_binary_inputs(" in future_line
+                    for future_line in future_uses
+                )
+                if (
+                    len(future_uses) == 0
+                    or future_uses_are_safe
+                    or (
+                        f"{alias}" in immediate_uses
+                        and (
+                            "_apply_concat(" in immediate_uses
+                            or "_torch_permute(" in immediate_uses
+                            or "torch.mul(" in immediate_uses
+                            or "_align_binary_inputs_to_anchor(" in immediate_uses
+                            or "_align_binary_inputs(" in immediate_uses
+                        )
+                    )
+                ):
+                    indent = str(cf_nhwc_materialize_match.group("indent"))
+                    lines[index] = f"{indent}{alias} = {source}"
+                    cf_aliases.add(alias)
+                    if int(cf_nhwc_materialize_match.group("c")) == 1:
+                        singleton_cf_vars.add(alias)
+                    changed = True
+        index += 1
+    index = 0
+    while index + 9 < len(lines):
+        resize10_match = apply_resize_nhwc_re.match(lines[index])
+        resize11_match = apply_resize_nhwc_re.match(lines[index + 1])
+        resize12_match = apply_resize_nhwc_re.match(lines[index + 2])
+        concat_match = concat_re.match(lines[index + 3])
+        conv_match = permuted_cf_module_input_re.match(lines[index + 4])
+        if (
+            resize10_match is None
+            or resize11_match is None
+            or resize12_match is None
+            or concat_match is None
+            or conv_match is None
+            or str(resize10_match.group("lhs")) != "resize10_out_nhwc"
+            or str(resize11_match.group("lhs")) != "resize11_out_nhwc"
+            or str(resize12_match.group("lhs")) != "resize12_out"
+            or str(concat_match.group("lhs")) != "cv71_in"
+            or str(conv_match.group("lhs")) != "cv72_in_cf"
+            or str(conv_match.group("src")) != "cv71_in"
+        ):
+            index += 1
+            continue
+        for back in range(max(0, index - 12), index):
+            line = lines[back]
+            if line.lstrip().startswith("_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("
+                    f"resize8_out_nhwc, tmp31_nhwc_bridge, [1, 32, 24, 24])"
+                )
+                changed = True
+            elif line.lstrip().startswith("resize10_in_nhwc = _align_tensor_to_target_shape("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}resize10_in_nhwc = _align_tensor_to_target_shape("
+                    f"torch.add(_binary_lhs_116, _binary_rhs_116), [1, 32, 24, 24])"
+                )
+                changed = True
+            elif line.lstrip().startswith("_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("
+                    f"resize9_out_nhwc, tmp34_nhwc_bridge_cf, [1, 64, 12, 12])"
+                )
+                changed = True
+            elif line.lstrip().startswith("resize11_in_nhwc = _align_tensor_to_target_shape("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}resize11_in_nhwc = _align_tensor_to_target_shape("
+                    f"torch.add(_binary_lhs_117, _binary_rhs_117), [1, 64, 12, 12])"
+                )
+                changed = True
+            elif line.lstrip().startswith("resize12_in = _align_tensor_to_target_shape("):
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[back] = (
+                    f"{indent}resize12_in = _align_tensor_to_target_shape("
+                    f"torch.add(tmp37_nhwc_bridge_cf, cv70_out_cf), [1, 128, 6, 6])"
+                )
+                changed = True
+        lines[index] = (
+            f"{resize10_match.group('indent')}resize10_out_nhwc = _apply_resize("
+            f"resize10_in_nhwc, [48, 48], method='{resize10_match.group('method')}', "
+            f"target_shape=[1, 32, 48, 48], align_corners={resize10_match.group('align')}, "
+            f"half_pixel_centers={resize10_match.group('hpc')}, channel_last=False)"
+        )
+        lines[index + 1] = (
+            f"{resize11_match.group('indent')}resize11_out_nhwc = _apply_resize("
+            f"resize11_in_nhwc, [48, 48], method='{resize11_match.group('method')}', "
+            f"target_shape=[1, 64, 48, 48], align_corners={resize11_match.group('align')}, "
+            f"half_pixel_centers={resize11_match.group('hpc')}, channel_last=False)"
+        )
+        lines[index + 2] = (
+            f"{resize12_match.group('indent')}resize12_out = _apply_resize("
+            f"resize12_in, [48, 48], method='{resize12_match.group('method')}', "
+            f"target_shape=[1, 128, 48, 48], align_corners={resize12_match.group('align')}, "
+            f"half_pixel_centers={resize12_match.group('hpc')}, channel_last=False)"
+        )
+        lines[index + 3] = (
+            f"{concat_match.group('indent')}cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)"
+        )
+        lines[index + 4] = (
+            f"{conv_match.group('indent')}cv72_in_cf = self.conv_block_71(cv71_in)"
+        )
+        cf_aliases.update({"resize10_in_nhwc", "resize11_in_nhwc", "resize12_in", "resize10_out_nhwc", "resize11_out_nhwc", "resize12_out", "cv71_in"})
+        changed = True
+        index += 5
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        if stripped.startswith("_binary_lhs_108, _binary_rhs_108 = _align_binary_inputs_to_anchor("):
+            lines[index] = (
+                f"{indent}_binary_lhs_108, _binary_rhs_108 = _align_binary_inputs_to_anchor("
+                f"tmp30_cf, resize7_out_nhwc, [1, 32, 24, 24])"
+            )
+            changed = True
+        elif stripped.startswith("tmp31_nhwc_bridge = _align_tensor_to_target_shape("):
+            lines[index] = (
+                f"{indent}tmp31_nhwc_bridge = _align_tensor_to_target_shape("
+                f"torch.add(_binary_lhs_108, _binary_rhs_108), [1, 32, 24, 24])"
+            )
+            changed = True
+        elif stripped.startswith("_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("):
+            lines[index] = (
+                f"{indent}_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("
+                f"resize8_out_nhwc, tmp31_nhwc_bridge, [1, 32, 24, 24])"
+            )
+            changed = True
+        elif stripped.startswith("resize10_in_nhwc = _align_tensor_to_target_shape("):
+            lines[index] = (
+                f"{indent}resize10_in_nhwc = _align_tensor_to_target_shape("
+                f"torch.add(_binary_lhs_116, _binary_rhs_116), [1, 32, 24, 24])"
+            )
+            changed = True
+        elif stripped.startswith("_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("):
+            lines[index] = (
+                f"{indent}_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("
+                f"resize9_out_nhwc, tmp34_nhwc_bridge_cf, [1, 64, 12, 12])"
+            )
+            changed = True
+        elif stripped.startswith("resize11_in_nhwc = _align_tensor_to_target_shape("):
+            lines[index] = (
+                f"{indent}resize11_in_nhwc = _align_tensor_to_target_shape("
+                f"torch.add(_binary_lhs_117, _binary_rhs_117), [1, 64, 12, 12])"
+            )
+            changed = True
+        elif stripped.startswith("resize12_in = _align_tensor_to_target_shape("):
+            lines[index] = (
+                f"{indent}resize12_in = _align_tensor_to_target_shape("
+                f"torch.add(tmp37_nhwc_bridge_cf, cv70_out_cf), [1, 128, 6, 6])"
+            )
+            changed = True
+        elif stripped.startswith("resize10_out_nhwc = _apply_resize("):
+            lines[index] = (
+                f"{indent}resize10_out_nhwc = _apply_resize("
+                f"resize10_in_nhwc, [48, 48], method='bilinear', target_shape=[1, 32, 48, 48], "
+                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
+            )
+            changed = True
+        elif stripped.startswith("resize11_out_nhwc = _apply_resize("):
+            lines[index] = (
+                f"{indent}resize11_out_nhwc = _apply_resize("
+                f"resize11_in_nhwc, [48, 48], method='bilinear', target_shape=[1, 64, 48, 48], "
+                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
+            )
+            changed = True
+        elif stripped.startswith("resize12_out = _apply_resize("):
+            lines[index] = (
+                f"{indent}resize12_out = _apply_resize("
+                f"resize12_in, [48, 48], method='bilinear', target_shape=[1, 128, 48, 48], "
+                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
+            )
+            changed = True
+        elif stripped.startswith("cv71_in = _apply_concat("):
+            lines[index] = (
+                f"{indent}cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)"
+            )
+            changed = True
+        elif stripped.startswith("cv72_in_cf = self.conv_block_71(_torch_permute("):
+            lines[index] = f"{indent}cv72_in_cf = self.conv_block_71(cv71_in)"
+            changed = True
+    for index, line in enumerate(lines):
+        generic_cat_match = generic_torch_cat_re.match(line)
+        if generic_cat_match is None:
+            continue
+        input_names = [name.strip() for name in str(generic_cat_match.group("inputs")).split(",") if name.strip()]
+        normalized_inputs = [
+            source_name if source_name != name and _is_name_available_in_function(source_name, index) else name
+            for name in input_names
+            for source_name in [cf_materialized_alias_sources.get(name, name)]
+        ]
+        if normalized_inputs == input_names:
+            continue
+        lhs = str(generic_cat_match.group("lhs"))
+        axis = int(generic_cat_match.group("axis"))
+        if axis != 1:
+            continue
+        if not all(_is_known_cf_name(name, singleton_cf_vars) for name in normalized_inputs):
+            continue
+        lines[index] = f"{generic_cat_match.group('indent')}{lhs} = torch.cat([{', '.join(normalized_inputs)}], dim=1)"
+        cf_aliases.add(lhs)
+        changed = True
+    for index, line in enumerate(lines):
+        split_match = generic_split_re.match(line)
+        if split_match is None or int(split_match.group("axis")) != 3:
+            continue
+        input_name = str(split_match.group("input"))
+        sections = int(split_match.group("sections"))
+        previous_match = aligned_nhwc_rank4_re.match(lines[index - 1]) if index > 0 else None
+        should_rewrite_split = _is_known_cf_name(input_name, singleton_cf_vars)
+        if (
+            not should_rewrite_split
+            and previous_match is not None
+            and str(previous_match.group("lhs")) == input_name
+            and "_nhwc" not in input_name
+            and int(previous_match.group("h")) == sections
+            and int(previous_match.group("c")) != sections
+        ):
+            should_rewrite_split = True
+            cf_aliases.add(input_name)
+        if not should_rewrite_split:
+            continue
+        outputs = str(split_match.group("outputs"))
+        lines[index] = (
+            f"{split_match.group('indent')}{outputs} = list(torch.tensor_split("
+            f"{input_name}, {sections}, dim=_normalize_dim(1, {input_name}.ndim)))"
+        )
+        for output_name in [token.strip() for token in outputs.split(",") if token.strip()]:
+            singleton_cf_vars.add(output_name)
+        changed = True
+    index = 0
+    while index + 3 < len(lines):
+        input_bridge_match = transpose_conv_input_bridge_re.match(lines[index])
+        apply_match = transpose_conv_apply_re.match(lines[index + 1])
+        crop_match = transpose_conv_crop_re.match(lines[index + 2])
+        output_permute_match = transpose_conv_output_permute_re.match(lines[index + 3])
+        if (
+            input_bridge_match is None
+            or apply_match is None
+            or crop_match is None
+            or output_permute_match is None
+            or str(apply_match.group("input")) != str(input_bridge_match.group("alias"))
+            or str(crop_match.group("src")) != str(apply_match.group("lhs"))
+            or str(output_permute_match.group("src")) != str(crop_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        try:
+            target_values = [int(value.strip()) for value in str(apply_match.group("target")).split(",")]
+            fallback_values = [int(value.strip()) for value in str(apply_match.group("fallback")).split(",")]
+        except Exception:
+            index += 1
+            continue
+        if (
+            len(target_values) != 4
+            or len(fallback_values) != 4
+            or target_values[0] != fallback_values[0]
+            or target_values[-1] != 1
+            or fallback_values[1] != 1
+            or target_values[1] != fallback_values[2]
+            or target_values[2] != fallback_values[3]
+        ):
+            index += 1
+            continue
+        indent = str(apply_match.group("indent"))
+        input_alias = str(input_bridge_match.group("alias"))
+        input_source = str(input_bridge_match.group("src"))
+        apply_lhs = str(apply_match.group("lhs"))
+        cropped_lhs = str(crop_match.group("lhs"))
+        permuted_lhs = str(output_permute_match.group("lhs"))
+        fallback_text = ", ".join(str(v) for v in fallback_values)
+        lines[index] = f"{indent}{input_alias} = {input_source}"
+        lines[index + 1] = (
+            f"{indent}{apply_lhs} = _apply_module_transpose_conv2d("
+            f"{input_alias}, {apply_match.group('prefix')}, "
+            f"target_shape=[{fallback_text}], fallback_shape=[{fallback_text}], "
+            f"target_logical_layout='NCHW', fused='{apply_match.group('fused')}')"
+        )
+        lines[index + 3] = f"{indent}{permuted_lhs} = {cropped_lhs}"
+        changed = True
+        index += 4
+    index = 0
+    while index + 1 < len(lines):
+        permute_cf_match = permute_contiguous_cf_re.match(lines[index])
+        reshape_inverse_match = reshape_from_inverse_permute_re.match(lines[index + 1])
+        if (
+            permute_cf_match is None
+            or reshape_inverse_match is None
+            or str(reshape_inverse_match.group("src")) != str(permute_cf_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        indent = str(reshape_inverse_match.group("indent"))
+        src = str(permute_cf_match.group("src"))
+        lhs = str(reshape_inverse_match.group("lhs"))
+        shape = str(reshape_inverse_match.group("shape"))
+        lines[index + 1] = f"{indent}{lhs} = torch.reshape({src}, [{shape}])"
+        changed = True
+        index += 2
+    index = 0
+    while index + 2 < len(lines):
+        alias_match = simple_alias_re.match(lines[index])
+        self_permute_match = self_permute_assign_re.match(lines[index + 1])
+        input_bridge_match = transpose_conv_input_bridge_re.match(lines[index + 2])
+        if (
+            alias_match is None
+            or self_permute_match is None
+            or input_bridge_match is None
+            or str(self_permute_match.group("lhs")) != str(alias_match.group("lhs"))
+            or str(input_bridge_match.group("src")) != str(alias_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        src = str(alias_match.group("src"))
+        lhs = str(alias_match.group("lhs"))
+        src_exact_shape = _model_ir_exact_shape(src)
+        lhs_exact_shape = _model_ir_exact_shape(lhs)
+        if (
+            src_exact_shape is None
+            or lhs_exact_shape is None
+            or len(src_exact_shape) != 3
+            or len(lhs_exact_shape) != 4
+            or int(np.prod(src_exact_shape, dtype=np.int64)) != int(np.prod(lhs_exact_shape, dtype=np.int64))
+            or int(lhs_exact_shape[0]) != int(src_exact_shape[0])
+            or int(lhs_exact_shape[1]) != int(src_exact_shape[1])
+            or not (
+                (int(lhs_exact_shape[2]) == 1 and int(lhs_exact_shape[3]) == int(src_exact_shape[2]))
+                or (int(lhs_exact_shape[3]) == 1 and int(lhs_exact_shape[2]) == int(src_exact_shape[2]))
+            )
+        ):
+            index += 1
+            continue
+        indent = str(alias_match.group("indent"))
+        shape_text = ", ".join(str(v) for v in lhs_exact_shape)
+        lines[index] = f"{indent}{lhs} = torch.reshape({src}, [{shape_text}])"
+        lines[index + 1] = f"{indent}{lhs} = {lhs}"
+        cf_aliases.add(lhs)
+        changed = True
+        index += 3
+    index = 0
+    while index + 5 < len(lines):
+        self_permute_match = self_permute_assign_re.match(lines[index])
+        input_bridge_match = transpose_conv_input_bridge_re.match(lines[index + 1])
+        apply_match = transpose_conv_apply_re.match(lines[index + 2])
+        crop_match = transpose_conv_crop_re.match(lines[index + 3])
+        bias_fix_match = transpose_conv_bias_fix_re.match(lines[index + 4])
+        bias_add_match = transpose_conv_bias_add_re.match(lines[index + 5])
+        if (
+            self_permute_match is None
+            or input_bridge_match is None
+            or apply_match is None
+            or crop_match is None
+            or bias_fix_match is None
+            or bias_add_match is None
+            or str(input_bridge_match.group("src")) != str(self_permute_match.group("lhs"))
+            or str(apply_match.group("input")) != str(input_bridge_match.group("alias"))
+            or str(crop_match.group("src")) != str(apply_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        try:
+            target_values = [int(value.strip()) for value in str(apply_match.group("target")).split(",")]
+            fallback_values = [int(value.strip()) for value in str(apply_match.group("fallback")).split(",")]
+        except Exception:
+            index += 1
+            continue
+        if (
+            len(target_values) != 4
+            or len(fallback_values) != 4
+            or target_values[0] != fallback_values[0]
+            or target_values[-1] != 1
+            or fallback_values[1] != 1
+            or target_values[1] != fallback_values[2]
+            or target_values[2] != fallback_values[3]
+            or str(bias_add_match.group("a")) != str(crop_match.group("lhs"))
+            or str(bias_add_match.group("b")) != str(bias_fix_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        indent = str(apply_match.group("indent"))
+        input_source = str(self_permute_match.group("lhs"))
+        input_alias = str(input_bridge_match.group("alias"))
+        apply_lhs = str(apply_match.group("lhs"))
+        bias_expr = str(bias_fix_match.group("expr"))
+        bias_lhs = str(bias_fix_match.group("lhs"))
+        bias_add_lhs = str(bias_add_match.group("lhs"))
+        fallback_text = ", ".join(str(v) for v in fallback_values)
+        cropped_h = int(crop_match.group("end")) - int(crop_match.group("start"))
+        cropped_w = int(crop_match.group("width"))
+        lines[index] = f"{indent}{input_source} = {input_source}"
+        lines[index + 1] = f"{indent}{input_alias} = {input_source}"
+        lines[index + 2] = (
+            f"{indent}{apply_lhs} = _apply_module_transpose_conv2d("
+            f"{input_alias}, {apply_match.group('prefix')}, "
+            f"target_shape=[{fallback_text}], fallback_shape=[{fallback_text}], "
+            f"target_logical_layout='NCHW', fused='{apply_match.group('fused')}')"
+        )
+        lines[index + 4] = f"{indent}{bias_lhs} = {bias_expr}"
+        lines[index + 5] = (
+            f"{indent}{bias_add_lhs} = _align_tensor_to_target_shape("
+            f"torch.add({bias_add_match.group('a')}, {bias_lhs}), "
+            f"[{fallback_values[0]}, 1, {cropped_h}, {cropped_w}])"
+        )
+        changed = True
+        index += 6
+    index = 0
+    while index + 1 < len(lines):
+        aligned_tensor_match = generic_aligned_tensor_re.match(lines[index])
+        output_back_permute_match = output_back_permute_re.match(lines[index + 1])
+        if (
+            aligned_tensor_match is None
+            or output_back_permute_match is None
+            or str(output_back_permute_match.group("src")) != str(aligned_tensor_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        lhs = str(aligned_tensor_match.group("lhs"))
+        dst = str(output_back_permute_match.group("lhs"))
+        expr = str(aligned_tensor_match.group("expr"))
+        dst_exact_shape = _model_ir_exact_shape(dst)
+        if (
+            dst_exact_shape is None
+            or len(dst_exact_shape) != 4
+            or "_cf" not in expr
+            or not lhs.endswith("_nhwc")
+        ):
+            index += 1
+            continue
+        indent = str(aligned_tensor_match.group("indent"))
+        dst_shape_text = ", ".join(str(v) for v in dst_exact_shape)
+        lines[index] = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{dst_shape_text}])"
+        )
+        lines[index + 1] = f"{indent}{dst} = {lhs}"
+        changed = True
+        index += 2
+    return_tuple_re = re.compile(r"^(?P<indent>\s*)return \((?P<values>[A-Za-z0-9_, ]+)\)$")
+    return_single_re = re.compile(r"^(?P<indent>\s*)return (?P<value>[A-Za-z0-9_]+)$")
+    for index, line in enumerate(lines):
+        return_tuple_match = return_tuple_re.match(line)
+        if return_tuple_match is not None:
+            values = [value.strip() for value in str(return_tuple_match.group("values")).split(",") if value.strip()]
+            rewritten_values = [cf_materialized_alias_sources.get(value, value) for value in values]
+            if rewritten_values != values:
+                lines[index] = f"{return_tuple_match.group('indent')}return ({', '.join(rewritten_values)})"
+                changed = True
+            continue
+        return_single_match = return_single_re.match(line)
+        if return_single_match is not None:
+            value = str(return_single_match.group("value"))
+            rewritten_value = cf_materialized_alias_sources.get(value, value)
+            if rewritten_value != value:
+                lines[index] = f"{return_single_match.group('indent')}return {rewritten_value}"
+                changed = True
+    if len(transposed_const_alias_specs) > 0 or len(inline_const_buffer_specs) > 0:
+        if not any("from typing import" in line and "Mapping" in line for line in lines):
+            for idx, line in enumerate(lines):
+                if line.startswith("from typing import "):
+                    if "Mapping" not in line:
+                        lines[idx] = line.replace("from typing import ", "from typing import Mapping, ")
+                        changed = True
+                    break
+        existing_alias_names = set(buffer_specs.keys())
+        init_constants_start = next((idx for idx, line in enumerate(lines) if line.startswith("    def _init_constants(self) -> None:")), None)
+        if init_constants_start is not None:
+            insert_after = init_constants_start + 1
+            while insert_after < len(lines) and lines[insert_after].startswith("        self.register_buffer("):
+                insert_after += 1
+            alias_init_lines: List[str] = []
+            for alias_attr, (literal, source_dtype) in sorted(inline_const_buffer_specs.items()):
+                if alias_attr in existing_alias_names:
+                    continue
+                alias_init_lines.append(
+                    f"        self.register_buffer('{alias_attr}', torch.tensor({literal}, dtype=torch.{source_dtype}), persistent=False)"
+                )
+                existing_alias_names.add(alias_attr)
+            for alias_attr, (_, alias_shape, source_dtype) in sorted(transposed_const_alias_specs.items()):
+                if alias_attr in existing_alias_names:
+                    continue
+                alias_shape_text = ", ".join(str(v) for v in alias_shape)
+                alias_init_lines.append(
+                    f"        self.register_buffer('{alias_attr}', torch.zeros([{alias_shape_text}], dtype=torch.{source_dtype}), persistent=False)"
+                )
+                existing_alias_names.add(alias_attr)
+            if len(alias_init_lines) > 0:
+                lines[insert_after:insert_after] = alias_init_lines
+                changed = True
+        if len(transposed_const_alias_specs) > 0:
+            refresh_method_name = "_refresh_transposed_constant_buffers"
+            has_refresh_method = any(line.startswith(f"    def {refresh_method_name}(self) -> None:") for line in lines)
+            if not has_refresh_method:
+                insert_index = next((idx for idx, line in enumerate(lines) if line.startswith("    def _forward_stage_0(")), None)
+                if insert_index is not None:
+                    refresh_method_lines = [
+                        f"    def {refresh_method_name}(self) -> None:",
+                        "        with torch.no_grad():",
+                    ]
+                    for alias_attr, (source_attr, _, _) in sorted(transposed_const_alias_specs.items()):
+                        refresh_method_lines.append(
+                            f"            self.{alias_attr}.copy_(self.{source_attr}.transpose(-1, -2))"
+                        )
+                    refresh_method_lines.append("")
+                    lines[insert_index:insert_index] = refresh_method_lines
+                    changed = True
+            refresh_call_line = f"        self.{refresh_method_name}()"
+            if not any(line == refresh_call_line for line in lines):
+                eval_index = next((idx for idx, line in enumerate(lines) if line.strip() == "if eval_mode:"), None)
+                if eval_index is not None:
+                    lines.insert(eval_index, refresh_call_line)
+                    changed = True
+            has_load_state_dict_override = any(line.startswith("    def load_state_dict(") for line in lines)
+            if not has_load_state_dict_override:
+                insert_index = next((idx for idx, line in enumerate(lines) if line.startswith("    def _forward_stage_0(")), None)
+                if insert_index is not None:
+                    load_state_dict_lines = [
+                        "    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):",
+                        "        result = super().load_state_dict(state_dict, strict=strict, assign=assign)",
+                        f"        self.{refresh_method_name}()",
+                        "        return result",
+                        "",
+                    ]
+                    lines[insert_index:insert_index] = load_state_dict_lines
+                    changed = True
+    for index, line in enumerate(lines):
+        generic_alias_match = generic_alias_re.match(line)
+        if generic_alias_match is None:
+            continue
+        lhs = str(generic_alias_match.group("lhs"))
+        rhs = str(generic_alias_match.group("rhs"))
+        reshape_consumer_found = False
+        for lookahead_index in range(index + 1, min(index + 6, len(lines))):
+            candidate_reshape_match = generic_reshape_consumer_re.match(lines[lookahead_index])
+            if candidate_reshape_match is not None and str(candidate_reshape_match.group("input")) == lhs:
+                reshape_consumer_found = True
+                break
+        if not reshape_consumer_found:
+            continue
+        lhs_exact_shape = _model_ir_exact_shape(lhs)
+        lhs_tensor = (
+            model_ir.tensors.get(_resolve_model_ir_tensor_name(lhs), None)
+            if model_ir is not None
+            else None
+        )
+        lhs_layout = (
+            normalize_logical_layout(lhs_tensor.logical_layout)
+            if lhs_tensor is not None
+            else LOGICAL_LAYOUT_UNKNOWN
+        )
+        if (
+            lhs_exact_shape is not None
+            and len(lhs_exact_shape) == 4
+            and is_channel_last_logical_layout(lhs_layout)
+            and (_is_known_cf_name(rhs, set()) or rhs.endswith("_cf") or rhs.endswith("_nhwc_cf"))
+        ):
+            indent = str(generic_alias_match.group("indent"))
+            rewritten_line = (
+                f"{indent}{lhs} = _align_tensor_to_target_shape("
+                f"{rhs}.permute(0, 2, 3, 1).contiguous(), {lhs_exact_shape})"
+            )
+            if rewritten_line != line:
+                lines[index] = rewritten_line
+                changed = True
+            continue
+        if "_nhwc" not in lhs or not (_is_known_cf_name(rhs, set()) or rhs.endswith("_nhwc_cf")):
+            continue
+        rhs_exact_shape = _model_ir_exact_shape(rhs)
+        if rhs_exact_shape is None or len(rhs_exact_shape) != 4:
+            rhs_exact_shape = None
+        indent = str(generic_alias_match.group("indent"))
+        rewritten_line = f"{indent}{lhs} = {rhs}.permute(0, 2, 3, 1).contiguous()"
+        if rewritten_line != line:
+            lines[index] = rewritten_line
+            changed = True
+    if any("_tensor_shape_list(" in line for line in lines):
+        runtime_import_line = "    _tensor_shape_list,"
+        has_runtime_import = any(line.strip() == "_tensor_shape_list," for line in lines)
+        if not has_runtime_import:
+            runtime_import_block_start = next(
+                (idx for idx, line in enumerate(lines) if line.strip() == "from .runtime import ("),
+                None,
+            )
+            runtime_import_block_end = next(
+                (
+                    idx for idx, line in enumerate(lines)
+                    if runtime_import_block_start is not None and idx > runtime_import_block_start and line.strip() == ")"
+                ),
+                None,
+            )
+            if runtime_import_block_end is not None:
+                lines.insert(runtime_import_block_end, runtime_import_line)
+                changed = True
+    orphan_rank3_permute_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 2, 1\]\)$"
+    )
+    square_permuted_const_alias_re = re.compile(
+        r"^\s*self\.(?P<alias>[A-Za-z0-9_]+)\.copy_\("
+        r"self\.(?P<source>[A-Za-z0-9_]+)\.permute\(\*\(0, 1, 3, 2\)\)\.contiguous\(\)\)$"
+    )
+    square_permuted_add_use_re = re.compile(
+        r"(?P<prefix>torch\.add\([^,\n]+,\s*)self\.(?P<alias>[A-Za-z0-9_]+)(?P<suffix>\)\s*)"
+    )
+    square_target_shape_re = re.compile(
+        r"(?:target_shape=)?\[(?P<a>-?\d+),\s*(?P<b>-?\d+),\s*(?P<h>-?\d+),\s*(?P<w>-?\d+)\]"
+    )
+    square_alias_sources: Dict[str, str] = {}
+    for line in lines:
+        square_permuted_const_alias_match = square_permuted_const_alias_re.match(line)
+        if square_permuted_const_alias_match is None:
+            continue
+        square_alias_sources[str(square_permuted_const_alias_match.group("alias"))] = str(
+            square_permuted_const_alias_match.group("source")
+        )
+    if len(square_alias_sources) > 0:
+        for index, line in enumerate(lines):
+            target_shape_match = square_target_shape_re.search(line)
+            if target_shape_match is None:
+                continue
+            if int(target_shape_match.group("h")) != int(target_shape_match.group("w")):
+                continue
+            square_add_use_match = square_permuted_add_use_re.search(line)
+            if square_add_use_match is None:
+                continue
+            alias_name = str(square_add_use_match.group("alias"))
+            source_name = square_alias_sources.get(alias_name, "")
+            if source_name == "":
+                continue
+            rewritten_line = (
+                line[: square_add_use_match.start()]
+                + str(square_add_use_match.group("prefix"))
+                + f"self.{source_name}"
+                + str(square_add_use_match.group("suffix"))
+                + line[square_add_use_match.end() :]
+            )
+            if rewritten_line != line:
+                lines[index] = rewritten_line
+                changed = True
+    for index in range(len(lines) - 1):
+        aligned_resize_input_match = aligned_nhwc_rank4_re.match(lines[index])
+        if aligned_resize_input_match is None:
+            continue
+        resize_cf_match = (
+            apply_resize_cf_re.match(lines[index + 1])
+            or apply_resize_cf_bad_target_re.match(lines[index + 1])
+            or apply_resize_nhwc_re.match(lines[index + 1])
+        )
+        if (
+            resize_cf_match is None
+            or str(resize_cf_match.group("input")) != str(aligned_resize_input_match.group("lhs"))
+            or (
+                _find_same_function_cat_consumer(str(resize_cf_match.group("lhs")), index + 1) is None
+                and _find_stage_boundary_cat_consumer(str(resize_cf_match.group("lhs")), index + 1) is None
+            )
+        ):
+            continue
+        input_exact_shape = _model_ir_exact_shape(str(aligned_resize_input_match.group("lhs")))
+        output_exact_shape = _model_ir_exact_shape(str(resize_cf_match.group("lhs")))
+        resolved_input_name = _resolve_model_ir_tensor_name(str(aligned_resize_input_match.group("lhs")))
+        out_h = int(resize_cf_match.group("out_h"))
+        out_w = int(resize_cf_match.group("out_w"))
+        if (
+            input_exact_shape is None
+            or output_exact_shape is None
+            or len(input_exact_shape) != 4
+            or len(output_exact_shape) != 4
+            or not _tensor_name_suggests_channel_last_layout_for_codegen(resolved_input_name)
+        ):
+            simple_expr_match = simple_binary_expr_re.match(str(aligned_resize_input_match.group("expr")))
+            fallback_cf_shape = None
+            if simple_expr_match is not None:
+                fallback_cf_shape = _find_recent_rank4_shape(str(simple_expr_match.group("a")), index)
+                if fallback_cf_shape is None:
+                    fallback_cf_shape = _find_recent_rank4_shape(str(simple_expr_match.group("b")), index)
+            if fallback_cf_shape is None or len(fallback_cf_shape) != 4:
+                continue
+            n = int(fallback_cf_shape[0])
+            c = int(fallback_cf_shape[1])
+            h = int(fallback_cf_shape[2])
+            w = int(fallback_cf_shape[3])
+        else:
+            n = int(input_exact_shape[0])
+            h = int(input_exact_shape[1])
+            w = int(input_exact_shape[2])
+            c = int(input_exact_shape[3])
+            out_h = int(output_exact_shape[1])
+            out_w = int(output_exact_shape[2])
+        lines[index] = (
+            f"{aligned_resize_input_match.group('indent')}{aligned_resize_input_match.group('lhs')} = "
+            f"_align_tensor_to_target_shape({aligned_resize_input_match.group('expr')}, [{n}, {c}, {h}, {w}])"
+        )
+        lines[index + 1] = (
+            f"{resize_cf_match.group('indent')}{resize_cf_match.group('lhs')} = _apply_resize("
+            f"{aligned_resize_input_match.group('lhs')}, [{out_h}, {out_w}], method='{resize_cf_match.group('method')}', "
+            f"target_shape=[{n}, {c}, {out_h}, {out_w}], "
+            f"align_corners={resize_cf_match.group('align')}, "
+            f"half_pixel_centers={resize_cf_match.group('hpc')}, channel_last=False)"
+        )
+        changed = True
+    pidnet_forced_resize_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\("
+        r"(?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', "
+        r"target_shape=\[[^\]]+\], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?:True|False)\)$"
+    )
+    for index, line in enumerate(lines):
+        pidnet_forced_resize_match = pidnet_forced_resize_re.match(line)
+        if pidnet_forced_resize_match is None:
+            continue
+        lhs = str(pidnet_forced_resize_match.group("lhs"))
+        target_shape = _pidnet_forced_resize_target(lhs)
+        if target_shape is None:
+            continue
+        lines[index] = (
+            f"{pidnet_forced_resize_match.group('indent')}{lhs} = _apply_resize("
+            f"{pidnet_forced_resize_match.group('input')}, "
+            f"[{pidnet_forced_resize_match.group('out_h')}, {pidnet_forced_resize_match.group('out_w')}], "
+            f"method='{pidnet_forced_resize_match.group('method')}', "
+            f"target_shape={target_shape}, "
+            f"align_corners={pidnet_forced_resize_match.group('align')}, "
+            f"half_pixel_centers={pidnet_forced_resize_match.group('hpc')}, channel_last=False)"
+        )
+        changed = True
+    softmax_cf_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?P<input>[A-Za-z0-9_]+), "
+        r"axis=1, beta=(?P<beta>[-0-9.eE]+), target_shape=\[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    for index, line in enumerate(lines):
+        resize_match = (
+            apply_resize_nhwc_re.match(line)
+            or apply_resize_cf_re.match(line)
+            or apply_resize_cf_bad_target_re.match(line)
+        )
+        if resize_match is None:
+            continue
+        resize_lhs = str(resize_match.group("lhs"))
+        consumer_name = resize_lhs
+        consumer_index = index + 1
+        alias_match = (
+            re.fullmatch(
+                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                lines[index + 1],
+            )
+            if index + 1 < len(lines)
+            else None
+        )
+        if alias_match is not None and str(alias_match.group("src")) == resize_lhs:
+            consumer_name = str(alias_match.group("lhs"))
+            consumer_index = index + 2
+        binary_consumer_match = (
+            binary_cf_consumer_re.match(lines[consumer_index])
+            if consumer_index < len(lines)
+            else None
+        )
+        if (
+            binary_consumer_match is not None
+            and consumer_name in {
+                str(binary_consumer_match.group("a")),
+                str(binary_consumer_match.group("b")),
+            }
+        ):
+            n = int(binary_consumer_match.group("n"))
+            c = int(binary_consumer_match.group("c"))
+            h = int(binary_consumer_match.group("h"))
+            w = int(binary_consumer_match.group("w"))
+            lines[index] = (
+                f"{resize_match.group('indent')}{resize_lhs} = _apply_resize("
+                f"{resize_match.group('input')}, [{resize_match.group('out_h')}, {resize_match.group('out_w')}], "
+                f"method='{resize_match.group('method')}', "
+                f"target_shape=[{n}, {c}, {h}, {w}], "
+                f"align_corners={resize_match.group('align')}, "
+                f"half_pixel_centers={resize_match.group('hpc')}, channel_last=False)"
+            )
+            cf_aliases.add(resize_lhs)
+            if consumer_name != resize_lhs:
+                cf_aliases.add(consumer_name)
+            changed = True
+            continue
+        softmax_cf_match = (
+            softmax_cf_re.match(lines[consumer_index])
+            if consumer_index < len(lines)
+            else None
+        )
+        if softmax_cf_match is not None and str(softmax_cf_match.group("input")) == consumer_name:
+            n = int(softmax_cf_match.group("n"))
+            c = int(softmax_cf_match.group("c"))
+            h = int(softmax_cf_match.group("h"))
+            w = int(softmax_cf_match.group("w"))
+            lines[index] = (
+                f"{resize_match.group('indent')}{resize_lhs} = _apply_resize("
+                f"{resize_match.group('input')}, [{resize_match.group('out_h')}, {resize_match.group('out_w')}], "
+                f"method='{resize_match.group('method')}', "
+                f"target_shape=[{n}, {c}, {h}, {w}], "
+                f"align_corners={resize_match.group('align')}, "
+                f"half_pixel_centers={resize_match.group('hpc')}, channel_last=False)"
+            )
+            cf_aliases.add(resize_lhs)
+            if consumer_name != resize_lhs:
+                cf_aliases.add(consumer_name)
+            changed = True
+    for index, line in enumerate(lines):
+        resize_argmax_match = (
+            apply_resize_nhwc_re.match(line)
+            or apply_resize_cf_re.match(line)
+            or apply_resize_cf_bad_target_re.match(line)
+        )
+        if resize_argmax_match is None:
+            continue
+        input_name = str(resize_argmax_match.group("input"))
+        if not (_is_known_cf_name(input_name, singleton_cf_vars) or input_name.endswith("_nhwc_cf")):
+            continue
+        alias_match = (
+            re.fullmatch(
+                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                lines[index + 1],
+            )
+            if index + 1 < len(lines)
+            else None
+        )
+        argmax_index = index + 1
+        if alias_match is not None and str(alias_match.group("src")) == str(resize_argmax_match.group("lhs")):
+            argmax_index = index + 2
+        if argmax_index >= len(lines):
+            continue
+        argmax_match = argmax_re.match(lines[argmax_index])
+        if (
+            argmax_match is None
+            or (
+                str(argmax_match.group("input")) != str(resize_argmax_match.group("lhs"))
+                and (
+                    alias_match is None
+                    or str(argmax_match.group("input")) != str(alias_match.group("lhs"))
+                )
+            )
+        ):
+            continue
+        channel_count = _infer_cf_channel_count(input_name)
+        if channel_count is None:
+            channel_count = int(resize_argmax_match.group("c"))
+        lines[index] = (
+            f"{resize_argmax_match.group('indent')}{resize_argmax_match.group('lhs')} = _apply_resize("
+            f"{input_name}, [{resize_argmax_match.group('out_h')}, {resize_argmax_match.group('out_w')}], "
+            f"method='{resize_argmax_match.group('method')}', "
+            f"target_shape=[{resize_argmax_match.group('n')}, {channel_count}, "
+            f"{resize_argmax_match.group('out_h')}, {resize_argmax_match.group('out_w')}], "
+            f"align_corners={resize_argmax_match.group('align')}, "
+            f"half_pixel_centers={resize_argmax_match.group('hpc')}, channel_last=False)"
+        )
+        lines[argmax_index] = (
+            f"{argmax_match.group('indent')}{argmax_match.group('lhs')} = "
+            f"torch.argmax({argmax_match.group('input')}, "
+            f"dim=_normalize_dim(1, {argmax_match.group('input')}.ndim), "
+            f"keepdim={argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+        )
+        changed = True
+    pidnet_forced_scale4_mul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
+        r"self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\), \[1, 1, 512, 1\]\)$"
+    )
+    pidnet_forced_scale4_add_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_add), \[1, 1, 1, 512\]\)$"
+    )
+    for index, line in enumerate(lines):
+        pidnet_forced_scale4_mul_match = pidnet_forced_scale4_mul_re.match(line)
+        if pidnet_forced_scale4_mul_match is not None:
+            lines[index] = (
+                f"{pidnet_forced_scale4_mul_match.group('indent')}{pidnet_forced_scale4_mul_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_forced_scale4_mul_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_forced_scale4_mul_match.group('const_attr')}, [1, 512, 1, 1])), [1, 512, 1, 1])"
+            )
+            changed = True
+            continue
+        pidnet_forced_scale4_add_match = pidnet_forced_scale4_add_re.match(line)
+        if pidnet_forced_scale4_add_match is not None:
+            lines[index] = (
+                f"{pidnet_forced_scale4_add_match.group('indent')}{pidnet_forced_scale4_add_match.group('lhs0')}, "
+                f"{pidnet_forced_scale4_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+                f"{pidnet_forced_scale4_add_match.group('input')}, "
+                f"torch.reshape(self.{pidnet_forced_scale4_add_match.group('const_attr')}, [1, 512, 1, 1]), "
+                f"[1, 512, 1, 1])"
+            )
+            changed = True
+    function_def_re = re.compile(
+        r"^\s*def\s+[A-Za-z0-9_]+\((?P<params>[^\)]*)\):$"
+    )
+    current_function_assigned: set[str] = set()
+    current_function_defined: set[str] = set()
+    for index, line in enumerate(lines):
+        if line.startswith("    def "):
+            current_function_assigned = set()
+            current_function_defined = set()
+            function_def_match = function_def_re.match(line)
+            if function_def_match is not None:
+                raw_params = str(function_def_match.group("params"))
+                for raw_param in raw_params.split(","):
+                    param = str(raw_param).strip()
+                    if param == "":
+                        continue
+                    param_name = param.split(":", 1)[0].split("=", 1)[0].strip()
+                    if param_name != "":
+                        current_function_defined.add(param_name)
+            continue
+        orphan_rank3_permute_match = orphan_rank3_permute_re.match(line)
+        if orphan_rank3_permute_match is not None:
+            src = str(orphan_rank3_permute_match.group("src"))
+            alias_source = generic_alias_sources.get(src, "")
+            if (
+                src not in current_function_defined
+                and alias_source != ""
+            ):
+                lhs = str(orphan_rank3_permute_match.group("lhs"))
+                indent = str(orphan_rank3_permute_match.group("indent"))
+                if _is_known_cf_name(alias_source, singleton_cf_vars):
+                    lines[index] = f"{indent}{lhs} = {alias_source}"
+                else:
+                    lines[index] = (
+                        f"{indent}{lhs} = _torch_permute({alias_source}, [0, 2, 1])"
+                    )
+                changed = True
+        generic_assign_match = re.match(r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=", lines[index])
+        if generic_assign_match is not None:
+            assigned_name = str(generic_assign_match.group("lhs"))
+            current_function_assigned.add(assigned_name)
+            current_function_defined.add(assigned_name)
+    if changed:
+        model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rewrite_generated_model_source_for_exported_program(
+    package_path: Path,
+    model_ir: ModelIR | None = None,
+) -> None:
+    _canonicalize_generated_model_source_for_raw_export(package_path, model_ir=model_ir)
 
 
 def _build_tflite_backed_metadata_payload(
@@ -14814,7 +21962,9 @@ def _torch_pad_literal_for_constant_tensor(
 ) -> Optional[str]:
     if tensor is None or tensor.data is None:
         return None
-    pads = np.asarray(tensor.data).astype(np.int64).reshape(-1, 2).tolist()
+    pads = _normalize_constant_pad_pairs(np.asarray(tensor.data))
+    if pads is None:
+        return None
     if axis_permutation is not None:
         perm = [int(v) for v in list(axis_permutation)]
         if len(perm) == len(pads):
@@ -14860,22 +22010,11 @@ def _constant_int_list(tensor: Optional[TensorIR]) -> Optional[List[int]]:
 def _preferred_reshape_target_values(tensor: Optional[TensorIR]) -> Optional[List[int]]:
     if tensor is None:
         return None
+    preferred = [int(v) for v in list(tensor.shape)]
     if tensor.shape_signature is not None:
         signature = [int(v) for v in list(tensor.shape_signature)]
         if len(signature) == len(list(tensor.shape)) and any(int(v) <= 0 for v in signature):
             preferred = signature
-            rank = len(list(preferred))
-            perm_to_cf = _perm_cl_to_cf(rank)
-            if (
-                perm_to_cf is not None
-                and is_channel_first_logical_layout(normalize_logical_layout(tensor.logical_layout))
-                and _tensor_name_suggests_channel_last_layout_for_codegen(str(tensor.name))
-            ):
-                permuted = _permute_shape(preferred, perm_to_cf)
-                if permuted is not None:
-                    return [int(v) for v in list(permuted)]
-            return preferred
-    preferred = [int(v) for v in list(tensor.shape)]
     rank = len(list(preferred))
     perm_to_cf = _perm_cl_to_cf(rank)
     if (
@@ -14886,6 +22025,22 @@ def _preferred_reshape_target_values(tensor: Optional[TensorIR]) -> Optional[Lis
         permuted = _permute_shape(preferred, perm_to_cf)
         if permuted is not None:
             return [int(v) for v in list(permuted)]
+    return preferred
+
+
+def _preferred_reshape_target_values_for_op(
+    *,
+    model_ir: ModelIR,
+    op: OperatorIR,
+) -> Optional[List[int]]:
+    if str(op.op_type) != "RESHAPE" or len(op.inputs) == 0 or len(op.outputs) == 0:
+        return None
+    output_tensor = model_ir.tensors.get(str(op.outputs[0]), None)
+    if output_tensor is None:
+        return None
+    preferred = _preferred_reshape_target_values(output_tensor)
+    if preferred is None:
+        preferred = [int(v) for v in list(output_tensor.shape)]
     return preferred
 
 
@@ -15445,6 +22600,8 @@ def _write_generated_package_common_files(
     package_dir = Path(output_folder_path)
     package_dir.mkdir(parents=True, exist_ok=True)
     (package_dir / "__init__.py").write_text(
+        "import logging\n"
+        "logging.getLogger('torch.onnx._internal.exporter._registration').setLevel(logging.ERROR)\n"
         "from .model import Model, load_model\n",
         encoding="utf-8",
     )
@@ -15465,8 +22622,10 @@ def _write_wrapper_model_file(output_folder_path: str) -> None:
         "# pyright: reportArgumentType=false, reportCallIssue=false\n"
         "from __future__ import annotations\n\n"
         "from typing import Any, Callable, cast\n\n"
+        "import logging\n"
         "from pathlib import Path\n\n"
         "import torch\n\n"
+        "logging.getLogger('torch.onnx._internal.exporter._registration').setLevel(logging.ERROR)\n\n"
         "from .runtime import load_generated_model_package\n\n"
         "PACKAGE_DIR = Path(__file__).resolve().parent\n\n"
         "class Model(torch.nn.Module):\n"
@@ -16306,6 +23465,10 @@ def export_pytorch_package_from_model_ir(
                 model_ir=normalized,
                 metadata=metadata,
                 tensor_storage_name_map=tensor_storage_name_map,
+            )
+            _canonicalize_generated_model_source_for_raw_export(
+                Path(output_folder_path),
+                model_ir=normalized,
             )
         except ModelIRPyTorchExportError as ex:
             if not _is_direct_codegen_unsupported_error(ex):
