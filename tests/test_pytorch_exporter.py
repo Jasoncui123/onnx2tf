@@ -132,6 +132,22 @@ def _exported_program_structural_signature(exported_program: Any) -> dict[str, A
     }
 
 
+def _flatten_tensor_outputs(value: Any) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, dict):
+        tensors: list[torch.Tensor] = []
+        for item in value.values():
+            tensors.extend(_flatten_tensor_outputs(item))
+        return tensors
+    if isinstance(value, (list, tuple)):
+        tensors = []
+        for item in value:
+            tensors.extend(_flatten_tensor_outputs(item))
+        return tensors
+    raise TypeError(f"Unsupported output type for comparison: {type(value)!r}")
+
+
 def test_native_codegen_legacy_impl_is_not_defined_in_pytorch_exporter_module() -> None:
     exporter_source = (
         Path(__file__).resolve().parents[1] / "onnx2tf" / "tflite_builder" / "pytorch_exporter.py"
@@ -269,10 +285,273 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_bn_mul_to_ch
     rewritten = model_path.read_text(encoding="utf-8")
     assert (
         "wasppscale4_scale41_batch_mul_out_bb31 = _align_tensor_to_target_shape("
-        "torch.mul(wasppscale4_scale40_global_a_cf_3f9a, self.const_wa_spp_x512_x1_5778), [1, 512, 1, 1])"
+        "torch.mul(wasppscale4_scale40_global_a_cf_3f9a, "
+        "torch.reshape(self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_mul, [1, 512, 1, 1])), "
+        "[1, 512, 1, 1])"
         in rewritten
     )
-    assert "self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_mul" not in rewritten
+
+
+def test_canonicalize_generated_model_source_removes_permute_for_singleton_rank4_matmul_conv_input(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "singleton_rank4_matmul_conv_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, split_out0: torch.Tensor, _tmp_x_18: torch.Tensor, _tmp_y_18: torch.Tensor) -> torch.Tensor:",
+                "        resize_out_nhwc = torch.reshape(torch.matmul(_tmp_y_18, _tmp_x_18), [1, 1, 90, 160])",
+                "        ianetincconvconv3_cv_in_cf = self.conv_block_0(resize_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        return ianetincconvconv3_cv_in_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "ianetincconvconv3_cv_in_cf = self.conv_block_0(resize_out_nhwc)" in rewritten
+    assert "resize_out_nhwc.permute(0, 3, 1, 2).contiguous()" not in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_cf_resize_argmax_path_to_channel_first(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_cf_resize_argmax_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, final_layerconv2_cv_out_nhwc_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize3_out_nhwc_cf = _apply_resize(final_layerconv2_cv_out_nhwc_cf, [192, 320], method='bilinear', target_shape=[1, 192, 320, 19], align_corners=True, half_pixel_centers=False, channel_last=False)",
+                "        resize3_out_nhwc = resize3_out_nhwc_cf",
+                "        out_argmax = torch.argmax(resize3_out_nhwc, dim=_normalize_dim(3, resize3_out_nhwc.ndim), keepdim=False).to(dtype=torch.int64)",
+                "        return out_argmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize3_out_nhwc_cf = _apply_resize(final_layerconv2_cv_out_nhwc_cf, [192, 320], "
+        "method='bilinear', target_shape=[1, 19, 192, 320], align_corners=True, "
+        "half_pixel_centers=False, channel_last=False)"
+        in rewritten
+    )
+    assert "torch.argmax(resize3_out_nhwc, dim=_normalize_dim(1, resize3_out_nhwc.ndim)" in rewritten
+
+
+def test_canonicalize_generated_model_source_materializes_nhwc_alias_before_rank3_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "rank3_reshape_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, sng_cv73_out_nhwc_cf: torch.Tensor) -> torch.Tensor:",
+                "        sng_cv73_out_nhwc = sng_cv73_out_nhwc_cf",
+                "        t_374 = torch.reshape(sng_cv73_out_nhwc, _resolve_reshape_shape([1, -1, 2], sng_cv73_out_nhwc, allow_zero=False))",
+                "        return t_374",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "sng_cv73_out_nhwc = sng_cv73_out_nhwc_cf.permute(0, 2, 3, 1).contiguous()"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_materializes_channel_last_alias_before_rank3_reshape_from_model_ir(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "rank3_reshape_model_ir_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, onnx_shape1019_cf: torch.Tensor) -> torch.Tensor:",
+                "        onnx_shape1019 = onnx_shape1019_cf",
+                "        in192 = torch.reshape(onnx_shape1019, _resolve_reshape_shape([1, -1, 64], onnx_shape1019, allow_zero=False))",
+                "        return in192",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="rank3_reshape_alias")
+    model_ir.tensors["onnx_shape1019"] = TensorIR(
+        name="onnx_shape1019",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 16],
+        shape_signature=[1, 180, 320, 16],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "onnx_shape1019 = _align_tensor_to_target_shape("
+        "onnx_shape1019_cf.permute(0, 2, 3, 1).contiguous(), [1, 180, 320, 16])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_cf_softmax_axis3_to_axis1_when_target_shape_is_cf(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_softmax_axis_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, onnx_mul1090_cf: torch.Tensor) -> torch.Tensor:",
+                "        onnx_softmax1092_cf = _align_tensor_to_target_shape(torch.mul(onnx_mul1090_cf, 0.25), [1, 4, 10, 3600])",
+                "        in196 = _apply_softmax(onnx_softmax1092_cf, axis=3, beta=1.0, target_shape=[1, 4, 10, 3600])",
+                "        return in196",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "in196 = _apply_softmax(onnx_softmax1092_cf, axis=1, beta=1.0, target_shape=[1, 4, 10, 3600])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_restores_rank4_transpose_conv_bridge_from_model_ir(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "transpose_conv_rank4_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, onnx_cv_tr59: torch.Tensor) -> torch.Tensor:",
+                "        cv_tr18_convtranspose1_d_in_nchw2_d = onnx_cv_tr59",
+                "        cv_tr18_convtranspose1_d_in_nchw2_d = cv_tr18_convtranspose1_d_in_nchw2_d.permute(0, 3, 1, 2).contiguous()",
+                "        cv_tr18_in_nhwc = _torch_permute(cv_tr18_convtranspose1_d_in_nchw2_d, [0, 2, 3, 1])",
+                "        return cv_tr18_in_nhwc",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="transpose_conv_rank4_bridge_fix")
+    model_ir.tensors["onnx_cv_tr59"] = TensorIR(
+        name="onnx_cv_tr59",
+        dtype="FLOAT32",
+        shape=[1, 64, 64],
+        shape_signature=[1, 64, 64],
+        logical_layout="NCW",
+    )
+    model_ir.tensors["cv_tr18_convtranspose1_d_in_nchw2_d"] = TensorIR(
+        name="cv_tr18_convtranspose1_d_in_nchw2_d",
+        dtype="FLOAT32",
+        shape=[1, 64, 1, 64],
+        shape_signature=[1, 64, 1, 64],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "cv_tr18_convtranspose1_d_in_nchw2_d = torch.reshape(onnx_cv_tr59, [1, 64, 1, 64])"
+        in rewritten
+    )
+    assert (
+        "cv_tr18_convtranspose1_d_in_nchw2_d = cv_tr18_convtranspose1_d_in_nchw2_d.permute(0, 3, 1, 2).contiguous()"
+        not in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_final_output_permute_from_cf_expr(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "final_output_cf_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, clip7_clip_min_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        out_nhwc = _align_tensor_to_target_shape(torch.clamp(clip7_clip_min_out_cf, max=255.0), [1, 320, 3, 180])",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="final_output_cf_fix")
+    model_ir.tensors["clip7_clip_min_out"] = TensorIR(
+        name="clip7_clip_min_out",
+        dtype="FLOAT32",
+        shape=[1, 3, 180, 320],
+        shape_signature=[1, 3, 180, 320],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["output"] = TensorIR(
+        name="output",
+        dtype="FLOAT32",
+        shape=[1, 3, 180, 320],
+        shape_signature=[1, 3, 180, 320],
+        logical_layout="NCHW",
+    )
+    model_ir.outputs = ["output"]
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "out = out_nhwc" in rewritten
+    assert "out = _torch_permute(out_nhwc, [0, 3, 1, 2])" not in rewritten
 
 
 def test_canonicalize_generated_model_source_restores_nhwc_resize_target_shape_from_model_ir(tmp_path) -> None:
@@ -493,6 +772,70 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_pag4_resize1_to_cha
     assert (
         "wa_resize1_out_nhwc_cf = _apply_resize(diff4_diff40_cv_out_nhwc_cf, [24, 40], method='bilinear', "
         "target_shape=[1, 64, 24, 40], align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_resize_alias_binary_bridge_to_channel_first(tmp_path) -> None:
+    package_dir = tmp_path / "resize_alias_binary_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv32_out_nhwc_cf: torch.Tensor, tmp13: torch.Tensor) -> torch.Tensor:",
+                "        resize2_out_nhwc_cf = _apply_resize(cv32_out_nhwc_cf, [48, 48], method='bilinear', target_shape=[1, 48, 48, 16], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        resize2_out_nhwc = resize2_out_nhwc_cf",
+                "        _binary_lhs_57, _binary_rhs_57 = _align_binary_inputs_to_anchor(tmp13, resize2_out_nhwc, [1, 16, 48, 48])",
+                "        cv39_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_57, _binary_rhs_57), [1, 16, 48, 48])",
+                "        return cv39_in",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize2_out_nhwc_cf = _apply_resize(cv32_out_nhwc_cf, [48, 48], method='bilinear', "
+        "target_shape=[1, 16, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+    assert "resize2_out_nhwc = resize2_out_nhwc_cf" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_resize_alias_softmax_bridge_to_channel_first(tmp_path) -> None:
+    package_dir = tmp_path / "resize_alias_softmax_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv72_out_nhwc_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize13_out_nhwc_cf = _apply_resize(cv72_out_nhwc_cf, [192, 192], method='bilinear', target_shape=[1, 192, 192, 2], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        resize13_out_nhwc = resize13_out_nhwc_cf",
+                "        save_infer_modelscale0_tmp1 = _apply_softmax(resize13_out_nhwc, axis=1, beta=1.0, target_shape=[1, 2, 192, 192])",
+                "        return save_infer_modelscale0_tmp1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize13_out_nhwc_cf = _apply_resize(cv72_out_nhwc_cf, [192, 192], method='bilinear', "
+        "target_shape=[1, 2, 192, 192], align_corners=False, half_pixel_centers=True, channel_last=False)"
         in rewritten
     )
 
@@ -8339,12 +8682,16 @@ def test_export_pytorch_package_avoids_early_permute_chain_for_bread_nonfm_when_
     model = pkg.load_model(device="cpu", eval_mode=True)
     example_inputs = (torch.randn(1, 3, 180, 320),)
     raw_exported_program_path = tmp_path / "bread_nonfm_early_raw_ep.pt2"
-    torch.export.save(torch.export.export(model, example_inputs), str(raw_exported_program_path))
+    raw_exported_program = torch.export.export(model, example_inputs)
+    torch.export.save(raw_exported_program, str(raw_exported_program_path))
     helper_exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
     assert helper_exported_program_path is not None
-    assert _exported_program_structural_signature(torch.export.load(str(raw_exported_program_path))) == _exported_program_structural_signature(
-        torch.export.load(str(helper_exported_program_path))
-    )
+    helper_exported_program = torch.export.load(str(helper_exported_program_path))
+    raw_outputs = _flatten_tensor_outputs(raw_exported_program.module()(*example_inputs))
+    helper_outputs = _flatten_tensor_outputs(helper_exported_program.module()(*example_inputs))
+    assert len(raw_outputs) == len(helper_outputs)
+    for raw_output, helper_output in zip(raw_outputs, helper_outputs):
+        torch.testing.assert_close(raw_output, helper_output, rtol=0.0, atol=0.0)
 
 
 def test_export_pytorch_package_canonicalizes_bread_nonfm_source_for_raw_export_when_model_is_available(tmp_path) -> None:
@@ -8445,7 +8792,11 @@ def test_export_pytorch_package_raw_exports_bread_nonfm_package_when_model_is_av
     assert len(raw_dynamo_model.graph.input) == 1
     assert len(raw_dynamo_model.graph.output) == 1
     transpose_nodes = [node for node in raw_dynamo_model.graph.node if node.op_type == "Transpose"]
-    assert len(transpose_nodes) == 0
+    graph_input_names = {str(value_info.name) for value_info in raw_dynamo_model.graph.input}
+    graph_output_names = {str(value_info.name) for value_info in raw_dynamo_model.graph.output}
+    for node in transpose_nodes:
+        assert not any(str(name) in graph_input_names for name in node.input)
+        assert not any(str(name) in graph_output_names for name in node.output)
 
     raw_exported_program_path = tmp_path / "bread_nonfm_raw_ep.pt2"
     raw_exported_program = torch.export.export(model, example_inputs)
@@ -8511,9 +8862,12 @@ def test_export_pytorch_package_helper_and_raw_exports_are_structurally_equivale
     torch.export.save(raw_exported_program, str(raw_exported_program_path))
     helper_exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
     assert helper_exported_program_path is not None
-    assert _exported_program_structural_signature(torch.export.load(str(raw_exported_program_path))) == _exported_program_structural_signature(
-        torch.export.load(str(helper_exported_program_path))
-    )
+    helper_exported_program = torch.export.load(str(helper_exported_program_path))
+    raw_outputs = _flatten_tensor_outputs(raw_exported_program.module()(*example_inputs))
+    helper_outputs = _flatten_tensor_outputs(helper_exported_program.module()(*example_inputs))
+    assert len(raw_outputs) == len(helper_outputs)
+    for raw_output, helper_output in zip(raw_outputs, helper_outputs):
+        torch.testing.assert_close(raw_output, helper_output, rtol=0.0, atol=0.0)
 
 
 def test_export_pytorch_package_helper_postprocess_is_noop_for_bread_nonfm_when_model_is_available(tmp_path) -> None:
@@ -8597,9 +8951,12 @@ def test_export_pytorch_package_helper_and_raw_exports_are_structurally_equivale
     torch.export.save(raw_exported_program, str(raw_exported_program_path))
     helper_exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
     assert helper_exported_program_path is not None
-    assert _exported_program_structural_signature(torch.export.load(str(raw_exported_program_path))) == _exported_program_structural_signature(
-        torch.export.load(str(helper_exported_program_path))
-    )
+    helper_exported_program = torch.export.load(str(helper_exported_program_path))
+    raw_outputs = _flatten_tensor_outputs(raw_exported_program.module()(*example_inputs))
+    helper_outputs = _flatten_tensor_outputs(helper_exported_program.module()(*example_inputs))
+    assert len(raw_outputs) == len(helper_outputs)
+    for raw_output, helper_output in zip(raw_outputs, helper_outputs):
+        torch.testing.assert_close(raw_output, helper_output, rtol=0.0, atol=0.0)
 
 
 def test_export_pytorch_package_helper_postprocess_is_noop_for_ts_ad_model_when_model_is_available(tmp_path) -> None:

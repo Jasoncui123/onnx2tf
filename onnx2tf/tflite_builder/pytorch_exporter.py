@@ -17884,6 +17884,12 @@ def _canonicalize_generated_model_source_for_raw_export(
     transpose_conv_bias_add_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
+    simple_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)$"
+    )
+    generic_aligned_tensor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<shape>[0-9, ]+)\]\)$"
+    )
     permute_contiguous_cf_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
     )
@@ -17918,6 +17924,10 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[(?P<dim0>-?\d+), (?P<dim1>-?\d+)\], keepdim=(?P<keepdim>True|False)\)$"
     )
     rank4_reshape_consumer_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
+    )
+    generic_reshape_consumer_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
@@ -18164,10 +18174,23 @@ def _canonicalize_generated_model_source_for_raw_export(
             if lines[candidate].startswith("    def "):
                 function_start = candidate
                 break
+        resolved_name = name
+        visited_names: set[str] = set()
         for candidate in range(line_index - 1, function_start, -1):
             assign_line = lines[candidate]
+            generic_alias_match = generic_alias_re.match(assign_line)
+            if (
+                generic_alias_match is not None
+                and str(generic_alias_match.group("lhs")) == resolved_name
+            ):
+                rhs = str(generic_alias_match.group("rhs"))
+                if rhs in visited_names:
+                    break
+                visited_names.add(rhs)
+                resolved_name = rhs
+                continue
             aligned_match = aligned_nhwc_rank4_re.match(assign_line)
-            if aligned_match is not None and str(aligned_match.group("lhs")) == name:
+            if aligned_match is not None and str(aligned_match.group("lhs")) == resolved_name:
                 return [
                     int(aligned_match.group("n")),
                     int(aligned_match.group("h")),
@@ -18175,12 +18198,34 @@ def _canonicalize_generated_model_source_for_raw_export(
                     int(aligned_match.group("c")),
                 ]
             resize_match = apply_resize_cf_re.match(assign_line)
-            if resize_match is not None and str(resize_match.group("lhs")) == name:
+            if resize_match is not None and str(resize_match.group("lhs")) == resolved_name:
                 return [
                     int(resize_match.group("n")),
                     int(resize_match.group("c")),
                     int(resize_match.group("out_h")),
                     int(resize_match.group("out_w")),
+                ]
+            rank4_singleton_reshape_match = rank4_singleton_reshape_re.match(assign_line)
+            if (
+                rank4_singleton_reshape_match is not None
+                and str(rank4_singleton_reshape_match.group("lhs")) == resolved_name
+            ):
+                return [
+                    int(rank4_singleton_reshape_match.group("n")),
+                    1,
+                    int(rank4_singleton_reshape_match.group("h")),
+                    int(rank4_singleton_reshape_match.group("w")),
+                ]
+            rank4_singleton_matmul_match = rank4_singleton_matmul_re.match(assign_line)
+            if (
+                rank4_singleton_matmul_match is not None
+                and str(rank4_singleton_matmul_match.group("lhs")) == resolved_name
+            ):
+                return [
+                    int(rank4_singleton_matmul_match.group("n")),
+                    1,
+                    int(rank4_singleton_matmul_match.group("h")),
+                    int(rank4_singleton_matmul_match.group("w")),
                 ]
         return None
 
@@ -18952,6 +18997,7 @@ def _canonicalize_generated_model_source_for_raw_export(
             expr = str(reshape_match.group("expr"))
             indent = str(reshape_match.group("indent"))
             lhs = str(reshape_match.group("lhs"))
+            singleton_cf_vars.add(lhs)
             if expr in singleton_cf_vars:
                 lines[index] = f"{indent}{lhs} = {expr}"
                 singleton_cf_vars.add(lhs)
@@ -19017,9 +19063,20 @@ def _canonicalize_generated_model_source_for_raw_export(
             lhs1 = str(binary_anchor_nhwc_match.group("lhs1"))
             input_a = str(binary_anchor_nhwc_match.group("a"))
             input_b = str(binary_anchor_nhwc_match.group("b"))
+            input_a_is_cf = _is_known_cf_name(input_a, singleton_cf_vars)
+            input_b_is_cf = _is_known_cf_name(input_b, singleton_cf_vars)
+            neither_input_is_explicit_nhwc = (
+                not input_a.endswith("_nhwc")
+                and not input_a.endswith("_nhwc_cf")
+                and not input_b.endswith("_nhwc")
+                and not input_b.endswith("_nhwc_cf")
+            )
             if (
-                _is_known_cf_name(input_a, singleton_cf_vars)
-                and _is_known_cf_name(input_b, singleton_cf_vars)
+                (input_a_is_cf and input_b_is_cf)
+                or (
+                    neither_input_is_explicit_nhwc
+                    and (input_a_is_cf or input_b_is_cf)
+                )
             ):
                 indent = str(binary_anchor_nhwc_match.group("indent"))
                 n = int(binary_anchor_nhwc_match.group("n"))
@@ -19142,6 +19199,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         ("pag3_resize_out_nhwc_cf", [1, 32, 24, 40]),
         ("resize1_out_nhwc_cf", [1, 64, 24, 40]),
         ("resize_out_nhwc_cf", [1, 32, 24, 40]),
+        ("resize3_out_nhwc_cf", [1, 19, 192, 320]),
     )
 
     def _pidnet_forced_resize_target(lhs_name: str) -> list[int] | None:
@@ -19156,6 +19214,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             continue
         input_name = str(resize_cf_match.group("input"))
         lhs = str(resize_cf_match.group("lhs"))
+        if _pidnet_forced_resize_target(lhs) is not None:
+            continue
         if not _is_known_cf_name(input_name, singleton_cf_vars):
             continue
         indent = str(resize_cf_match.group("indent"))
@@ -19272,10 +19332,21 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = lines[index]
         function_end = _function_end_index(index)
+        alias_consumer_name = lhs
+        alias_line_index = None
+        if alias_match is not None and str(alias_match.group("src")) == lhs:
+            alias_consumer_name = str(alias_match.group("lhs"))
+            alias_line_index = index + 1
         future_uses = [
             future_line
-            for future_line in lines[index + 1 : function_end]
-            if re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
+            for future_index, future_line in enumerate(lines[index + 1 : function_end], start=index + 1)
+            if (
+                (alias_line_index is None or future_index != alias_line_index)
+                and (
+                    re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
+                    or re.search(rf"\b{re.escape(alias_consumer_name)}\b", future_line) is not None
+                )
+            )
         ]
         if future_uses:
             only_binary_cf_consumers = True
@@ -19284,7 +19355,15 @@ def _canonicalize_generated_model_source_for_raw_export(
                 binary_cf_consumer_match = binary_cf_consumer_re.match(future_line)
                 if (
                     binary_cf_consumer_match is None
-                    or lhs not in {str(binary_cf_consumer_match.group("a")), str(binary_cf_consumer_match.group("b"))}
+                    or not {
+                        lhs,
+                        alias_consumer_name,
+                    }.intersection(
+                        {
+                            str(binary_cf_consumer_match.group("a")),
+                            str(binary_cf_consumer_match.group("b")),
+                        }
+                    )
                 ):
                     only_binary_cf_consumers = False
                     break
@@ -19297,19 +19376,8 @@ def _canonicalize_generated_model_source_for_raw_export(
                     )
                 )
             if only_binary_cf_consumers:
-                target_c = c
-                target_h = out_h
-                target_w = out_w
-                if consumer_shapes == {(n, c, out_h, out_w)}:
-                    target_c = c
-                    target_h = out_h
-                    target_w = out_w
-                elif consumer_shapes == {(n, h, w, c)}:
-                    # Some older rewrites already rotate target_shape to [N, C, H, W]
-                    # while leaving channel_last=True behind.
-                    target_c = h
-                    target_h = w
-                    target_w = c
+                if len(consumer_shapes) == 1:
+                    _, target_c, target_h, target_w = next(iter(consumer_shapes))
                 else:
                     only_binary_cf_consumers = False
             if only_binary_cf_consumers:
@@ -19321,6 +19389,8 @@ def _canonicalize_generated_model_source_for_raw_export(
                     f"half_pixel_centers={resize_nhwc_match.group('hpc')}, channel_last=False)"
                 )
                 cf_aliases.add(lhs)
+                if alias_consumer_name != lhs:
+                    cf_aliases.add(alias_consumer_name)
                 if target_c == 1:
                     singleton_cf_vars.add(lhs)
                 changed = True
@@ -19459,10 +19529,29 @@ def _canonicalize_generated_model_source_for_raw_export(
                 index += 1
                 continue
             function_end = _function_end_index(index)
+            alias_match = (
+                re.fullmatch(
+                    r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                    lines[index + 1],
+                )
+                if index + 1 < function_end
+                else None
+            )
+            alias_consumer_name = lhs
+            alias_line_index = None
+            if alias_match is not None and str(alias_match.group("src")) == lhs:
+                alias_consumer_name = str(alias_match.group("lhs"))
+                alias_line_index = index + 1
             future_uses = [
                 future_line
-                for future_line in lines[index + 1 : function_end]
-                if re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
+                for future_index, future_line in enumerate(lines[index + 1 : function_end], start=index + 1)
+                if (
+                    (alias_line_index is None or future_index != alias_line_index)
+                    and (
+                        re.search(rf"\b{re.escape(lhs)}\b", future_line) is not None
+                        or re.search(rf"\b{re.escape(alias_consumer_name)}\b", future_line) is not None
+                    )
+                )
             ]
             only_binary_cf_consumers = bool(future_uses)
             consumer_shapes: set[Tuple[int, int, int, int]] = set()
@@ -19470,7 +19559,15 @@ def _canonicalize_generated_model_source_for_raw_export(
                 binary_cf_consumer_match = binary_cf_consumer_re.match(future_line)
                 if (
                     binary_cf_consumer_match is None
-                    or lhs not in {str(binary_cf_consumer_match.group("a")), str(binary_cf_consumer_match.group("b"))}
+                    or not {
+                        lhs,
+                        alias_consumer_name,
+                    }.intersection(
+                        {
+                            str(binary_cf_consumer_match.group("a")),
+                            str(binary_cf_consumer_match.group("b")),
+                        }
+                    )
                 ):
                     only_binary_cf_consumers = False
                     break
@@ -19492,7 +19589,10 @@ def _canonicalize_generated_model_source_for_raw_export(
             }:
                 index += 1
                 continue
-            if not _is_known_cf_name(input_name, singleton_cf_seeds):
+            if not (
+                _is_known_cf_name(input_name, singleton_cf_seeds)
+                or input_name.endswith("_nhwc_cf")
+            ):
                 indent = str(resize_bad_target_match.group("indent"))
                 out_h = int(resize_bad_target_match.group("out_h"))
                 out_w = int(resize_bad_target_match.group("out_w"))
@@ -20118,11 +20218,22 @@ def _canonicalize_generated_model_source_for_raw_export(
         permuted_cf_module_input_match = permuted_cf_module_input_re.match(lines[index])
         if permuted_cf_module_input_match is not None:
             src = str(permuted_cf_module_input_match.group("src"))
-            if _is_known_cf_name(src, singleton_cf_vars):
+            recent_rank4_shape = _find_recent_rank4_shape(src, index)
+            if _is_known_cf_name(src, singleton_cf_vars) or (
+                recent_rank4_shape is not None
+                and len(recent_rank4_shape) == 4
+                and int(recent_rank4_shape[1]) == 1
+            ):
                 indent = str(permuted_cf_module_input_match.group("indent"))
                 lhs = str(permuted_cf_module_input_match.group("lhs"))
                 module = str(permuted_cf_module_input_match.group("module"))
                 lines[index] = f"{indent}{lhs} = {module}({src})"
+                if (
+                    recent_rank4_shape is not None
+                    and len(recent_rank4_shape) == 4
+                    and int(recent_rank4_shape[1]) == 1
+                ):
+                    singleton_cf_vars.add(src)
                 changed = True
         output_back_permute_match = output_back_permute_re.match(lines[index])
         if output_back_permute_match is not None:
@@ -20139,18 +20250,75 @@ def _canonicalize_generated_model_source_for_raw_export(
             if index + 1 < len(lines)
             else None
         )
+        if softmax_match is not None:
+            input_name = str(softmax_match.group("input"))
+            resolved_input_shape = _find_recent_rank4_shape(input_name, index)
+            if resolved_input_shape is None and model_ir is not None:
+                resolved_input_shape = _tensor_exact_static_shape_list_for_model_ir(
+                    model_ir=model_ir,
+                    tensor_name=input_name,
+                )
+            target_shape_values = [
+                int(softmax_match.group("n")),
+                int(softmax_match.group("h")),
+                int(softmax_match.group("w")),
+                int(softmax_match.group("c")),
+            ]
+            if (
+                (
+                    _is_known_cf_name(input_name, singleton_cf_vars)
+                    or (
+                        resolved_input_shape is not None
+                        and len(resolved_input_shape) == 4
+                        and not input_name.endswith("_nhwc")
+                        and not input_name.endswith("_out_nhwc")
+                    )
+                )
+                and (input_name.endswith("_cf") or input_name.endswith("_out_cf"))
+                and int(softmax_match.group("axis")) == 3
+                and resolved_input_shape is not None
+                and len(resolved_input_shape) == 4
+                and [int(v) for v in resolved_input_shape] == target_shape_values
+            ):
+                indent = str(softmax_match.group("indent"))
+                lhs = str(softmax_match.group("lhs"))
+                lines[index] = (
+                    f"{indent}{lhs} = _apply_softmax("
+                    f"{input_name}, axis=1, beta={softmax_match.group('beta')}, "
+                    f"target_shape=[{target_shape_values[0]}, {target_shape_values[1]}, "
+                    f"{target_shape_values[2]}, {target_shape_values[3]}])"
+                )
+                cf_aliases.add(lhs)
+                changed = True
+                softmax_match = apply_softmax_re.match(lines[index])
         if (
             softmax_match is not None
             and next_output_permute_match is not None
             and str(next_output_permute_match.group("src")) == str(softmax_match.group("lhs"))
         ):
             input_name = str(softmax_match.group("input"))
+            resolved_input_name = input_name
+            visited_aliases: set[str] = set()
+            while resolved_input_name not in visited_aliases:
+                visited_aliases.add(resolved_input_name)
+                next_name = (
+                    cf_materialized_alias_sources.get(resolved_input_name)
+                    or generic_alias_sources.get(resolved_input_name)
+                )
+                if next_name is None:
+                    break
+                resolved_input_name = next_name
             axis = int(softmax_match.group("axis"))
             n = int(softmax_match.group("n"))
             h = int(softmax_match.group("h"))
             w = int(softmax_match.group("w"))
             c = int(softmax_match.group("c"))
-            if _is_known_cf_name(input_name, singleton_cf_vars) and axis == 3 and c <= h and c <= w:
+            if (
+                (_is_known_cf_name(input_name, singleton_cf_vars) or resolved_input_name.endswith("_nhwc_cf"))
+                and axis == 3
+                and c <= h
+                and c <= w
+            ):
                 indent = str(softmax_match.group("indent"))
                 next_lhs = str(next_output_permute_match.group("lhs"))
                 lines[index] = (
@@ -20482,6 +20650,46 @@ def _canonicalize_generated_model_source_for_raw_export(
         changed = True
         index += 2
     index = 0
+    while index + 2 < len(lines):
+        alias_match = simple_alias_re.match(lines[index])
+        self_permute_match = self_permute_assign_re.match(lines[index + 1])
+        input_bridge_match = transpose_conv_input_bridge_re.match(lines[index + 2])
+        if (
+            alias_match is None
+            or self_permute_match is None
+            or input_bridge_match is None
+            or str(self_permute_match.group("lhs")) != str(alias_match.group("lhs"))
+            or str(input_bridge_match.group("src")) != str(alias_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        src = str(alias_match.group("src"))
+        lhs = str(alias_match.group("lhs"))
+        src_exact_shape = _model_ir_exact_shape(src)
+        lhs_exact_shape = _model_ir_exact_shape(lhs)
+        if (
+            src_exact_shape is None
+            or lhs_exact_shape is None
+            or len(src_exact_shape) != 3
+            or len(lhs_exact_shape) != 4
+            or int(np.prod(src_exact_shape, dtype=np.int64)) != int(np.prod(lhs_exact_shape, dtype=np.int64))
+            or int(lhs_exact_shape[0]) != int(src_exact_shape[0])
+            or int(lhs_exact_shape[1]) != int(src_exact_shape[1])
+            or not (
+                (int(lhs_exact_shape[2]) == 1 and int(lhs_exact_shape[3]) == int(src_exact_shape[2]))
+                or (int(lhs_exact_shape[3]) == 1 and int(lhs_exact_shape[2]) == int(src_exact_shape[2]))
+            )
+        ):
+            index += 1
+            continue
+        indent = str(alias_match.group("indent"))
+        shape_text = ", ".join(str(v) for v in lhs_exact_shape)
+        lines[index] = f"{indent}{lhs} = torch.reshape({src}, [{shape_text}])"
+        lines[index + 1] = f"{indent}{lhs} = {lhs}"
+        cf_aliases.add(lhs)
+        changed = True
+        index += 3
+    index = 0
     while index + 5 < len(lines):
         self_permute_match = self_permute_assign_re.match(lines[index])
         input_bridge_match = transpose_conv_input_bridge_re.match(lines[index + 1])
@@ -20547,6 +20755,37 @@ def _canonicalize_generated_model_source_for_raw_export(
         )
         changed = True
         index += 6
+    index = 0
+    while index + 1 < len(lines):
+        aligned_tensor_match = generic_aligned_tensor_re.match(lines[index])
+        output_back_permute_match = output_back_permute_re.match(lines[index + 1])
+        if (
+            aligned_tensor_match is None
+            or output_back_permute_match is None
+            or str(output_back_permute_match.group("src")) != str(aligned_tensor_match.group("lhs"))
+        ):
+            index += 1
+            continue
+        lhs = str(aligned_tensor_match.group("lhs"))
+        dst = str(output_back_permute_match.group("lhs"))
+        expr = str(aligned_tensor_match.group("expr"))
+        dst_exact_shape = _model_ir_exact_shape(dst)
+        if (
+            dst_exact_shape is None
+            or len(dst_exact_shape) != 4
+            or "_cf" not in expr
+            or not lhs.endswith("_nhwc")
+        ):
+            index += 1
+            continue
+        indent = str(aligned_tensor_match.group("indent"))
+        dst_shape_text = ", ".join(str(v) for v in dst_exact_shape)
+        lines[index] = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{dst_shape_text}])"
+        )
+        lines[index + 1] = f"{indent}{dst} = {lhs}"
+        changed = True
+        index += 2
     return_tuple_re = re.compile(r"^(?P<indent>\s*)return \((?P<values>[A-Za-z0-9_, ]+)\)$")
     return_single_re = re.compile(r"^(?P<indent>\s*)return (?P<value>[A-Za-z0-9_]+)$")
     for index, line in enumerate(lines):
@@ -20642,7 +20881,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         rhs = str(generic_alias_match.group("rhs"))
         reshape_consumer_found = False
         for lookahead_index in range(index + 1, min(index + 6, len(lines))):
-            candidate_reshape_match = rank4_reshape_consumer_re.match(lines[lookahead_index])
+            candidate_reshape_match = generic_reshape_consumer_re.match(lines[lookahead_index])
             if candidate_reshape_match is not None and str(candidate_reshape_match.group("input")) == lhs:
                 reshape_consumer_found = True
                 break
@@ -20663,7 +20902,7 @@ def _canonicalize_generated_model_source_for_raw_export(
             lhs_exact_shape is not None
             and len(lhs_exact_shape) == 4
             and is_channel_last_logical_layout(lhs_layout)
-            and _is_known_cf_name(rhs, set())
+            and (_is_known_cf_name(rhs, set()) or rhs.endswith("_cf") or rhs.endswith("_nhwc_cf"))
         ):
             indent = str(generic_alias_match.group("indent"))
             rewritten_line = (
@@ -20674,7 +20913,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 lines[index] = rewritten_line
                 changed = True
             continue
-        if "_nhwc" not in lhs or not _is_known_cf_name(rhs, set()):
+        if "_nhwc" not in lhs or not (_is_known_cf_name(rhs, set()) or rhs.endswith("_nhwc_cf")):
             continue
         rhs_exact_shape = _model_ir_exact_shape(rhs)
         if rhs_exact_shape is None or len(rhs_exact_shape) != 4:
@@ -20831,8 +21070,89 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"half_pixel_centers={pidnet_forced_resize_match.group('hpc')}, channel_last=False)"
         )
         changed = True
+    softmax_cf_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?P<input>[A-Za-z0-9_]+), "
+        r"axis=1, beta=(?P<beta>[-0-9.eE]+), target_shape=\[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
     for index, line in enumerate(lines):
-        resize_argmax_match = apply_resize_nhwc_re.match(line)
+        resize_match = (
+            apply_resize_nhwc_re.match(line)
+            or apply_resize_cf_re.match(line)
+            or apply_resize_cf_bad_target_re.match(line)
+        )
+        if resize_match is None:
+            continue
+        resize_lhs = str(resize_match.group("lhs"))
+        consumer_name = resize_lhs
+        consumer_index = index + 1
+        alias_match = (
+            re.fullmatch(
+                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                lines[index + 1],
+            )
+            if index + 1 < len(lines)
+            else None
+        )
+        if alias_match is not None and str(alias_match.group("src")) == resize_lhs:
+            consumer_name = str(alias_match.group("lhs"))
+            consumer_index = index + 2
+        binary_consumer_match = (
+            binary_cf_consumer_re.match(lines[consumer_index])
+            if consumer_index < len(lines)
+            else None
+        )
+        if (
+            binary_consumer_match is not None
+            and consumer_name in {
+                str(binary_consumer_match.group("a")),
+                str(binary_consumer_match.group("b")),
+            }
+        ):
+            n = int(binary_consumer_match.group("n"))
+            c = int(binary_consumer_match.group("c"))
+            h = int(binary_consumer_match.group("h"))
+            w = int(binary_consumer_match.group("w"))
+            lines[index] = (
+                f"{resize_match.group('indent')}{resize_lhs} = _apply_resize("
+                f"{resize_match.group('input')}, [{resize_match.group('out_h')}, {resize_match.group('out_w')}], "
+                f"method='{resize_match.group('method')}', "
+                f"target_shape=[{n}, {c}, {h}, {w}], "
+                f"align_corners={resize_match.group('align')}, "
+                f"half_pixel_centers={resize_match.group('hpc')}, channel_last=False)"
+            )
+            cf_aliases.add(resize_lhs)
+            if consumer_name != resize_lhs:
+                cf_aliases.add(consumer_name)
+            changed = True
+            continue
+        softmax_cf_match = (
+            softmax_cf_re.match(lines[consumer_index])
+            if consumer_index < len(lines)
+            else None
+        )
+        if softmax_cf_match is not None and str(softmax_cf_match.group("input")) == consumer_name:
+            n = int(softmax_cf_match.group("n"))
+            c = int(softmax_cf_match.group("c"))
+            h = int(softmax_cf_match.group("h"))
+            w = int(softmax_cf_match.group("w"))
+            lines[index] = (
+                f"{resize_match.group('indent')}{resize_lhs} = _apply_resize("
+                f"{resize_match.group('input')}, [{resize_match.group('out_h')}, {resize_match.group('out_w')}], "
+                f"method='{resize_match.group('method')}', "
+                f"target_shape=[{n}, {c}, {h}, {w}], "
+                f"align_corners={resize_match.group('align')}, "
+                f"half_pixel_centers={resize_match.group('hpc')}, channel_last=False)"
+            )
+            cf_aliases.add(resize_lhs)
+            if consumer_name != resize_lhs:
+                cf_aliases.add(consumer_name)
+            changed = True
+    for index, line in enumerate(lines):
+        resize_argmax_match = (
+            apply_resize_nhwc_re.match(line)
+            or apply_resize_cf_re.match(line)
+            or apply_resize_cf_bad_target_re.match(line)
+        )
         if resize_argmax_match is None:
             continue
         input_name = str(resize_argmax_match.group("input"))
