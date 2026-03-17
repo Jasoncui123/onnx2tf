@@ -50,12 +50,15 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _conv2d_same_pad_padding_arg_for_codegen,
     _export_runtime_wrapper_package_from_model_ir,
     _fold_inverse_permute_round_trips_in_exported_program_archive,
+    _fold_channel_first_hardsigmoid_gate_conv_bridges,
     _make_tensor_storage_name_map,
     _merge_reference_public_boundary_metadata,
     _preferred_reshape_target_values,
     _propagate_pytorch_friendly_layouts,
+    _repair_channel_last_gap_conv_inputs,
     _reject_residual_layout_transposes,
     _remove_redundant_layout_transposes,
+    _rewrite_generated_model_source_for_exported_program,
     _rewrite_channel_last_binary_bridge_chains,
     _rewrite_channel_last_gap_means_to_reduce_mean,
     _sanitize_dynamo_exported_onnx_metadata,
@@ -504,6 +507,93 @@ def test_canonicalize_generated_model_source_materializes_channel_last_alias_bef
     )
 
 
+def test_canonicalize_generated_model_source_materializes_runtime_cf_alias_before_rank3_reshape_from_model_ir(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "rank3_runtime_cf_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv540_out_nhwc_cf: torch.Tensor, cv541_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        onnx_shape1019_cf = torch.add(cv540_out_nhwc_cf, cv541_out_cf)",
+                "        onnx_shape1019 = onnx_shape1019_cf",
+                "        in192 = torch.reshape(onnx_shape1019, _resolve_reshape_shape([1, -1, 64], onnx_shape1019, allow_zero=False))",
+                "        return in192",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="rank3_runtime_cf_alias")
+    model_ir.tensors["onnx_shape1019"] = TensorIR(
+        name="onnx_shape1019",
+        dtype="FLOAT32",
+        shape=[1, 45, 80, 64],
+        shape_signature=[1, 45, 80, 64],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["input.192"] = TensorIR(
+        name="input.192",
+        dtype="FLOAT32",
+        shape=[1, 3600, 64],
+        shape_signature=[1, 3600, 64],
+        logical_layout="NWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "onnx_shape1019 = _align_tensor_to_target_shape("
+        "onnx_shape1019_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])"
+        in rewritten
+    )
+
+
+def test_rewrite_generated_model_source_for_exported_program_preserves_rank3_reshape_materialize_without_model_ir(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "rank3_exported_program_rewrite_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv540_out_nhwc_cf: torch.Tensor, cv541_out_cf: torch.Tensor, onnx_mul218: torch.Tensor) -> torch.Tensor:",
+                "        onnx_shape1019_cf = torch.add(cv540_out_nhwc_cf, cv541_out_cf)",
+                "        onnx_shape1019 = _align_tensor_to_target_shape(onnx_shape1019_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])",
+                "        onnx_add219 = _align_tensor_to_target_shape(torch.mul(onnx_mul218, 0.5), [1, 16, 57600])",
+                "        in192 = torch.reshape(onnx_shape1019, _resolve_reshape_shape([1, -1, 64], onnx_shape1019, allow_zero=False))",
+                "        return in192",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _rewrite_generated_model_source_for_exported_program(package_dir, model_ir=None)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "onnx_shape1019 = _align_tensor_to_target_shape("
+        "onnx_shape1019_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])"
+        in rewritten
+    )
+    assert "onnx_shape1019 = onnx_shape1019_cf" not in rewritten
+    assert (
+        "in192 = torch.reshape(onnx_shape1019, _resolve_reshape_shape([1, -1, 64], onnx_shape1019, allow_zero=False))"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_cf_softmax_axis3_to_axis1_when_target_shape_is_cf(
     tmp_path,
 ) -> None:
@@ -671,6 +761,50 @@ def test_canonicalize_generated_model_source_restores_nhwc_resize_target_shape_f
         in rewritten
     )
     assert "target_shape=[1, 40, 64, 24]" not in rewritten
+
+
+def test_canonicalize_generated_model_source_restores_public_output_resize_target_shape(tmp_path) -> None:
+    package_dir = tmp_path / "public_output_resize_target_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        t607_public_layout_bridge_cf = _apply_resize(x, [128, 256], method='bilinear', target_shape=[1, 256, 21, 128], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        t_607 = t607_public_layout_bridge_cf",
+                "        return t_607",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="public_output_resize_target_fix")
+    model_ir.outputs = ["607"]
+    model_ir.tensors["607"] = TensorIR(
+        name="607",
+        dtype="FLOAT32",
+        shape=[1, 21, 128, 256],
+        shape_signature=[1, 21, 128, 256],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=model_ir,
+    )
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "t607_public_layout_bridge_cf = _apply_resize(x, [128, 256], method='bilinear', "
+        "target_shape=[1, 21, 128, 256], align_corners=False, "
+        "half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+    assert "target_shape=[1, 256, 21, 128]" not in rewritten
 
 
 def test_canonicalize_generated_model_source_rewrites_pidnet_pag4_mul2_to_channel_first(tmp_path) -> None:
@@ -7753,6 +7887,31 @@ def test_export_pytorch_package_helper_and_raw_exports_are_structurally_equivale
     )
 
 
+def test_export_dynamo_onnx_from_generated_package_preserves_yolox_output_shape_when_model_is_available(tmp_path) -> None:
+    model_path = Path("yolox_s.onnx")
+    if not model_path.exists():
+        pytest.skip("yolox_s.onnx is not available")
+    model_proto = onnx.load(model_path)
+    model_ir = lower_onnx_to_ir(
+        model_proto,
+        output_file_name="yolox_output_shape_regression_test",
+        show_progress=False,
+    )
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=model_ir,
+        output_folder_path=str(tmp_path / "yolox_output_shape_pkg"),
+        fallback_saved_model_path=str(tmp_path / "yolox_output_shape_saved_model"),
+    )
+
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
+    assert dynamo_onnx_path is not None
+
+    exported_model = onnx.load(str(dynamo_onnx_path))
+    assert len(exported_model.graph.output) == 1
+    output_dims = _onnx_value_shape_signature(exported_model.graph.output[0])
+    assert output_dims == (1, 8400, 85)
+
+
 def test_export_pytorch_package_avoids_early_permute_chain_for_human_segmentation_when_model_is_available(tmp_path) -> None:
     model_path = Path("human_segmentation_pphumanseg_2021oct.onnx")
     if not model_path.exists():
@@ -9071,6 +9230,61 @@ def test_export_pytorch_package_helper_postprocess_is_noop_for_ts_ad_model_when_
     archive_copy_path.write_bytes(Path(helper_exported_program_path).read_bytes())
     _fold_inverse_permute_round_trips_in_exported_program_archive(archive_copy_path)
     assert _exported_program_structural_signature(torch.export.load(str(archive_copy_path))) == exported_before_signature
+
+
+def test_fold_inverse_permute_round_trips_in_exported_program_archive_folds_hardsigmoid_layout_bridge(
+    tmp_path,
+) -> None:
+    class HardsigmoidBridge(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            y = x * (1.0 / 6.0)
+            y = y + 0.5
+            y = y.permute(0, 2, 3, 1).contiguous()
+            y = torch.clamp(y, 0.0, 1.0)
+            y = y.permute(0, 3, 1, 2).contiguous()
+            return y
+
+    model = HardsigmoidBridge().eval()
+    example_inputs = (torch.randn(1, 3, 4, 5),)
+    exported_program = torch.export.export(model, example_inputs)
+    archive_path = tmp_path / "hardsigmoid_bridge.pt2"
+    torch.export.save(exported_program, str(archive_path))
+
+    before = torch.export.load(str(archive_path))
+    before_outputs = _flatten_tensor_outputs(before.module()(*example_inputs))
+    before_targets = [
+        str(node.target)
+        for node in before.graph_module.graph.nodes
+        if node.op == "call_function"
+    ]
+    assert before_targets == [
+        "aten.mul.Tensor",
+        "aten.add.Tensor",
+        "aten.permute.default",
+        "aten.contiguous.default",
+        "aten.clamp.default",
+        "aten.permute.default",
+        "aten.contiguous.default",
+    ]
+
+    _fold_inverse_permute_round_trips_in_exported_program_archive(archive_path)
+
+    after = torch.export.load(str(archive_path))
+    after_outputs = _flatten_tensor_outputs(after.module()(*example_inputs))
+    assert len(before_outputs) == len(after_outputs)
+    for before_output, after_output in zip(before_outputs, after_outputs):
+        torch.testing.assert_close(after_output, before_output, rtol=1e-6, atol=1e-7)
+
+    after_targets = [
+        str(node.target)
+        for node in after.graph_module.graph.nodes
+        if node.op == "call_function"
+    ]
+    assert after_targets[0] == "aten.hardsigmoid.default"
+    assert "aten.mul.Tensor" not in after_targets
+    assert "aten.add.Tensor" not in after_targets
+    assert "aten.permute.default" not in after_targets
+    assert "aten.clamp.default" not in after_targets
 
 
 def test_export_pytorch_package_prefers_channel_first_shape_for_nhwc_named_channel_first_reshape() -> None:
@@ -10596,6 +10810,32 @@ def test_sanitize_dynamo_exported_onnx_metadata_preserves_atan_rank4_output_shap
     assert output_dims == [1, 3, 224, 224]
 
 
+def test_sanitize_dynamo_exported_onnx_metadata_preserves_transpose_rank3_output_shape(tmp_path) -> None:
+    x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 85, 8400])
+    y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8400, 85])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["input"], ["output"], name="TransposeNode", perm=[0, 2, 1]),
+        ],
+        "transpose_rank3_graph",
+        [x],
+        [y],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "transpose_rank3.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    output_dims = [
+        int(dim.dim_value)
+        for dim in sanitized_model.graph.output[0].type.tensor_type.shape.dim
+    ]
+    assert output_dims == [1, 8400, 85]
+
+
 def test_sanitize_dynamo_exported_onnx_metadata_folds_relu_between_inverse_transposes(tmp_path) -> None:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4, 5, 6])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4, 5, 6])
@@ -10621,6 +10861,159 @@ def test_sanitize_dynamo_exported_onnx_metadata_folds_relu_between_inverse_trans
     relu_node = sanitized_model.graph.node[0]
     assert list(relu_node.input) == ["x"]
     assert list(relu_node.output) == ["y"]
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_clip_between_inverse_transposes(tmp_path) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4, 5, 6])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4, 5, 6])
+    clip_min = helper.make_tensor("clip_min", TensorProto.FLOAT, [], [0.0])
+    clip_max = helper.make_tensor("clip_max", TensorProto.FLOAT, [], [6.0])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["x"], ["x_t"], name="ToNHWC", perm=[0, 2, 3, 1]),
+            helper.make_node("Clip", ["x_t", "clip_min", "clip_max"], ["x_clip"], name="ClipBridge"),
+            helper.make_node("Transpose", ["x_clip"], ["y"], name="BackToNCHW", perm=[0, 3, 1, 2]),
+        ],
+        "clip_inverse_transpose_bridge_graph",
+        [x],
+        [y],
+        initializer=[clip_min, clip_max],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "clip_inverse_transpose_bridge.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert [str(node.op_type) for node in sanitized_model.graph.node] == ["Clip"]
+    clip_node = sanitized_model.graph.node[0]
+    assert list(clip_node.input) == ["x", "clip_min", "clip_max"]
+    assert list(clip_node.output) == ["y"]
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_clip_mul_transpose_bridge(tmp_path) -> None:
+    x0 = helper.make_tensor_value_info("x0", TensorProto.FLOAT, [1, 8, 6, 6])
+    x1 = helper.make_tensor_value_info("x1", TensorProto.FLOAT, [1, 8, 6, 6])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 6, 6])
+    clip_min = helper.make_tensor("clip_min", TensorProto.FLOAT, [], [0.0])
+    clip_max = helper.make_tensor("clip_max", TensorProto.FLOAT, [], [6.0])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["x0"], ["x0_nhwc"], name="ToNHWC0", perm=[0, 2, 3, 1]),
+            helper.make_node("Clip", ["x0_nhwc", "clip_min", "clip_max"], ["x0_clip"], name="ClipBridge"),
+            helper.make_node("Transpose", ["x1"], ["x1_nhwc"], name="ToNHWC1", perm=[0, 2, 3, 1]),
+            helper.make_node("Mul", ["x1_nhwc", "x0_clip"], ["mul_nhwc"], name="MulBridge"),
+            helper.make_node("Transpose", ["mul_nhwc"], ["y"], name="BackToNCHW", perm=[0, 3, 1, 2]),
+        ],
+        "clip_mul_transpose_bridge_graph",
+        [x0, x1],
+        [y],
+        initializer=[clip_min, clip_max],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "clip_mul_transpose_bridge.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert [str(node.op_type) for node in sanitized_model.graph.node] == ["Clip", "Mul"]
+    assert list(sanitized_model.graph.node[0].input) == ["x0", "clip_min", "clip_max"]
+    assert list(sanitized_model.graph.node[1].input) == ["x1", "x0_clip"]
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_clip_mul_reduce_mean_layout_bridges(tmp_path) -> None:
+    x0 = helper.make_tensor_value_info("x0", TensorProto.FLOAT, [1, 8, 6, 6])
+    x1 = helper.make_tensor_value_info("x1", TensorProto.FLOAT, [1, 8, 6, 6])
+    y0 = helper.make_tensor_value_info("y0", TensorProto.FLOAT, [1, 4, 6, 6])
+    y1 = helper.make_tensor_value_info("y1", TensorProto.FLOAT, [1, 4, 1, 1])
+    clip_min = helper.make_tensor("clip_min", TensorProto.FLOAT, [], [0.0])
+    clip_max = helper.make_tensor("clip_max", TensorProto.FLOAT, [], [6.0])
+    reduce_axes = helper.make_tensor("reduce_axes", TensorProto.INT64, [2], [1, 2])
+    w0 = helper.make_tensor(
+        "w0",
+        TensorProto.FLOAT,
+        [4, 8, 1, 1],
+        np.arange(32, dtype=np.float32),
+    )
+    w1 = helper.make_tensor(
+        "w1",
+        TensorProto.FLOAT,
+        [4, 8, 1, 1],
+        np.arange(32, dtype=np.float32),
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["x0"], ["x0_nhwc"], name="ToNHWC0", perm=[0, 2, 3, 1]),
+            helper.make_node("Clip", ["x0_nhwc", "clip_min", "clip_max"], ["x0_clip"], name="ClipBridge"),
+            helper.make_node("Transpose", ["x1"], ["x1_nhwc"], name="ToNHWC1", perm=[0, 2, 3, 1]),
+            helper.make_node("Mul", ["x1_nhwc", "x0_clip"], ["mul_nhwc"], name="MulBridge"),
+            helper.make_node("Transpose", ["mul_nhwc"], ["mul_nchw"], name="BackToNCHW", perm=[0, 3, 1, 2]),
+            helper.make_node("Conv", ["mul_nchw", "w0"], ["y0"], name="ConvBranch"),
+            helper.make_node("ReduceMean", ["mul_nhwc", "reduce_axes"], ["mean_nhwc"], name="GapBranch", keepdims=1),
+            helper.make_node("Transpose", ["mean_nhwc"], ["mean_nchw"], name="GapBackToNCHW", perm=[0, 3, 1, 2]),
+            helper.make_node("Conv", ["mean_nchw", "w1"], ["y1"], name="GapConv"),
+        ],
+        "clip_mul_reduce_mean_layout_bridge_graph",
+        [x0, x1],
+        [y0, y1],
+        initializer=[clip_min, clip_max, reduce_axes, w0, w1],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 18)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "clip_mul_reduce_mean_bridge.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert [str(node.op_type) for node in sanitized_model.graph.node] == ["Clip", "Mul", "Conv", "ReduceMean", "Conv"]
+    reduce_node = next(node for node in sanitized_model.graph.node if str(node.op_type) == "ReduceMean")
+    reduce_axes_name = str(reduce_node.input[1])
+    reduce_axes_init = next(init for init in sanitized_model.graph.initializer if init.name == reduce_axes_name)
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(reduce_axes_init), np.asarray([2, 3], dtype=np.int64))
+    assert list(reduce_node.input) == ["mul_nhwc", reduce_axes_name]
+    assert list(sanitized_model.graph.node[2].input) == ["mul_nhwc", "w0"]
+    assert list(sanitized_model.graph.node[4].input) == ["mean_nhwc", "w1"]
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_mul_add_clip_to_hardsigmoid(tmp_path) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 6, 6])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 6, 6])
+    mul_const = helper.make_tensor("mul_const", TensorProto.FLOAT, [], [1.0 / 6.0])
+    add_const = helper.make_tensor("add_const", TensorProto.FLOAT, [], [0.5])
+    clip_min = helper.make_tensor("clip_min", TensorProto.FLOAT, [], [0.0])
+    clip_max = helper.make_tensor("clip_max", TensorProto.FLOAT, [], [1.0])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Mul", ["x", "mul_const"], ["mul"], name="MulNode"),
+            helper.make_node("Add", ["mul", "add_const"], ["add"], name="AddNode"),
+            helper.make_node("Clip", ["add", "clip_min", "clip_max"], ["y"], name="ClipNode"),
+        ],
+        "mul_add_clip_hardsigmoid_graph",
+        [x],
+        [y],
+        initializer=[mul_const, add_const, clip_min, clip_max],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "mul_add_clip_hardsigmoid.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert [str(node.op_type) for node in sanitized_model.graph.node] == ["HardSigmoid"]
+    hard_sigmoid_node = sanitized_model.graph.node[0]
+    assert list(hard_sigmoid_node.input) == ["x"]
+    assert list(hard_sigmoid_node.output) == ["y"]
+    alpha_attr = next(attr for attr in hard_sigmoid_node.attribute if str(attr.name) == "alpha")
+    beta_attr = next(attr for attr in hard_sigmoid_node.attribute if str(attr.name) == "beta")
+    assert abs(float(helper.get_attribute_value(alpha_attr)) - (1.0 / 6.0)) < 1e-6
+    assert abs(float(helper.get_attribute_value(beta_attr)) - 0.5) < 1e-6
 
 
 def test_sanitize_dynamo_exported_onnx_metadata_folds_residual_add_relu_conv_bridge(tmp_path) -> None:
@@ -16238,6 +16631,194 @@ def test_export_generated_package_aligns_symint_shapes_for_channel_last_gap_conv
     assert Path(dynamo_onnx_path).exists()
     assert exported_program_path is not None
     assert Path(exported_program_path).exists()
+
+
+def test_export_generated_package_permutes_channel_last_gap_before_following_conv(
+    tmp_path,
+) -> None:
+    model_ir = ModelIR(name="channel_last_gap_followed_by_conv")
+    model_ir.inputs = ["x"]
+    model_ir.outputs = ["y"]
+    model_ir.tensors["x"] = TensorIR(
+        name="x",
+        dtype="FLOAT32",
+        shape=[1, 4, 5, 4],
+        shape_signature=[1, 4, 5, 4],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["w0"] = TensorIR(
+        name="w0",
+        dtype="FLOAT32",
+        shape=[8, 1, 1, 4],
+        shape_signature=[8, 1, 1, 4],
+        data=(np.arange(8 * 4, dtype=np.float32).reshape(8, 1, 1, 4) / 25.0),
+    )
+    model_ir.tensors["b0"] = TensorIR(
+        name="b0",
+        dtype="FLOAT32",
+        shape=[8],
+        shape_signature=[8],
+        data=np.linspace(-0.2, 0.2, 8, dtype=np.float32),
+    )
+    model_ir.tensors["conv0"] = TensorIR(
+        name="conv0",
+        dtype="FLOAT32",
+        shape=[1, 4, 5, 8],
+        shape_signature=[1, 4, 5, 8],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["gap_axes"] = TensorIR(
+        name="gap_axes",
+        dtype="INT32",
+        shape=[2],
+        shape_signature=[2],
+        data=np.asarray([1, 2], dtype=np.int32),
+    )
+    model_ir.tensors["gap"] = TensorIR(
+        name="gap",
+        dtype="FLOAT32",
+        shape=[1, 1, 1, 8],
+        shape_signature=[1, 1, 1, 8],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["w1"] = TensorIR(
+        name="w1",
+        dtype="FLOAT32",
+        shape=[3, 1, 1, 8],
+        shape_signature=[3, 1, 1, 8],
+        data=(np.arange(3 * 8, dtype=np.float32).reshape(3, 1, 1, 8) / 15.0),
+    )
+    model_ir.tensors["b1"] = TensorIR(
+        name="b1",
+        dtype="FLOAT32",
+        shape=[3],
+        shape_signature=[3],
+        data=np.linspace(-0.1, 0.1, 3, dtype=np.float32),
+    )
+    model_ir.tensors["y"] = TensorIR(
+        name="y",
+        dtype="FLOAT32",
+        shape=[1, 1, 1, 3],
+        shape_signature=[1, 1, 1, 3],
+        logical_layout="NHWC",
+    )
+    model_ir.operators.extend(
+        [
+            OperatorIR(
+                op_type="CONV_2D",
+                inputs=["x", "w0", "b0"],
+                outputs=["conv0"],
+                options={
+                    "strideH": 1,
+                    "strideW": 1,
+                    "dilationHFactor": 1,
+                    "dilationWFactor": 1,
+                    "padding": "VALID",
+                    "fusedActivationFunction": "NONE",
+                },
+            ),
+            OperatorIR(
+                op_type="MEAN",
+                inputs=["conv0", "gap_axes"],
+                outputs=["gap"],
+                options={"keepDims": True},
+            ),
+            OperatorIR(
+                op_type="CONV_2D",
+                inputs=["gap", "w1", "b1"],
+                outputs=["y"],
+                options={
+                    "strideH": 1,
+                    "strideW": 1,
+                    "dilationHFactor": 1,
+                    "dilationWFactor": 1,
+                    "padding": "VALID",
+                    "fusedActivationFunction": "NONE",
+                },
+            ),
+        ]
+    )
+
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=model_ir,
+        output_folder_path=str(tmp_path / "channel_last_gap_followed_by_conv_pkg"),
+    )
+    model_source = (Path(package_path) / "model.py").read_text(encoding="utf-8")
+    assert (
+        "self.conv_block_1(gap.permute(0, 3, 1, 2).contiguous())" in model_source
+        or (
+            "x = torch.mean(x_cf, dim=[2, 3], keepdim=True)" in model_source
+            and "x_cf = self.conv_block_1(x)" in model_source
+        )
+    )
+
+    pkg = _import_generated_package(package_path)
+    model = pkg.load_model()
+    x = torch.arange(1 * 4 * 5 * 4, dtype=torch.float32).reshape(1, 4, 5, 4) / 10.0
+    out = cast(Any, model).forward_named(x=x)["y"]
+    expected = model.conv_block_0(x.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
+    expected = torch.mean(expected, dim=(1, 2), keepdim=True)
+    expected = model.conv_block_1(expected.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
+    assert tuple(out.shape) == (1, 1, 1, 3)
+    assert torch.allclose(out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_repair_channel_last_gap_conv_inputs_repairs_channel_last_gap_conv_chain() -> None:
+    lines = [
+        "        gap = torch.mean(features, dim=[1, 2], keepdim=True)",
+        "        y = self.conv_block_66(gap)",
+    ]
+    repaired = _repair_channel_last_gap_conv_inputs(lines)
+    assert repaired == [
+        "        gap = torch.mean(features, dim=[1, 2], keepdim=True)",
+        "        y = self.conv_block_66(gap.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+
+def test_fold_channel_first_hardsigmoid_gate_conv_bridges_rewrites_classifier_gate_block() -> None:
+    lines = [
+        "        gate_mul = torch.mul(features_cf, 0.1666666716337204)",
+        "        gate_add = _align_tensor_to_target_shape(torch.add(gate_mul, 0.5), [1, 8, 16, 960])",
+        "        gate_sig = torch.clamp(gate_add, min=0.0, max=1.0)",
+        "        _binary_rhs_0, _binary_lhs_0 = _align_binary_inputs_to_anchor(gate_sig, features_cf, [1, 8, 16, 960])",
+        "        gated_nhwc = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [1, 8, 16, 960])",
+        "        y0 = self.conv_block_62(gated_nhwc.permute(0, 3, 1, 2).contiguous())",
+        "        y1 = self.conv_block_63(gated_nhwc.permute(0, 3, 1, 2).contiguous())",
+        "        gap = torch.mean(gated_nhwc, dim=[1, 2], keepdim=True)",
+        "        ygap = self.conv_block_66(gap.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+    rewritten = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+
+    assert rewritten == [
+        "        gate_sig = torch.nn.functional.hardsigmoid(features_cf)",
+        "        gated_nhwc = torch.mul(features_cf, gate_sig)",
+        "        y0 = self.conv_block_62(gated_nhwc)",
+        "        y1 = self.conv_block_63(gated_nhwc)",
+        "        gap = torch.mean(gated_nhwc, dim=[2, 3], keepdim=True)",
+        "        ygap = self.conv_block_66(gap)",
+    ]
+
+
+def test_fold_channel_first_hardsigmoid_gate_conv_bridges_keeps_following_cf_binary_alignment() -> None:
+    lines = [
+        "        gate_mul = torch.mul(features_cf, 0.1666666716337204)",
+        "        gate_add = _align_tensor_to_target_shape(torch.add(gate_mul, 0.5), [1, 64, 128, 16])",
+        "        gate_sig = torch.clamp(gate_add, min=0.0, max=1.0)",
+        "        _binary_rhs_0, _binary_lhs_0 = _align_binary_inputs_to_anchor(gate_sig, features_cf, [1, 64, 128, 16])",
+        "        gated_nhwc = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [1, 64, 128, 16])",
+        "        y0 = self.conv_block_1(gated_nhwc.permute(0, 3, 1, 2).contiguous())",
+        "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs_to_anchor(y0, gated_nhwc, [1, 16, 64, 128])",
+    ]
+
+    rewritten = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+
+    assert rewritten == [
+        "        gate_sig = torch.nn.functional.hardsigmoid(features_cf)",
+        "        gated_nhwc = torch.mul(features_cf, gate_sig)",
+        "        y0 = self.conv_block_1(gated_nhwc)",
+        "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs_to_anchor(y0, gated_nhwc, [1, 16, 64, 128])",
+    ]
 
 
 def test_export_generated_package_permutes_ambiguous_channel_last_conv_outputs_before_gap(

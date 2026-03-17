@@ -40,6 +40,21 @@ _NATIVE_CODEGEN_FUNCTION_SOURCE = _NATIVE_CODEGEN_FUNCTION_SOURCE.replace(
     "if can_emit_channel_first_binary_op_fn(op) and runtime_shape_passthrough_operand is None and not requires_runtime_alignment:",
     "if can_emit_channel_first_binary_op_fn(op) and runtime_shape_passthrough_operand is None:",
 )
+_NATIVE_CODEGEN_FUNCTION_SOURCE = re.sub(
+    (
+        r"forward_lines = _fold_channel_first_gap_conv_bridges\(forward_lines\)\n"
+        r"([ \t]+)forward_lines = _rewrite_channel_first_gap_outputs_to_explicit_channel_last\(forward_lines\)\n"
+        r"[ \t]+forward_lines = _rewrite_channel_last_gap_means_to_reduce_mean\(forward_lines\)"
+    ),
+    (
+        "forward_lines = _fold_channel_first_gap_conv_bridges(forward_lines)\n"
+        r"\1forward_lines = _repair_channel_last_gap_conv_inputs(forward_lines)\n"
+        r"\1forward_lines = _rewrite_channel_first_gap_outputs_to_explicit_channel_last(forward_lines)\n"
+        r"\1forward_lines = _rewrite_channel_last_gap_means_to_reduce_mean(forward_lines)"
+    ),
+    _NATIVE_CODEGEN_FUNCTION_SOURCE,
+    count=1,
+)
 _NATIVE_CODEGEN_IMPL: Optional[Callable[..., Any]] = None
 
 
