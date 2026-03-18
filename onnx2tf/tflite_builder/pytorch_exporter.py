@@ -3988,6 +3988,12 @@ def _can_omit_materialized_channel_last_alias_recursive_for_codegen(
                 or list(transpose_perm or []) != list(expected_input_bridge_perm)
             ):
                 return False
+            # Rank-3 feature-last tensors still need a materialized alias here.
+            # Later transpose emission cannot always reuse the channel-first
+            # producer alias because `_tensor_expr` intentionally preserves the
+            # logical NWC name for public/bridge cases.
+            if int(output_rank) == 3:
+                return False
             continue
         if consumer_type in {"CONV_2D", "DEPTHWISE_CONV_2D"}:
             if len(consumer_op.inputs) < 2 or str(consumer_op.inputs[0]) != str(output_name):
@@ -6749,6 +6755,226 @@ def _rewrite_channel_last_gap_means_to_reduce_mean(
             f"{materialize_match.group('cf')}, dim=1, keepdim=True)"
         )
     return rewritten
+
+
+def _repair_channel_last_gap_conv_inputs(
+    lines: Sequence[str],
+) -> List[str]:
+    mean_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[1, 2\], keepdim=True\)$"
+    )
+    reduce_mean_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = _reduce_mean\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[1, 2\], [A-Za-z0-9_]+\.ndim\), keepdims=True\)$"
+    )
+    conv_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+
+    rewritten = [str(line) for line in lines]
+    channel_last_gap_vars: Set[str] = set()
+    for index, line in enumerate(rewritten):
+        mean_match = mean_re.match(line) or reduce_mean_re.match(line)
+        if mean_match is not None:
+            channel_last_gap_vars.add(str(mean_match.group("out")))
+            continue
+        conv_match = conv_re.match(line)
+        if conv_match is None:
+            continue
+        input_var = str(conv_match.group("input"))
+        if input_var not in channel_last_gap_vars:
+            continue
+        rewritten[index] = (
+            f"{conv_match.group('indent')}{conv_match.group('out')} = self.{conv_match.group('module')}("
+            f"{input_var}.permute(0, 3, 1, 2).contiguous())"
+        )
+    return rewritten
+
+
+def _fold_channel_first_hardsigmoid_gate_conv_bridges(
+    lines: Sequence[str],
+) -> List[str]:
+    mul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), (?P<alpha>[-+0-9.eE]+)\)$"
+    )
+    add_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<input>[A-Za-z0-9_]+), (?P<beta>[-+0-9.eE]+)\), (?P<target>\[[^\]]+\])\)$"
+    )
+    clamp_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = torch\.clamp\((?P<input>[A-Za-z0-9_]+), min=0\.0, max=1\.0\)$"
+    )
+    anchor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), (?P<target>\[[^\]]+\])\)$"
+    )
+    mul_out_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
+    )
+    conv_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+    )
+    mean_re = re.compile(
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[1, 2\], keepdim=True\)$"
+    )
+    anchor_cf_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    binary_cf_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+ = _align_binary_inputs\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    rewritten = [str(line) for line in lines]
+    alpha_ref = float(1.0 / 6.0)
+    beta_ref = 0.5
+    eps = 1e-6
+
+    def _function_end_index(line_index: int) -> int:
+        for candidate in range(line_index + 1, len(rewritten)):
+            if rewritten[candidate].startswith("    def "):
+                return candidate
+        return len(rewritten)
+
+    def _line_mentions_name(line: str, name: str) -> bool:
+        return re.search(rf"\b{re.escape(name)}\b", line) is not None
+
+    index = 0
+    while index <= len(rewritten) - 5:
+        mul_match = mul_re.match(rewritten[index])
+        add_match = add_re.match(rewritten[index + 1])
+        clamp_match = clamp_re.match(rewritten[index + 2])
+        anchor_match = anchor_re.match(rewritten[index + 3])
+        mul_out_match = mul_out_re.match(rewritten[index + 4])
+        if (
+            mul_match is None
+            or add_match is None
+            or clamp_match is None
+            or anchor_match is None
+            or mul_out_match is None
+        ):
+            index += 1
+            continue
+        try:
+            alpha = float(mul_match.group("alpha"))
+            beta = float(add_match.group("beta"))
+        except Exception:
+            index += 1
+            continue
+        if abs(alpha - alpha_ref) > eps or abs(beta - beta_ref) > eps:
+            index += 1
+            continue
+        mul_out = str(mul_match.group("out"))
+        add_out = str(add_match.group("out"))
+        clamp_out = str(clamp_match.group("out"))
+        source_input = str(mul_match.group("input"))
+        if (
+            str(add_match.group("input")) != mul_out
+            or str(clamp_match.group("input")) != add_out
+            or str(anchor_match.group("input0")) != clamp_out
+            or str(anchor_match.group("target")) != str(add_match.group("target"))
+            or str(mul_out_match.group("target")) != str(add_match.group("target"))
+        ):
+            index += 1
+            continue
+        anchor_source = str(anchor_match.group("input1"))
+        if anchor_source != source_input:
+            index += 1
+            continue
+        anchor_lhs = {str(anchor_match.group("lhs0")), str(anchor_match.group("lhs1"))}
+        mul_inputs = {str(mul_out_match.group("input0")), str(mul_out_match.group("input1"))}
+        if anchor_lhs != mul_inputs:
+            index += 1
+            continue
+        gated_output = str(mul_out_match.group("out"))
+        try:
+            nhwc_target = [int(v) for v in ast.literal_eval(str(add_match.group("target")))]
+        except Exception:
+            index += 1
+            continue
+        if len(nhwc_target) != 4:
+            index += 1
+            continue
+        cf_target = [nhwc_target[0], nhwc_target[3], nhwc_target[1], nhwc_target[2]]
+        function_end = _function_end_index(index)
+        supported_gap_vars: Set[str] = set()
+        safe_to_rewrite = True
+        for lookahead_index in range(index + 5, function_end):
+            line = rewritten[lookahead_index]
+            if not _line_mentions_name(line, gated_output):
+                continue
+            conv_match = conv_re.match(line)
+            if conv_match is not None and str(conv_match.group("input")) == gated_output:
+                continue
+            mean_match = mean_re.match(line)
+            if mean_match is not None and str(mean_match.group("input")) == gated_output:
+                supported_gap_vars.add(str(mean_match.group("out")))
+                continue
+            anchor_cf_match = anchor_cf_re.match(line) or binary_cf_re.match(line)
+            if anchor_cf_match is not None and gated_output in {
+                str(anchor_cf_match.group("input0")),
+                str(anchor_cf_match.group("input1")),
+            }:
+                target = [
+                    int(anchor_cf_match.group("n")),
+                    int(anchor_cf_match.group("c")),
+                    int(anchor_cf_match.group("h")),
+                    int(anchor_cf_match.group("w")),
+                ]
+                if target == cf_target:
+                    continue
+            safe_to_rewrite = False
+            break
+        if not safe_to_rewrite:
+            index += 1
+            continue
+        for gap_var in supported_gap_vars:
+            for lookahead_index in range(index + 5, function_end):
+                line = rewritten[lookahead_index]
+                if not _line_mentions_name(line, gap_var):
+                    continue
+                conv_match = conv_re.match(line)
+                if conv_match is not None and str(conv_match.group("input")) == gap_var:
+                    continue
+                mean_match = mean_re.match(line)
+                if mean_match is not None and str(mean_match.group("out")) == gap_var:
+                    continue
+                safe_to_rewrite = False
+                break
+            if not safe_to_rewrite:
+                break
+        if not safe_to_rewrite:
+            index += 1
+            continue
+        indent = str(mul_match.group("indent"))
+        rewritten[index] = (
+            f"{indent}{clamp_out} = torch.nn.functional.hardsigmoid({source_input})"
+        )
+        rewritten[index + 1] = ""
+        rewritten[index + 2] = ""
+        rewritten[index + 3] = ""
+        rewritten[index + 4] = (
+            f"{mul_out_match.group('indent')}{gated_output} = torch.mul({source_input}, {clamp_out})"
+        )
+        for lookahead_index in range(index + 5, function_end):
+            conv_match = conv_re.match(rewritten[lookahead_index])
+            if conv_match is not None and str(conv_match.group("input")) == gated_output:
+                rewritten[lookahead_index] = (
+                    f"{conv_match.group('indent')}{conv_match.group('out')} = "
+                    f"self.{conv_match.group('module')}({gated_output})"
+                )
+                continue
+            mean_match = mean_re.match(rewritten[lookahead_index])
+            if mean_match is not None and str(mean_match.group("input")) == gated_output:
+                gap_var = str(mean_match.group("out"))
+                rewritten[lookahead_index] = (
+                    f"{mean_match.group('indent')}{gap_var} = "
+                    f"torch.mean({gated_output}, dim=[2, 3], keepdim=True)"
+                )
+                continue
+            conv_match = conv_re.match(rewritten[lookahead_index])
+            if conv_match is not None and str(conv_match.group("input")) in supported_gap_vars:
+                rewritten[lookahead_index] = (
+                    f"{conv_match.group('indent')}{conv_match.group('out')} = "
+                    f"self.{conv_match.group('module')}({conv_match.group('input')})"
+                )
+        index += 5
+    return [line for line in rewritten if line != ""]
 
 
 def _fold_boundary_transpose_pad_conv_bridges(
@@ -12052,12 +12278,12 @@ def _onnx_repair_inferred_shapes_in_place(model: onnx.ModelProto) -> None:
         output_name = str(output.name)
         if output_name == "" or output_name not in producer_map:
             continue
-        inferred_shape = _onnx_resolve_rank4_shape(
+        inferred_shape = _onnx_resolve_static_shape(
             model.graph,
             output_name,
             producer_map=producer_map,
         )
-        if not inferred_shape:
+        if inferred_shape is None:
             continue
         for dim_value in inferred_shape:
             shape.dim.add().dim_value = int(dim_value)
@@ -12105,6 +12331,19 @@ def _onnx_get_initializer_array(
     return onnx.numpy_helper.to_array(graph.initializer[initializer_index])
 
 
+def _onnx_get_initializer_scalar(
+    graph: onnx.GraphProto,
+    name: str,
+) -> Optional[float]:
+    initializer_array = _onnx_get_initializer_array(graph, str(name))
+    if initializer_array is None:
+        return None
+    initializer_values = np.asarray(initializer_array)
+    if int(initializer_values.size) != 1:
+        return None
+    return float(initializer_values.reshape(()))
+
+
 def _onnx_get_value_info_shape(
     graph: onnx.GraphProto,
     name: str,
@@ -12113,6 +12352,8 @@ def _onnx_get_value_info_shape(
     for value_info in list(graph.value_info) + list(graph.input) + list(graph.output):
         if str(value_info.name) != target_name:
             continue
+        if len(value_info.type.tensor_type.shape.dim) == 0:
+            return None
         shape: List[int] = []
         for dim in value_info.type.tensor_type.shape.dim:
             if dim.HasField("dim_value"):
@@ -12123,7 +12364,40 @@ def _onnx_get_value_info_shape(
     return None
 
 
-def _onnx_resolve_rank4_shape(
+_ONNX_STATIC_SHAPE_PASSTHROUGH_OP_TYPES = {
+    "Abs",
+    "Acos",
+    "Asin",
+    "Atan",
+    "Cast",
+    "Ceil",
+    "Clip",
+    "Cos",
+    "Cosh",
+    "Elu",
+    "Erf",
+    "Exp",
+    "Floor",
+    "HardSigmoid",
+    "Identity",
+    "LeakyRelu",
+    "Log",
+    "Neg",
+    "Reciprocal",
+    "Relu",
+    "Round",
+    "Selu",
+    "Sigmoid",
+    "Sin",
+    "Sinh",
+    "Softplus",
+    "Softsign",
+    "Sqrt",
+    "Tanh",
+}
+
+
+def _onnx_resolve_static_shape(
     graph: onnx.GraphProto,
     name: str,
     *,
@@ -12133,10 +12407,10 @@ def _onnx_resolve_rank4_shape(
     if depth > 4:
         return None
     shape = _onnx_get_value_info_shape(graph, name)
-    if shape is not None and len(shape) == 4:
+    if shape is not None:
         return shape
     initializer_array = _onnx_get_initializer_array(graph, name)
-    if initializer_array is not None and initializer_array.ndim == 4:
+    if initializer_array is not None:
         return [int(v) for v in initializer_array.shape]
     if producer_map is None:
         producer_map, _ = _onnx_node_maps(graph)
@@ -12144,21 +12418,21 @@ def _onnx_resolve_rank4_shape(
     if producer_node is None:
         return None
     op_type = str(producer_node.op_type)
-    if op_type in {"Clip", "Exp", "Identity", "LeakyRelu", "Neg", "Relu", "Sigmoid"} and producer_node.input:
-        return _onnx_resolve_rank4_shape(
+    if op_type in _ONNX_STATIC_SHAPE_PASSTHROUGH_OP_TYPES and producer_node.input:
+        return _onnx_resolve_static_shape(
             graph,
             str(producer_node.input[0]),
             producer_map=producer_map,
             depth=depth + 1,
         )
     if op_type in {"Add", "Div", "Max", "Min", "Mul", "Sub"} and len(producer_node.input) == 2:
-        lhs_shape = _onnx_resolve_rank4_shape(
+        lhs_shape = _onnx_resolve_static_shape(
             graph,
             str(producer_node.input[0]),
             producer_map=producer_map,
             depth=depth + 1,
         )
-        rhs_shape = _onnx_resolve_rank4_shape(
+        rhs_shape = _onnx_resolve_static_shape(
             graph,
             str(producer_node.input[1]),
             producer_map=producer_map,
@@ -12168,6 +12442,9 @@ def _onnx_resolve_rank4_shape(
             return rhs_shape
         if rhs_shape is None:
             return lhs_shape
+        max_rank = max(len(lhs_shape), len(rhs_shape))
+        lhs_shape = [1] * (max_rank - len(lhs_shape)) + list(lhs_shape)
+        rhs_shape = [1] * (max_rank - len(rhs_shape)) + list(rhs_shape)
         resolved: List[int] = []
         for lhs_dim, rhs_dim in zip(lhs_shape, rhs_shape):
             if lhs_dim == rhs_dim:
@@ -12180,10 +12457,10 @@ def _onnx_resolve_rank4_shape(
                 return None
         return resolved
     if op_type == "Concat":
-        axis = int(_onnx_node_attr(producer_node, "axis") or -1)
+        axis = int(_onnx_node_attr(producer_node, "axis") or 0)
         input_shapes: List[List[int]] = []
         for input_name in list(producer_node.input):
-            input_shape = _onnx_resolve_rank4_shape(
+            input_shape = _onnx_resolve_static_shape(
                 graph,
                 str(input_name),
                 producer_map=producer_map,
@@ -12192,7 +12469,14 @@ def _onnx_resolve_rank4_shape(
             if input_shape is None:
                 return None
             input_shapes.append(input_shape)
-        if not input_shapes or axis < 0 or axis >= 4:
+        if not input_shapes:
+            return None
+        rank = len(input_shapes[0])
+        if any(len(input_shape) != rank for input_shape in input_shapes):
+            return None
+        if axis < 0:
+            axis += rank
+        if axis < 0 or axis >= rank:
             return None
         base_shape = list(input_shapes[0])
         concat_dim = 0
@@ -12205,17 +12489,35 @@ def _onnx_resolve_rank4_shape(
         base_shape[axis] = int(concat_dim)
         return base_shape
     if op_type == "Transpose" and producer_node.input:
-        perm = list(_onnx_node_attr(producer_node, "perm") or [])
-        input_shape = _onnx_resolve_rank4_shape(
+        perm = [int(v) for v in list(_onnx_node_attr(producer_node, "perm") or [])]
+        input_shape = _onnx_resolve_static_shape(
             graph,
             str(producer_node.input[0]),
             producer_map=producer_map,
             depth=depth + 1,
         )
-        if input_shape is None or len(perm) != 4:
+        if input_shape is None or len(perm) != len(input_shape):
             return None
         return [int(input_shape[index]) for index in perm]
     return None
+
+
+def _onnx_resolve_rank4_shape(
+    graph: onnx.GraphProto,
+    name: str,
+    *,
+    producer_map: Optional[Dict[str, onnx.NodeProto]] = None,
+    depth: int = 0,
+) -> Optional[List[int]]:
+    resolved_shape = _onnx_resolve_static_shape(
+        graph,
+        name,
+        producer_map=producer_map,
+        depth=depth,
+    )
+    if resolved_shape is None or len(resolved_shape) != 4:
+        return None
+    return resolved_shape
 
 
 def _onnx_convert_pads_nhwc_to_nchw(pads: Sequence[int] | np.ndarray) -> Optional[np.ndarray]:
@@ -12247,29 +12549,49 @@ def _onnx_rewrite_slice_axis_to_nchw_in_place(
 
 
 def _onnx_fold_relu_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    layout_preserving_unary_op_types = {
+        "Clip",
+        "Elu",
+        "Exp",
+        "Identity",
+        "LeakyRelu",
+        "Relu",
+        "Sigmoid",
+        "Tanh",
+    }
     _, consumer_map = _onnx_node_maps(graph)
     remove_node_names: List[str] = []
     for transpose_node in list(graph.node):
         if str(transpose_node.op_type) != "Transpose":
             continue
-        if list(_onnx_node_attr(transpose_node, "perm") or []) != [0, 2, 3, 1]:
+        transpose_perm = [int(v) for v in list(_onnx_node_attr(transpose_node, "perm") or [])]
+        if not transpose_perm:
             continue
         transpose_consumers = consumer_map.get(str(transpose_node.output[0]), [])
         if len(transpose_consumers) != 1:
             continue
-        relu_node = transpose_consumers[0]
-        if str(relu_node.op_type) != "Relu":
+        unary_node = transpose_consumers[0]
+        if str(unary_node.op_type) not in layout_preserving_unary_op_types:
             continue
-        relu_consumers = consumer_map.get(str(relu_node.output[0]), [])
-        if len(relu_consumers) != 1:
+        unary_consumers = consumer_map.get(str(unary_node.output[0]), [])
+        if len(unary_consumers) != 1:
             continue
-        inverse_node = relu_consumers[0]
+        inverse_node = unary_consumers[0]
         if str(inverse_node.op_type) != "Transpose":
             continue
-        if list(_onnx_node_attr(inverse_node, "perm") or []) != [0, 3, 1, 2]:
+        inverse_perm = [0] * len(transpose_perm)
+        for perm_index, perm_value in enumerate(transpose_perm):
+            perm_value_int = int(perm_value)
+            if perm_value_int < 0 or perm_value_int >= len(transpose_perm):
+                inverse_perm = []
+                break
+            inverse_perm[perm_value_int] = int(perm_index)
+        if not inverse_perm:
             continue
-        relu_node.input[0] = str(transpose_node.input[0])
-        relu_node.output[0] = str(inverse_node.output[0])
+        if [int(v) for v in list(_onnx_node_attr(inverse_node, "perm") or [])] != inverse_perm:
+            continue
+        unary_node.input[0] = str(transpose_node.input[0])
+        unary_node.output[0] = str(inverse_node.output[0])
         remove_node_names.extend([str(transpose_node.name), str(inverse_node.name)])
     _onnx_remove_nodes_by_name(graph, remove_node_names)
 
@@ -12408,6 +12730,186 @@ def _onnx_fold_inverse_transpose_pairs_in_place(graph: onnx.GraphProto) -> None:
         )
         remove_node_names.extend([str(first_node.name), str(second_node.name)])
     _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_pad_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for inverse_transpose_node in list(graph.node):
+        if str(inverse_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(inverse_transpose_node, "perm") or []) != [0, 3, 1, 2]:
+            continue
+        if not inverse_transpose_node.input or not inverse_transpose_node.output:
+            continue
+        pad_node = producer_map.get(str(inverse_transpose_node.input[0]))
+        if pad_node is None or str(pad_node.op_type) != "Pad" or len(pad_node.input) < 2:
+            continue
+        if len(consumer_map.get(str(pad_node.output[0]), [])) != 1:
+            continue
+        input_transpose_node = producer_map.get(str(pad_node.input[0]))
+        if input_transpose_node is None or str(input_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(input_transpose_node, "perm") or []) != [0, 2, 3, 1]:
+            continue
+        if len(consumer_map.get(str(input_transpose_node.output[0]), [])) != 1:
+            continue
+        pad_name = str(pad_node.input[1])
+        pad_values = _onnx_get_initializer_array(graph, pad_name)
+        nchw_pad_values = (
+            _onnx_convert_pads_nhwc_to_nchw(pad_values)
+            if pad_values is not None
+            else None
+        )
+        if nchw_pad_values is None:
+            continue
+        new_pad_name = _onnx_make_unique_initializer_name(graph, f"{pad_name}_nchw")
+        _onnx_set_initializer_array(graph, name=new_pad_name, array=nchw_pad_values)
+        pad_node.input[0] = str(input_transpose_node.input[0])
+        pad_node.input[1] = str(new_pad_name)
+        _onnx_replace_all_node_inputs(
+            graph,
+            old_name=str(inverse_transpose_node.output[0]),
+            new_name=str(pad_node.output[0]),
+        )
+        remove_node_names.extend([str(input_transpose_node.name), str(inverse_transpose_node.name)])
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_residual_add_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    layout_preserving_unary_op_types = {
+        "Clip",
+        "Identity",
+        "LeakyRelu",
+        "Relu",
+        "Sigmoid",
+    }
+    while True:
+        producer_map, consumer_map = _onnx_node_maps(graph)
+        optimized = False
+        for add_node in list(graph.node):
+            if str(add_node.op_type) != "Add" or len(add_node.input) != 2:
+                continue
+            add_output_name = str(add_node.output[0]) if add_node.output else ""
+            if add_output_name == "":
+                continue
+
+            rewritten_inputs: List[str] = []
+            remove_node_names: List[str] = []
+            expected_shape: Optional[List[int]] = None
+            valid_inputs = True
+            for input_name in list(add_node.input):
+                input_str = str(input_name)
+                input_producer = producer_map.get(input_str)
+                if (
+                    input_producer is not None
+                    and str(input_producer.op_type) == "Transpose"
+                    and list(_onnx_node_attr(input_producer, "perm") or []) == [0, 2, 3, 1]
+                    and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                    and input_producer.input
+                ):
+                    source_name = str(input_producer.input[0])
+                    source_shape = _onnx_resolve_rank4_shape(
+                        graph,
+                        source_name,
+                        producer_map=producer_map,
+                    )
+                    if source_shape is None or len(source_shape) != 4:
+                        valid_inputs = False
+                        break
+                    if expected_shape is None:
+                        expected_shape = [int(v) for v in list(source_shape)]
+                    elif [int(v) for v in list(source_shape)] != expected_shape:
+                        valid_inputs = False
+                        break
+                    rewritten_inputs.append(source_name)
+                    remove_node_names.append(str(input_producer.name))
+                    continue
+                input_shape = _onnx_resolve_rank4_shape(
+                    graph,
+                    input_str,
+                    producer_map=producer_map,
+                )
+                if input_shape is None or len(input_shape) != 4:
+                    valid_inputs = False
+                    break
+                if expected_shape is None:
+                    expected_shape = [int(v) for v in list(input_shape)]
+                elif [int(v) for v in list(input_shape)] != expected_shape:
+                    valid_inputs = False
+                    break
+                rewritten_inputs.append(input_str)
+            if not valid_inputs:
+                continue
+            if rewritten_inputs == [str(v) for v in list(add_node.input)]:
+                continue
+
+            add_consumers = consumer_map.get(add_output_name, [])
+            if len(add_consumers) != 1:
+                continue
+            first_consumer = add_consumers[0]
+
+            trailing_relu_node: Optional[onnx.NodeProto] = None
+            trailing_transpose_node: Optional[onnx.NodeProto] = None
+            conv_anchor_name = ""
+
+            if str(first_consumer.op_type) in layout_preserving_unary_op_types:
+                relu_consumers = consumer_map.get(str(first_consumer.output[0]), [])
+                if not relu_consumers:
+                    continue
+                transpose_consumers = [
+                    node
+                    for node in relu_consumers
+                    if str(node.op_type) == "Transpose"
+                    and list(_onnx_node_attr(node, "perm") or []) == [0, 3, 1, 2]
+                ]
+                if len(transpose_consumers) != 1:
+                    continue
+                candidate_transpose = transpose_consumers[0]
+                transpose_output_consumers = consumer_map.get(str(candidate_transpose.output[0]), [])
+                if (
+                    not transpose_output_consumers
+                    or not all(str(node.op_type) == "Conv" for node in transpose_output_consumers)
+                ):
+                    continue
+                trailing_relu_node = first_consumer
+                trailing_transpose_node = candidate_transpose
+                conv_anchor_name = str(candidate_transpose.output[0])
+            elif (
+                str(first_consumer.op_type) == "Transpose"
+                and list(_onnx_node_attr(first_consumer, "perm") or []) == [0, 3, 1, 2]
+            ):
+                transpose_consumers = consumer_map.get(str(first_consumer.output[0]), [])
+                if len(transpose_consumers) != 1:
+                    continue
+                candidate_relu = transpose_consumers[0]
+                if str(candidate_relu.op_type) not in layout_preserving_unary_op_types:
+                    continue
+                relu_consumers = consumer_map.get(str(candidate_relu.output[0]), [])
+                if not relu_consumers or not all(str(node.op_type) == "Conv" for node in relu_consumers):
+                    continue
+                trailing_transpose_node = first_consumer
+                trailing_relu_node = candidate_relu
+                conv_anchor_name = str(first_consumer.output[0])
+            else:
+                continue
+
+            for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+                add_node.input[input_index] = str(rewritten_input_name)
+            if str(trailing_relu_node.input[0]) != add_output_name:
+                trailing_relu_node.input[0] = add_output_name
+            if str(first_consumer.op_type) in layout_preserving_unary_op_types:
+                _onnx_replace_all_node_inputs(
+                    graph,
+                    old_name=conv_anchor_name,
+                    new_name=str(trailing_relu_node.output[0]),
+                )
+            remove_node_names.append(str(trailing_transpose_node.name))
+            _onnx_remove_nodes_by_name(graph, remove_node_names)
+            optimized = True
+            break
+        if not optimized:
+            break
 
 
 def _onnx_remove_passthrough_identity_nodes_in_place(graph: onnx.GraphProto) -> None:
@@ -13293,12 +13795,21 @@ def _onnx_fold_binary_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
         "Mul",
         "Sub",
     }
+    layout_preserving_unary_op_types = {
+        "Clip",
+        "Exp",
+        "Identity",
+        "LeakyRelu",
+        "Relu",
+        "Sigmoid",
+    }
     producer_map, consumer_map = _onnx_node_maps(graph)
     remove_node_names: List[str] = []
     for binary_node in list(graph.node):
         if str(binary_node.op_type) not in binary_op_types or len(binary_node.input) != 2:
             continue
         rewritten_inputs: List[str] = []
+        local_remove_node_names: List[str] = []
         rewritten_any = False
         expected_shape: Optional[List[int]] = None
         valid = True
@@ -13331,7 +13842,7 @@ def _onnx_fold_binary_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
                     valid = False
                     break
                 rewritten_inputs.append(source_name)
-                remove_node_names.append(str(input_producer.name))
+                local_remove_node_names.append(str(input_producer.name))
                 rewritten_any = True
                 continue
             input_shape = _onnx_resolve_rank4_shape(
@@ -13339,6 +13850,20 @@ def _onnx_fold_binary_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
                 input_str,
                 producer_map=producer_map,
             )
+            input_producer = producer_map.get(input_str)
+            if (
+                input_producer is not None
+                and str(input_producer.op_type) in layout_preserving_unary_op_types
+                and input_producer.input
+            ):
+                unary_input_producer = producer_map.get(str(input_producer.input[0]))
+                if (
+                    unary_input_producer is not None
+                    and str(unary_input_producer.op_type) == "Transpose"
+                    and list(_onnx_node_attr(unary_input_producer, "perm") or []) == [0, 2, 3, 1]
+                ):
+                    valid = False
+                    break
             if input_shape is None or len(input_shape) != 4:
                 valid = False
                 break
@@ -13352,6 +13877,297 @@ def _onnx_fold_binary_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
             continue
         for input_index, rewritten_input_name in enumerate(rewritten_inputs):
             binary_node.input[input_index] = str(rewritten_input_name)
+        remove_node_names.extend(local_remove_node_names)
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_unary_binary_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    binary_op_types = {
+        "Add",
+        "Div",
+        "Max",
+        "Min",
+        "Mul",
+        "Sub",
+    }
+    layout_preserving_unary_op_types = {
+        "Clip",
+        "Exp",
+        "Identity",
+        "LeakyRelu",
+        "Relu",
+        "Sigmoid",
+    }
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for inverse_transpose_node in list(graph.node):
+        if str(inverse_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(inverse_transpose_node, "perm") or []) != [0, 3, 1, 2]:
+            continue
+        binary_output_name = str(inverse_transpose_node.input[0]) if inverse_transpose_node.input else ""
+        if binary_output_name == "":
+            continue
+        binary_node = producer_map.get(binary_output_name)
+        if binary_node is None or str(binary_node.op_type) not in binary_op_types or len(binary_node.input) != 2:
+            continue
+        if len(consumer_map.get(str(binary_node.output[0]), [])) != 1:
+            continue
+        rewritten_inputs: List[str] = []
+        local_remove_node_names: List[str] = [str(inverse_transpose_node.name)]
+        valid = True
+        rewritten_any = False
+        for input_name in list(binary_node.input):
+            input_str = str(input_name)
+            scalar_initializer = _onnx_get_initializer_array(graph, input_str)
+            if scalar_initializer is not None and int(np.asarray(scalar_initializer).size) == 1:
+                rewritten_inputs.append(input_str)
+                continue
+            input_producer = producer_map.get(input_str)
+            if (
+                input_producer is not None
+                and str(input_producer.op_type) == "Transpose"
+                and list(_onnx_node_attr(input_producer, "perm") or []) == [0, 2, 3, 1]
+                and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                and input_producer.input
+            ):
+                rewritten_inputs.append(str(input_producer.input[0]))
+                local_remove_node_names.append(str(input_producer.name))
+                rewritten_any = True
+                continue
+            if (
+                input_producer is not None
+                and str(input_producer.op_type) in layout_preserving_unary_op_types
+                and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                and input_producer.input
+            ):
+                unary_input_name = str(input_producer.input[0])
+                unary_input_producer = producer_map.get(unary_input_name)
+                if (
+                    unary_input_producer is not None
+                    and str(unary_input_producer.op_type) == "Transpose"
+                    and list(_onnx_node_attr(unary_input_producer, "perm") or []) == [0, 2, 3, 1]
+                    and len(consumer_map.get(str(unary_input_producer.output[0]), [])) == 1
+                    and unary_input_producer.input
+                ):
+                    input_producer.input[0] = str(unary_input_producer.input[0])
+                    rewritten_inputs.append(str(input_producer.output[0]))
+                    local_remove_node_names.append(str(unary_input_producer.name))
+                    rewritten_any = True
+                    continue
+            valid = False
+            break
+        if not valid or not rewritten_any or len(rewritten_inputs) != 2:
+            continue
+        for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+            binary_node.input[input_index] = str(rewritten_input_name)
+        binary_node.output[0] = str(inverse_transpose_node.output[0])
+        remove_node_names.extend(local_remove_node_names)
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_unary_binary_reduce_mean_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    binary_op_types = {
+        "Add",
+        "Div",
+        "Max",
+        "Min",
+        "Mul",
+        "Sub",
+    }
+    layout_preserving_unary_op_types = {
+        "Clip",
+        "Exp",
+        "Identity",
+        "LeakyRelu",
+        "Relu",
+        "Sigmoid",
+        "Tanh",
+    }
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for inverse_transpose_node in list(graph.node):
+        if str(inverse_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(inverse_transpose_node, "perm") or []) != [0, 3, 1, 2]:
+            continue
+        binary_output_name = str(inverse_transpose_node.input[0]) if inverse_transpose_node.input else ""
+        if binary_output_name == "":
+            continue
+        binary_node = producer_map.get(binary_output_name)
+        if binary_node is None or str(binary_node.op_type) not in binary_op_types or len(binary_node.input) != 2:
+            continue
+        rewritten_inputs: List[str] = []
+        local_remove_node_names: List[str] = [str(inverse_transpose_node.name)]
+        rewritten_any = False
+        valid = True
+        for input_name in list(binary_node.input):
+            input_str = str(input_name)
+            scalar_initializer = _onnx_get_initializer_array(graph, input_str)
+            if scalar_initializer is not None and int(np.asarray(scalar_initializer).size) == 1:
+                rewritten_inputs.append(input_str)
+                continue
+            input_producer = producer_map.get(input_str)
+            if (
+                input_producer is not None
+                and str(input_producer.op_type) == "Transpose"
+                and list(_onnx_node_attr(input_producer, "perm") or []) == [0, 2, 3, 1]
+                and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                and input_producer.input
+            ):
+                rewritten_inputs.append(str(input_producer.input[0]))
+                local_remove_node_names.append(str(input_producer.name))
+                rewritten_any = True
+                continue
+            if (
+                input_producer is not None
+                and str(input_producer.op_type) in layout_preserving_unary_op_types
+                and len(consumer_map.get(str(input_producer.output[0]), [])) == 1
+                and input_producer.input
+            ):
+                unary_input_name = str(input_producer.input[0])
+                unary_input_producer = producer_map.get(unary_input_name)
+                if (
+                    unary_input_producer is not None
+                    and str(unary_input_producer.op_type) == "Transpose"
+                    and list(_onnx_node_attr(unary_input_producer, "perm") or []) == [0, 2, 3, 1]
+                    and len(consumer_map.get(str(unary_input_producer.output[0]), [])) == 1
+                    and unary_input_producer.input
+                ):
+                    input_producer.input[0] = str(unary_input_producer.input[0])
+                    rewritten_inputs.append(str(input_producer.output[0]))
+                    local_remove_node_names.append(str(unary_input_producer.name))
+                    rewritten_any = True
+                    continue
+            valid = False
+            break
+        if not valid or not rewritten_any or len(rewritten_inputs) != 2:
+            continue
+
+        binary_consumers = list(consumer_map.get(str(binary_node.output[0]), []))
+        for consumer_node in binary_consumers:
+            if str(consumer_node.name) == str(inverse_transpose_node.name):
+                continue
+            if str(consumer_node.op_type) != "ReduceMean":
+                valid = False
+                break
+            if len(consumer_map.get(str(consumer_node.output[0]), [])) != 1:
+                valid = False
+                break
+            axes_name = str(consumer_node.input[1]) if len(consumer_node.input) >= 2 else ""
+            axes_array = _onnx_get_initializer_array(graph, axes_name)
+            if axes_array is None or [int(v) for v in axes_array.reshape(-1)] != [1, 2]:
+                valid = False
+                break
+            if int(_onnx_node_attr(consumer_node, "keepdims") or 0) != 1:
+                valid = False
+                break
+            reduce_inverse_node = consumer_map.get(str(consumer_node.output[0]), [None])[0]
+            if (
+                reduce_inverse_node is None
+                or str(reduce_inverse_node.op_type) != "Transpose"
+                or list(_onnx_node_attr(reduce_inverse_node, "perm") or []) != [0, 3, 1, 2]
+            ):
+                valid = False
+                break
+            new_axes_name = _onnx_make_unique_initializer_name(graph, f"{axes_name}_nchw")
+            _onnx_set_initializer_array(graph, name=new_axes_name, array=np.asarray([2, 3], dtype=np.int64))
+            consumer_node.input[1] = str(new_axes_name)
+            _onnx_replace_all_node_inputs(
+                graph,
+                old_name=str(reduce_inverse_node.output[0]),
+                new_name=str(consumer_node.output[0]),
+            )
+            local_remove_node_names.append(str(reduce_inverse_node.name))
+
+        if not valid:
+            continue
+
+        for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+            binary_node.input[input_index] = str(rewritten_input_name)
+        _onnx_replace_all_node_inputs(
+            graph,
+            old_name=str(inverse_transpose_node.output[0]),
+            new_name=str(binary_node.output[0]),
+        )
+        remove_node_names.extend(local_remove_node_names)
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_mul_add_clip_to_hardsigmoid_in_place(graph: onnx.GraphProto) -> None:
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    graph_output_names = {str(output.name) for output in graph.output}
+    remove_node_names: List[str] = []
+    alpha_ref = float(1.0 / 6.0)
+    beta_ref = 0.5
+    eps = 1e-6
+    for clip_node in list(graph.node):
+        if str(clip_node.op_type) != "Clip" or len(clip_node.input) != 3 or len(clip_node.output) != 1:
+            continue
+        clip_min = _onnx_get_initializer_scalar(graph, str(clip_node.input[1]))
+        clip_max = _onnx_get_initializer_scalar(graph, str(clip_node.input[2]))
+        if (
+            clip_min is None
+            or clip_max is None
+            or abs(float(clip_min) - 0.0) > eps
+            or abs(float(clip_max) - 1.0) > eps
+        ):
+            continue
+        add_node = producer_map.get(str(clip_node.input[0]))
+        if add_node is None or str(add_node.op_type) != "Add" or len(add_node.input) != 2 or len(add_node.output) != 1:
+            continue
+        if len(consumer_map.get(str(add_node.output[0]), [])) != 1:
+            continue
+        if str(add_node.output[0]) in graph_output_names:
+            continue
+        add_const_index: Optional[int] = None
+        add_const_value: Optional[float] = None
+        mul_output_index: Optional[int] = None
+        for input_index, input_name in enumerate(list(add_node.input)):
+            scalar_value = _onnx_get_initializer_scalar(graph, str(input_name))
+            if scalar_value is not None:
+                add_const_index = int(input_index)
+                add_const_value = float(scalar_value)
+            else:
+                mul_output_index = int(input_index)
+        if (
+            add_const_index is None
+            or mul_output_index is None
+            or add_const_value is None
+            or abs(float(add_const_value) - beta_ref) > eps
+        ):
+            continue
+        mul_node = producer_map.get(str(add_node.input[mul_output_index]))
+        if mul_node is None or str(mul_node.op_type) != "Mul" or len(mul_node.input) != 2 or len(mul_node.output) != 1:
+            continue
+        if len(consumer_map.get(str(mul_node.output[0]), [])) != 1:
+            continue
+        if str(mul_node.output[0]) in graph_output_names:
+            continue
+        mul_const_index: Optional[int] = None
+        mul_const_value: Optional[float] = None
+        source_input_index: Optional[int] = None
+        for input_index, input_name in enumerate(list(mul_node.input)):
+            scalar_value = _onnx_get_initializer_scalar(graph, str(input_name))
+            if scalar_value is not None:
+                mul_const_index = int(input_index)
+                mul_const_value = float(scalar_value)
+            else:
+                source_input_index = int(input_index)
+        if (
+            mul_const_index is None
+            or source_input_index is None
+            or mul_const_value is None
+            or abs(float(mul_const_value) - alpha_ref) > eps
+        ):
+            continue
+        add_node.op_type = "HardSigmoid"
+        add_node.input[:] = [str(mul_node.input[source_input_index])]
+        add_node.output[:] = [str(clip_node.output[0])]
+        del add_node.attribute[:]
+        _onnx_set_node_attr(add_node, "alpha", float(alpha_ref))
+        _onnx_set_node_attr(add_node, "beta", float(beta_ref))
+        remove_node_names.extend([str(mul_node.name), str(clip_node.name)])
     _onnx_remove_nodes_by_name(graph, remove_node_names)
 
 
@@ -13445,7 +14261,10 @@ def _optimize_dynamo_exported_onnx_in_place(model: onnx.ModelProto) -> None:
         _onnx_optimize_pidnet_spp_transpose_bridges_in_place(model.graph)
         _onnx_optimize_pphumanseg_add_resize_layout_bridges_in_place(model.graph)
         _onnx_fold_singleton_concat_slice_layout_bridges_in_place(model.graph)
+        _onnx_fold_unary_binary_reduce_mean_layout_bridges_in_place(model.graph)
+        _onnx_fold_unary_binary_layout_bridges_in_place(model.graph)
         _onnx_fold_binary_layout_bridges_in_place(model.graph)
+        _onnx_fold_mul_add_clip_to_hardsigmoid_in_place(model.graph)
         _onnx_fold_singleton_binary_layout_bridges_in_place(model.graph)
         _onnx_fold_concat_layout_bridges_in_place(model.graph)
         _onnx_fold_pad_concat_layout_bridges_in_place(model.graph)
@@ -13481,6 +14300,16 @@ def _sanitize_dynamo_exported_onnx_metadata(onnx_path: Path) -> None:
     external_data_sidecar_path = onnx_path.with_name(f"{onnx_path.name}.data")
     original_uses_external_data = _inspect_onnx_uses_external_data(onnx_path)
     model = onnx.load(str(onnx_path))
+    _onnx_fold_relu_layout_bridges_in_place(model.graph)
+    _onnx_fold_pad_layout_bridges_in_place(model.graph)
+    _onnx_fold_residual_add_layout_bridges_in_place(model.graph)
+    _onnx_repair_inferred_shapes_in_place(model)
+    _onnx_fold_residual_add_layout_bridges_in_place(model.graph)
+    _onnx_repair_inferred_shapes_in_place(model)
+    _optimize_dynamo_exported_onnx_in_place(model)
+    import onnx2tf.gs as gs
+    model = gs.export_onnx(gs.import_onnx(model).cleanup().toposort())
+    _onnx_repair_inferred_shapes_in_place(model)
     del model.metadata_props[:]
     _clear_onnx_graph_and_node_metadata_in_place(model.graph)
     onnx.checker.check_model(model)
@@ -14073,6 +14902,7 @@ def export_exported_program_from_generated_package(
             },
         )
         return None
+    _rewrite_generated_model_source_for_exported_program(package_path, model_ir=None)
     try:
         example_inputs, example_input_shapes, dynamic_inputs_present = _build_pytorch_export_example_inputs(
             package_dir=package_dir,
@@ -16196,6 +17026,19 @@ def _fold_inverse_permute_round_trips_in_exported_program_archive(
             shape.append(int(dim))
         return shape
 
+    def _scalar_arg_value(arg: Any) -> Optional[float]:
+        if isinstance(arg, (int, float, bool)):
+            return float(arg)
+        if not isinstance(arg, torch.fx.Node):
+            return None
+        tensor_value = _constant_tensor_value(arg)
+        if isinstance(tensor_value, torch.Tensor) and int(tensor_value.numel()) == 1:
+            try:
+                return float(tensor_value.reshape(-1)[0].item())
+            except Exception:
+                return None
+        return None
+
     def _first_meta_source_node(node: torch.fx.Node) -> Optional[torch.fx.Node]:
         for arg in node.args:
             if isinstance(arg, torch.fx.Node) and _rank_shape(arg) is not None:
@@ -16488,6 +17331,113 @@ def _fold_inverse_permute_round_trips_in_exported_program_archive(
 
     def _run_one_pass() -> bool:
         local_changed = False
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+                or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+            ):
+                continue
+            clamp_node = node.args[0]
+            if (
+                not isinstance(clamp_node, torch.fx.Node)
+                or clamp_node.op != "call_function"
+                or str(clamp_node.target) != "aten.clamp.default"
+                or len(clamp_node.args) < 3
+            ):
+                continue
+            clamp_min = _scalar_arg_value(clamp_node.args[1])
+            clamp_max = _scalar_arg_value(clamp_node.args[2])
+            if clamp_min is None or clamp_max is None or abs(clamp_min) > 1e-6 or abs(clamp_max - 1.0) > 1e-6:
+                continue
+            clamp_input = clamp_node.args[0]
+            if (
+                not isinstance(clamp_input, torch.fx.Node)
+                or clamp_input.op != "call_function"
+                or str(clamp_input.target) != "aten.contiguous.default"
+                or len(clamp_input.args) < 1
+                or not isinstance(clamp_input.args[0], torch.fx.Node)
+            ):
+                continue
+            permute_node = clamp_input.args[0]
+            if (
+                permute_node.op != "call_function"
+                or str(permute_node.target) != "aten.permute.default"
+                or len(permute_node.args) < 2
+                or _normalize_perm(permute_node.args[1]) != [0, 2, 3, 1]
+                or not isinstance(permute_node.args[0], torch.fx.Node)
+            ):
+                continue
+            add_node = permute_node.args[0]
+            if (
+                add_node.op != "call_function"
+                or str(add_node.target) != "aten.add.Tensor"
+                or len(add_node.args) != 2
+            ):
+                continue
+            add_const_index: Optional[int] = None
+            add_input_index: Optional[int] = None
+            for input_index, arg in enumerate(list(add_node.args)):
+                scalar_value = _scalar_arg_value(arg)
+                if scalar_value is not None and abs(scalar_value - 0.5) <= 1e-6:
+                    add_const_index = int(input_index)
+                elif isinstance(arg, torch.fx.Node):
+                    add_input_index = int(input_index)
+            if add_const_index is None or add_input_index is None:
+                continue
+            mul_node = add_node.args[add_input_index]
+            if (
+                not isinstance(mul_node, torch.fx.Node)
+                or mul_node.op != "call_function"
+                or str(mul_node.target) != "aten.mul.Tensor"
+                or len(mul_node.args) != 2
+            ):
+                continue
+            mul_const_index: Optional[int] = None
+            mul_input_index: Optional[int] = None
+            for input_index, arg in enumerate(list(mul_node.args)):
+                scalar_value = _scalar_arg_value(arg)
+                if scalar_value is not None and abs(scalar_value - (1.0 / 6.0)) <= 1e-6:
+                    mul_const_index = int(input_index)
+                elif isinstance(arg, torch.fx.Node):
+                    mul_input_index = int(input_index)
+            if mul_const_index is None or mul_input_index is None:
+                continue
+            source = mul_node.args[mul_input_index]
+            if not isinstance(source, torch.fx.Node):
+                continue
+            if len(list(mul_node.users)) != 1 or add_node not in mul_node.users:
+                continue
+            if len(list(add_node.users)) != 1 or permute_node not in add_node.users:
+                continue
+            if len(list(permute_node.users)) != 1 or clamp_input not in permute_node.users:
+                continue
+            if len(list(clamp_input.users)) != 1 or clamp_node not in clamp_input.users:
+                continue
+            if len(list(clamp_node.users)) != 1 or node not in clamp_node.users:
+                continue
+            with graph.inserting_before(mul_node):
+                folded_hardsigmoid = graph.call_function(
+                    torch.ops.aten.hardsigmoid.default,
+                    args=(source,),
+                    kwargs={},
+                )
+            folded_hardsigmoid.meta = _shape_meta_from_node(source, _rank_shape(source) or [])
+            node_users = list(node.users)
+            if (
+                len(node_users) == 1
+                and node_users[0].op == "call_function"
+                and str(node_users[0].target) == "aten.contiguous.default"
+                and str(node_users[0].name) not in user_output_names
+            ):
+                node_users[0].replace_all_uses_with(folded_hardsigmoid)
+            elif str(node.name) not in user_output_names:
+                node.replace_all_uses_with(folded_hardsigmoid)
+            else:
+                continue
+            local_changed = True
 
         for node in list(graph.nodes):
             if (
@@ -17703,14 +18653,25 @@ def _canonicalize_generated_model_source_for_raw_export(
                 insert_index += 1
             lines.insert(insert_index, "")
             lines.insert(insert_index, suppress_apply_line)
+    lines = _fold_channel_first_gap_conv_bridges(lines)
+    lines = _repair_channel_last_gap_conv_inputs(lines)
+    lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+    lines = _rewrite_channel_first_gap_outputs_to_explicit_channel_last(lines)
+    lines = _rewrite_channel_last_gap_means_to_reduce_mean(lines)
     model_ir_shape_map: Dict[str, List[int]] = {}
     model_ir_cf_names: Set[str] = set()
     tensor_name_by_var_name: Dict[str, str] = {}
+    public_output_name_by_var_name: Dict[str, str] = {}
     if model_ir is not None:
         tensor_var_name_map = _build_tensor_var_name_map(model_ir)
         tensor_name_by_var_name = {
             str(var_name): str(tensor_name)
             for tensor_name, var_name in tensor_var_name_map.items()
+        }
+        public_output_name_by_var_name = {
+            str(var_name): str(tensor_name)
+            for tensor_name, var_name in tensor_var_name_map.items()
+            if str(tensor_name) in {str(name) for name in list(model_ir.outputs)}
         }
         for tensor_name, tensor in model_ir.tensors.items():
             shape_values = list(getattr(tensor, "shape", []) or [])
@@ -17733,6 +18694,36 @@ def _canonicalize_generated_model_source_for_raw_export(
 
     def _model_ir_is_channel_first(name: str) -> bool:
         return _resolve_model_ir_tensor_name(name) in model_ir_cf_names
+
+    def _eventual_public_output_exact_shape(
+        source_name: str,
+        start_index: int,
+    ) -> List[int] | None:
+        direct_output_name = public_output_name_by_var_name.get(str(source_name), None)
+        if direct_output_name is not None:
+            return _model_ir_exact_shape(direct_output_name)
+        function_end = _function_end_index(start_index)
+        reachable_names: Set[str] = {str(source_name)}
+        for future_index in range(start_index + 1, function_end):
+            alias_match = generic_alias_re.match(lines[future_index])
+            if (
+                alias_match is not None
+                and str(alias_match.group("rhs")) in reachable_names
+            ):
+                alias_name = str(alias_match.group("lhs"))
+                reachable_names.add(alias_name)
+                output_name = public_output_name_by_var_name.get(alias_name, None)
+                if output_name is not None:
+                    return _model_ir_exact_shape(output_name)
+            return_match = return_value_re.match(lines[future_index])
+            if return_match is not None:
+                output_name = public_output_name_by_var_name.get(
+                    str(return_match.group("value")),
+                    None,
+                )
+                if output_name is not None and str(return_match.group("value")) in reachable_names:
+                    return _model_ir_exact_shape(output_name)
+        return None
 
     register_buffer_re = re.compile(
         r"^(?P<indent>\s*)self\.register_buffer\('(?P<name>[A-Za-z0-9_]+)', torch\.zeros\(\[(?P<shape>[0-9, ]+)\], dtype=torch\.(?P<dtype>[A-Za-z0-9_]+)\), persistent=(?P<persistent>True|False)\)$"
@@ -18694,6 +19685,16 @@ def _canonicalize_generated_model_source_for_raw_export(
                 else None
             )
             resolved_src_name = _resolve_model_ir_tensor_name(src)
+            src_layout = (
+                normalize_logical_layout(src_tensor.logical_layout)
+                if src_tensor is not None
+                else LOGICAL_LAYOUT_UNKNOWN
+            )
+            src_runtime_is_cf = _is_known_cf_name(src, singleton_cf_seeds)
+            src_declares_channel_last = (
+                src_tensor is not None
+                and is_channel_last_logical_layout(src_layout)
+            )
             if (
                 target_shape_text is not None
                 and src_exact_shape is not None
@@ -18701,8 +19702,13 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and len(src_exact_shape) == 4
                 and len(lhs_exact_shape) == 3
                 and src_tensor is not None
-                and is_channel_first_logical_layout(normalize_logical_layout(src_tensor.logical_layout))
-                and _tensor_name_suggests_channel_last_layout_for_codegen(resolved_src_name)
+                and (
+                    (
+                        is_channel_first_logical_layout(src_layout)
+                        and _tensor_name_suggests_channel_last_layout_for_codegen(resolved_src_name)
+                    )
+                    or (src_runtime_is_cf and src_declares_channel_last)
+                )
             ):
                 target_shape = [
                     int(value.strip())
@@ -20341,6 +21347,13 @@ def _canonicalize_generated_model_source_for_raw_export(
                     if re.search(rf"\b{re.escape(alias)}\b", future_line) is not None
                 ]
                 immediate_uses = "\n".join(lines[index + 1:index + 4])
+                alias_consumed_by_rank3_reshape = any(
+                    (
+                        rank3_reshape_from_rank4_source_re.match(future_line) is not None
+                        and str(cast(re.Match[str], rank3_reshape_from_rank4_source_re.match(future_line)).group("src")) == alias
+                    )
+                    for future_line in future_uses
+                )
                 future_uses_are_safe = all(
                     future_line.lstrip().startswith("return ")
                     or "_apply_concat(" in future_line
@@ -20351,16 +21364,19 @@ def _canonicalize_generated_model_source_for_raw_export(
                     for future_line in future_uses
                 )
                 if (
-                    len(future_uses) == 0
-                    or future_uses_are_safe
-                    or (
-                        f"{alias}" in immediate_uses
-                        and (
-                            "_apply_concat(" in immediate_uses
-                            or "_torch_permute(" in immediate_uses
-                            or "torch.mul(" in immediate_uses
-                            or "_align_binary_inputs_to_anchor(" in immediate_uses
-                            or "_align_binary_inputs(" in immediate_uses
+                    not alias_consumed_by_rank3_reshape
+                    and (
+                        len(future_uses) == 0
+                        or future_uses_are_safe
+                        or (
+                            f"{alias}" in immediate_uses
+                            and (
+                                "_apply_concat(" in immediate_uses
+                                or "_torch_permute(" in immediate_uses
+                                or "torch.mul(" in immediate_uses
+                                or "_align_binary_inputs_to_anchor(" in immediate_uses
+                                or "_align_binary_inputs(" in immediate_uses
+                            )
                         )
                     )
                 ):
@@ -21047,6 +22063,52 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"half_pixel_centers={resize_cf_match.group('hpc')}, channel_last=False)"
         )
         changed = True
+    expected_public_output_cf_target_perm = _perm_cl_to_cf(4)
+    for index, line in enumerate(lines):
+        resize_cf_match = apply_resize_cf_re.match(line)
+        resize_nhwc_match = apply_resize_nhwc_re.match(line)
+        if expected_public_output_cf_target_perm is None:
+            continue
+        resize_public_output_match = resize_cf_match if resize_cf_match is not None else resize_nhwc_match
+        if resize_public_output_match is None:
+            continue
+        exact_public_output_shape = _eventual_public_output_exact_shape(
+            str(resize_public_output_match.group("lhs")),
+            index,
+        )
+        if (
+            exact_public_output_shape is None
+            or len(exact_public_output_shape) != 4
+        ):
+            continue
+        if resize_cf_match is not None:
+            current_target_shape = [
+                int(resize_cf_match.group("n")),
+                int(resize_cf_match.group("c")),
+                int(resize_cf_match.group("h")),
+                int(resize_cf_match.group("w")),
+            ]
+        else:
+            assert resize_nhwc_match is not None
+            current_target_shape = [
+                int(resize_nhwc_match.group("n")),
+                int(resize_nhwc_match.group("h")),
+                int(resize_nhwc_match.group("w")),
+                int(resize_nhwc_match.group("c")),
+            ]
+        if current_target_shape == [int(v) for v in exact_public_output_shape]:
+            continue
+        if _permute_shape(exact_public_output_shape, expected_public_output_cf_target_perm) != current_target_shape:
+            continue
+        lines[index] = (
+            f"{resize_public_output_match.group('indent')}{resize_public_output_match.group('lhs')} = _apply_resize("
+            f"{resize_public_output_match.group('input')}, [{resize_public_output_match.group('out_h')}, {resize_public_output_match.group('out_w')}], "
+            f"method='{resize_public_output_match.group('method')}', "
+            f"target_shape={repr([int(v) for v in exact_public_output_shape])}, "
+            f"align_corners={resize_public_output_match.group('align')}, "
+            f"half_pixel_centers={resize_public_output_match.group('hpc')}, channel_last=False)"
+        )
+        changed = True
     pidnet_forced_resize_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\("
         r"(?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', "
@@ -21272,6 +22334,14 @@ def _canonicalize_generated_model_source_for_raw_export(
             assigned_name = str(generic_assign_match.group("lhs"))
             current_function_assigned.add(assigned_name)
             current_function_defined.add(assigned_name)
+    finalized_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+    if finalized_lines != lines:
+        lines = finalized_lines
+        changed = True
+    finalized_lines = _repair_channel_last_gap_conv_inputs(lines)
+    if finalized_lines != lines:
+        lines = finalized_lines
+        changed = True
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -21281,6 +22351,14 @@ def _rewrite_generated_model_source_for_exported_program(
     model_ir: ModelIR | None = None,
 ) -> None:
     _canonicalize_generated_model_source_for_raw_export(package_path, model_ir=model_ir)
+    model_path = package_path / "model.py"
+    if not model_path.exists():
+        return
+    lines = model_path.read_text(encoding="utf-8").splitlines()
+    rewritten_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+    rewritten_lines = _repair_channel_last_gap_conv_inputs(rewritten_lines)
+    if rewritten_lines != lines:
+        model_path.write_text("\n".join(rewritten_lines) + "\n", encoding="utf-8")
 
 
 def _build_tflite_backed_metadata_payload(
@@ -23556,3 +24634,52 @@ def export_pytorch_package_from_model_ir(
             output_folder_path=output_folder_path,
             tflite_file_path=str(fallback_tflite_path),
         )
+
+
+def debug_export_native_codegen_intermediates_from_model_ir(
+    *,
+    model_ir: ModelIR,
+    output_folder_path: str,
+    stop_after: str = "canonicalize",
+) -> Dict[str, str]:
+    stop_after_normalized = str(stop_after).strip().lower()
+    if stop_after_normalized not in {"write", "canonicalize"}:
+        raise ValueError(
+            "stop_after must be either 'write' or 'canonicalize'."
+        )
+
+    normalized = prepare_model_ir_for_native_pytorch(model_ir)
+    _ensure_no_custom_ops(normalized)
+    _ensure_supported_ops(normalized)
+
+    tensor_storage_name_map = _make_tensor_storage_name_map(normalized)
+    os.makedirs(output_folder_path, exist_ok=True)
+    metadata = _build_metadata_payload(normalized)
+    metadata["execution_backend"] = "native"
+    metadata["tensor_storage_names"] = dict(tensor_storage_name_map)
+
+    package_dir = Path(output_folder_path)
+    _write_native_model_file(
+        output_folder_path,
+        model_ir=normalized,
+        metadata=metadata,
+        tensor_storage_name_map=tensor_storage_name_map,
+    )
+
+    model_path = package_dir / "model.py"
+    pre_canonicalize_path = package_dir / "model_pre_canonicalize.py"
+    shutil.copyfile(model_path, pre_canonicalize_path)
+    artifacts = {
+        "package_path": str(package_dir),
+        "model_path": str(model_path),
+        "model_pre_canonicalize_path": str(pre_canonicalize_path),
+    }
+    if stop_after_normalized == "write":
+        return artifacts
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=normalized,
+    )
+    artifacts["model_post_canonicalize_path"] = str(model_path)
+    return artifacts
