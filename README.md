@@ -382,6 +382,10 @@ The output directory contains:
 - `yolox_s_float32.tflite`
 - `yolox_s_float16.tflite`
 - `yolox_s_pytorch/`
+- `model.py`
+- `runtime.py`
+- `state_dict.pth`
+- `metadata.json`
 - `yolox_s_pytorch/yolox_s_jit.pt`
 - `yolox_s_pytorch/yolox_s_dynamo.onnx`
 - `yolox_s_pytorch/yolox_s_ep.pt2`
