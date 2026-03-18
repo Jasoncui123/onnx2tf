@@ -65,6 +65,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _should_prefer_tflite_backed_package,
     _target_shape_values_for_model_ir,
     _tensor_exact_static_shape_list_for_model_ir,
+    _try_export_native_package_from_tflite_import,
     _write_native_model_file,
     export_dynamo_onnx_from_generated_package,
     export_exported_program_from_generated_package,
@@ -807,7 +808,7 @@ def test_canonicalize_generated_model_source_restores_public_output_resize_targe
     assert "target_shape=[1, 256, 21, 128]" not in rewritten
 
 
-def test_canonicalize_generated_model_source_rewrites_pidnet_pag4_mul2_to_channel_first(tmp_path) -> None:
+def test_canonicalize_generated_model_source_preserves_pidnet_pag4_mul2_alignment(tmp_path) -> None:
     package_dir = tmp_path / "pidnet_pag4_mul2_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
@@ -831,7 +832,7 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_pag4_mul2_to_channe
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert (
-        "_binary_lhs_99, _binary_rhs_99 = pag4_sig_out0, pag4_resize1_out_nhwc"
+        "_binary_lhs_99, _binary_rhs_99 = _align_binary_inputs(pag4_sig_out0, pag4_resize1_out_nhwc, [1, 64, 24, 40])"
         in rewritten
     )
     assert (
@@ -3043,6 +3044,317 @@ def _make_concat_with_ambiguous_axis_only_match_model_ir() -> ModelIR:
         )
     )
     return model_ir
+
+
+def _make_nhwc_concat_last_axis_gather_model_ir() -> ModelIR:
+    model_ir = ModelIR(name="nhwc_concat_last_axis_gather_model_ir")
+    model_ir.inputs = ["x_nhwc", "y_nhwc"]
+    model_ir.outputs = ["gathered_even_nhwc"]
+    model_ir.tensors["x_nhwc"] = TensorIR(
+        name="x_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 2, 2, 3],
+        shape_signature=[1, 2, 2, 3],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["y_nhwc"] = TensorIR(
+        name="y_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 2, 2, 3],
+        shape_signature=[1, 2, 2, 3],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["concat_out_nhwc"] = TensorIR(
+        name="concat_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 2, 2, 6],
+        shape_signature=[1, 2, 2, 6],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["gather_even_indices"] = TensorIR(
+        name="gather_even_indices",
+        dtype="INT32",
+        shape=[3],
+        shape_signature=[3],
+        data=np.asarray([0, 2, 4], dtype=np.int32),
+    )
+    model_ir.tensors["gathered_even_nhwc"] = TensorIR(
+        name="gathered_even_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 2, 2, 3],
+        shape_signature=[1, 2, 2, 3],
+        logical_layout="NHWC",
+    )
+    model_ir.operators.extend(
+        [
+            OperatorIR(
+                op_type="CONCATENATION",
+                inputs=["x_nhwc", "y_nhwc"],
+                outputs=["concat_out_nhwc"],
+                options={"axis": 3, "fusedActivationFunction": "NONE"},
+            ),
+            OperatorIR(
+                op_type="GATHER",
+                inputs=["concat_out_nhwc", "gather_even_indices"],
+                outputs=["gathered_even_nhwc"],
+                options={"axis": 3, "batchDims": 0},
+            ),
+        ]
+    )
+    return model_ir
+
+
+def _count_dynamo_channel_front_concat_input_transpose_bridges(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    producer_map = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            producer_map[str(output_name)] = node
+    count = 0
+    for trailing_transpose_node in model.graph.node:
+        if str(trailing_transpose_node.op_type) != "Transpose":
+            continue
+        trailing_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in trailing_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if trailing_perm != [3, 0, 1, 2]:
+            continue
+        concat_node = producer_map.get(str(trailing_transpose_node.input[0]) if trailing_transpose_node.input else "")
+        if concat_node is None or str(concat_node.op_type) != "Concat":
+            continue
+        concat_axis = next(
+            (
+                int(attr.i)
+                for attr in concat_node.attribute
+                if str(attr.name) == "axis"
+            ),
+            -1,
+        )
+        if concat_axis != 3:
+            continue
+        input_has_layout_bridge = False
+        for input_name in concat_node.input:
+            input_node = producer_map.get(str(input_name))
+            if input_node is None or str(input_node.op_type) != "Transpose":
+                continue
+            input_perm = next(
+                (
+                    [int(v) for v in list(attr.ints)]
+                    for attr in input_node.attribute
+                    if str(attr.name) == "perm"
+                ),
+                [],
+            )
+            if input_perm == [0, 2, 3, 1]:
+                input_has_layout_bridge = True
+                break
+        if input_has_layout_bridge:
+            count += 1
+    return count
+
+
+def _count_dynamo_shared_concat_passthrough_transpose_bridges(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    producer_map = {}
+    consumer_map = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            producer_map[str(output_name)] = node
+        for input_name in node.input:
+            consumer_map.setdefault(str(input_name), []).append(node)
+    count = 0
+    for input_transpose_node in model.graph.node:
+        if str(input_transpose_node.op_type) != "Transpose":
+            continue
+        input_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in input_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if input_perm != [0, 2, 3, 1]:
+            continue
+        input_output_name = str(input_transpose_node.output[0]) if input_transpose_node.output else ""
+        consumers = consumer_map.get(input_output_name, [])
+        if len(consumers) != 2:
+            continue
+        concat_node = next((node for node in consumers if str(node.op_type) == "Concat"), None)
+        passthrough_inverse_node = next(
+            (
+                node
+                for node in consumers
+                if str(node.op_type) == "Transpose"
+                and next(
+                    (
+                        [int(v) for v in list(attr.ints)]
+                        for attr in node.attribute
+                        if str(attr.name) == "perm"
+                    ),
+                    [],
+                ) == [0, 3, 1, 2]
+            ),
+            None,
+        )
+        if concat_node is None or passthrough_inverse_node is None:
+            continue
+        concat_axis = next(
+            (
+                int(attr.i)
+                for attr in concat_node.attribute
+                if str(attr.name) == "axis"
+            ),
+            -1,
+        )
+        if concat_axis != 3:
+            continue
+        trailing_consumers = consumer_map.get(str(concat_node.output[0]) if concat_node.output else "", [])
+        if len(trailing_consumers) != 1:
+            continue
+        trailing_transpose_node = trailing_consumers[0]
+        trailing_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in trailing_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if trailing_perm == [0, 3, 1, 2]:
+            count += 1
+    return count
+
+
+def _count_dynamo_channel_front_gathernd_transpose_bridges(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    producer_map = {}
+    consumer_map = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            producer_map[str(output_name)] = node
+        for input_name in node.input:
+            consumer_map.setdefault(str(input_name), []).append(node)
+    count = 0
+    for source_transpose_node in model.graph.node:
+        if str(source_transpose_node.op_type) != "Transpose":
+            continue
+        source_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in source_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if source_perm != [1, 0, 2, 3]:
+            continue
+        source_output_name = str(source_transpose_node.output[0]) if source_transpose_node.output else ""
+        for gather_node in consumer_map.get(source_output_name, []):
+            if str(gather_node.op_type) != "GatherND":
+                continue
+            gather_output_name = str(gather_node.output[0]) if gather_node.output else ""
+            gather_consumers = consumer_map.get(gather_output_name, [])
+            if len(gather_consumers) != 1:
+                continue
+            trailing_transpose_node = gather_consumers[0]
+            if str(trailing_transpose_node.op_type) != "Transpose":
+                continue
+            trailing_perm = next(
+                (
+                    [int(v) for v in list(attr.ints)]
+                    for attr in trailing_transpose_node.attribute
+                    if str(attr.name) == "perm"
+                ),
+                [],
+            )
+            if trailing_perm == [1, 0, 2, 3]:
+                count += 1
+    return count
+
+
+def _count_dynamo_channel_front_gathernd_double_transpose_bridges(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    producer_map = {}
+    consumer_map = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            producer_map[str(output_name)] = node
+        for input_name in node.input:
+            consumer_map.setdefault(str(input_name), []).append(node)
+    count = 0
+    for source_transpose_node in model.graph.node:
+        if str(source_transpose_node.op_type) != "Transpose":
+            continue
+        source_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in source_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if source_perm != [1, 0, 2, 3]:
+            continue
+        source_output_name = str(source_transpose_node.output[0]) if source_transpose_node.output else ""
+        for gather_node in consumer_map.get(source_output_name, []):
+            if str(gather_node.op_type) != "GatherND":
+                continue
+            gather_output_name = str(gather_node.output[0]) if gather_node.output else ""
+            first_consumers = consumer_map.get(gather_output_name, [])
+            if len(first_consumers) != 1:
+                continue
+            first_transpose_node = first_consumers[0]
+            first_perm = next(
+                (
+                    [int(v) for v in list(attr.ints)]
+                    for attr in first_transpose_node.attribute
+                    if str(attr.name) == "perm"
+                ),
+                [],
+            )
+            if first_perm != [1, 2, 3, 0]:
+                continue
+            first_output_name = str(first_transpose_node.output[0]) if first_transpose_node.output else ""
+            second_consumers = consumer_map.get(first_output_name, [])
+            if len(second_consumers) != 1:
+                continue
+            second_transpose_node = second_consumers[0]
+            second_perm = next(
+                (
+                    [int(v) for v in list(attr.ints)]
+                    for attr in second_transpose_node.attribute
+                    if str(attr.name) == "perm"
+                ),
+                [],
+            )
+            if second_perm == [0, 3, 1, 2]:
+                count += 1
+    return count
+
+
+def _count_dynamo_channel_front_gather_axis1_patterns(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    count = 0
+    for node in model.graph.node:
+        if str(node.op_type) != "Gather":
+            continue
+        axis = next(
+            (
+                int(attr.i)
+                for attr in node.attribute
+                if str(attr.name) == "axis"
+            ),
+            0,
+        )
+        if axis == 1:
+            count += 1
+    return count
 
 
 def _make_sigmoid_mul_nchw_model_ir() -> ModelIR:
@@ -8069,6 +8381,384 @@ def test_export_pytorch_package_imported_tflite_with_cumsum_stays_native(tmp_pat
     assert Path(torchscript_path).exists()
 
 
+def test_export_pytorch_package_imported_tflite_keeps_channel_last_concat_for_last_axis_gather(tmp_path) -> None:
+    model_ir = _make_nhwc_concat_last_axis_gather_model_ir()
+    tflite_path = _write_model_ir_as_tflite(
+        str(tmp_path),
+        "concat_last_axis_gather_native",
+        model_ir,
+    )
+    package_path = _try_export_native_package_from_tflite_import(
+        output_folder_path=str(tmp_path / "concat_last_axis_gather_native_pytorch"),
+        fallback_tflite_path=tflite_path,
+        reference_model_ir=None,
+        reference_onnx_graph=None,
+    )
+    assert package_path is not None
+    package_dir = Path(package_path)
+    metadata = json.loads((package_dir / "metadata.json").read_text())
+    model_source = (package_dir / "model.py").read_text()
+    assert metadata["execution_backend"] == "native"
+    assert "concat_out_nhwc_cf = torch.cat([x_nhwc, y_nhwc], dim=1)" not in model_source
+    assert "_apply_concat([x, y], axis=3, target_shape=[1, 2, 2, 6], fused='NONE')" in model_source
+
+    pkg = _import_generated_package(package_path)
+    model = pkg.load_model()
+    x = torch.arange(12, dtype=torch.float32).reshape(1, 2, 2, 3)
+    y = torch.arange(12, 24, dtype=torch.float32).reshape(1, 2, 2, 3)
+    out = model(x, y)
+    expected = torch.index_select(
+        torch.cat([x, y], dim=3),
+        dim=3,
+        index=torch.tensor([0, 2, 4], dtype=torch.int64),
+    )
+    assert torch.allclose(out, expected)
+
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
+    exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
+    assert dynamo_onnx_path is not None
+    assert exported_program_path is not None
+    assert Path(dynamo_onnx_path).exists()
+    assert Path(exported_program_path).exists()
+
+
+def test_export_pytorch_package_imported_tflite_preserves_rank3_concat_for_nanodet_when_model_is_available(tmp_path) -> None:
+    model_path = Path("nanodet-plus-m_416.onnx")
+    if not model_path.exists():
+        pytest.skip("nanodet-plus-m_416.onnx is not available")
+    model_ir = lower_onnx_to_ir(
+        onnx.load(model_path),
+        output_file_name="nanodet_imported_tflite_rank3_concat_test",
+        show_progress=False,
+    )
+    tflite_path = _write_model_ir_as_tflite(
+        str(tmp_path),
+        "nanodet_imported_tflite_rank3_concat",
+        model_ir,
+    )
+    package_path = _try_export_native_package_from_tflite_import(
+        output_folder_path=str(tmp_path / "nanodet_imported_tflite_rank3_concat_pytorch"),
+        fallback_tflite_path=tflite_path,
+        reference_model_ir=None,
+        reference_onnx_graph=None,
+    )
+    assert package_path is not None
+    package_dir = Path(package_path)
+    model_source = (package_dir / "model.py").read_text()
+    assert (
+        "out = torch.cat([wahead_rs_out0.permute(0, 2, 1).contiguous(), "
+        "wahead_rs1_out0.permute(0, 2, 1).contiguous(), "
+        "wahead_rs2_out0.permute(0, 2, 1).contiguous(), "
+        "wahead_rs3_out0.permute(0, 2, 1).contiguous()], dim=1)"
+    ) not in model_source
+    assert "out = _apply_concat([" in model_source
+    assert "axis=1, target_shape=[1, 3598, 37], fused='NONE')" in model_source
+
+    pkg = _import_generated_package(package_path)
+    model = pkg.load_model()
+    x = torch.randn(1, 3, 416, 416, dtype=torch.float32)
+    out = model(x)
+    assert list(out.shape) == [1, 3598, 37]
+
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
+    exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
+    assert dynamo_onnx_path is not None
+    assert exported_program_path is not None
+    assert Path(dynamo_onnx_path).exists()
+    assert Path(exported_program_path).exists()
+    exported_program = torch.export.load(str(exported_program_path))
+    redundant_pool_bridge_count = 0
+    redundant_channel_last_concat_gather_bridge_count = 0
+    redundant_depthwise_permute_pad_bridge_count = 0
+    for node in exported_program.module().graph.nodes:
+        perm_arg = node.args[1] if len(node.args) >= 2 else None
+        perm = (
+            list(cast(list[int] | tuple[int, ...], perm_arg))
+            if isinstance(perm_arg, (list, tuple))
+            else None
+        )
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.permute.default"
+            or perm != [0, 2, 3, 1]
+        ):
+            continue
+        permute_users = list(node.users)
+        if len(permute_users) != 1:
+            continue
+        contiguous_node = permute_users[0]
+        if (
+            contiguous_node.op != "call_function"
+            or str(contiguous_node.target) != "aten.contiguous.default"
+        ):
+            continue
+        contiguous_users = list(contiguous_node.users)
+        if len(contiguous_users) != 1:
+            continue
+        pad_node = contiguous_users[0]
+        pad_values_arg = pad_node.args[1] if len(pad_node.args) >= 2 else None
+        pad_values = (
+            list(cast(list[int] | tuple[int, ...], pad_values_arg))
+            if isinstance(pad_values_arg, (list, tuple))
+            else None
+        )
+        if (
+            pad_node.op != "call_function"
+            or str(pad_node.target) != "aten.pad.default"
+            or pad_values != [0, 0, 1, 1, 1, 1]
+        ):
+            continue
+        pad_users = list(pad_node.users)
+        if len(pad_users) != 1:
+            continue
+        inverse_permute_node = pad_users[0]
+        inverse_perm_arg = inverse_permute_node.args[1] if len(inverse_permute_node.args) >= 2 else None
+        inverse_perm = (
+            list(cast(list[int] | tuple[int, ...], inverse_perm_arg))
+            if isinstance(inverse_perm_arg, (list, tuple))
+            else None
+        )
+        if (
+            inverse_permute_node.op != "call_function"
+            or str(inverse_permute_node.target) != "aten.permute.default"
+            or inverse_perm != [0, 3, 1, 2]
+        ):
+            continue
+        inverse_users = list(inverse_permute_node.users)
+        if len(inverse_users) != 1:
+            continue
+        inverse_contiguous_node = inverse_users[0]
+        if (
+            inverse_contiguous_node.op != "call_function"
+            or str(inverse_contiguous_node.target) != "aten.contiguous.default"
+        ):
+            continue
+        inverse_contiguous_users = list(inverse_contiguous_node.users)
+        if (
+            len(inverse_contiguous_users) == 1
+            and inverse_contiguous_users[0].op == "call_function"
+            and str(inverse_contiguous_users[0].target) == "aten.max_pool2d.default"
+        ):
+            redundant_pool_bridge_count += 1
+        continue
+    for node in exported_program.module().graph.nodes:
+        perm_arg = node.args[1] if len(node.args) >= 2 else None
+        perm = (
+            list(cast(list[int] | tuple[int, ...], perm_arg))
+            if isinstance(perm_arg, (list, tuple))
+            else None
+        )
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.permute.default"
+            or perm != [0, 3, 1, 2]
+            or len(node.args) < 1
+            or not isinstance(node.args[0], torch.fx.Node)
+        ):
+            continue
+        source_node = node.args[0]
+        permute_users = list(node.users)
+        if len(permute_users) != 1:
+            continue
+        contiguous_node = permute_users[0]
+        if (
+            contiguous_node.op != "call_function"
+            or str(contiguous_node.target) != "aten.contiguous.default"
+        ):
+            continue
+        contiguous_shape_meta = getattr(contiguous_node, "meta", {}).get("val", None)
+        contiguous_shape = list(contiguous_shape_meta.shape) if isinstance(contiguous_shape_meta, torch.Tensor) else None
+        if contiguous_shape is not None and (len(contiguous_shape) != 4):
+            continue
+        contiguous_users = list(contiguous_node.users)
+        if len(contiguous_users) != 1:
+            continue
+        pad_node = contiguous_users[0]
+        pad_values_arg = pad_node.args[1] if len(pad_node.args) >= 2 else None
+        pad_values = (
+            list(cast(list[int] | tuple[int, ...], pad_values_arg))
+            if isinstance(pad_values_arg, (list, tuple))
+            else None
+        )
+        if (
+            pad_node.op != "call_function"
+            or str(pad_node.target) != "aten.pad.default"
+            or pad_values is None
+            or len(pad_values) != 4
+        ):
+            continue
+        pad_users = list(pad_node.users)
+        if len(pad_users) != 1:
+            continue
+        conv_node = pad_users[0]
+        groups_arg = conv_node.args[6] if len(conv_node.args) >= 7 else None
+        sibling_conv_users = [
+            user
+            for user in list(source_node.users)
+            if user is not node
+            and user.op == "call_function"
+            and str(user.target) == "aten.conv2d.default"
+        ]
+        if (
+            conv_node.op == "call_function"
+            and str(conv_node.target) == "aten.conv2d.default"
+            and isinstance(groups_arg, int)
+            and groups_arg > 1
+            and len(sibling_conv_users) > 0
+            and not (contiguous_shape is not None and contiguous_shape[1] == groups_arg)
+        ):
+            redundant_depthwise_permute_pad_bridge_count += 1
+    for node in exported_program.module().graph.nodes:
+        cat_dim = None
+        if len(node.args) >= 2 and isinstance(node.args[1], int):
+            cat_dim = int(node.args[1])
+        elif isinstance(node.kwargs, dict) and "dim" in node.kwargs:
+            cat_dim = int(node.kwargs["dim"])
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.cat.default"
+            or cat_dim != 3
+            or len(node.args) < 1
+            or not isinstance(node.args[0], (list, tuple))
+        ):
+            continue
+        cat_inputs = list(cast(list[torch.fx.Node] | tuple[torch.fx.Node, ...], node.args[0]))
+        if len(cat_inputs) == 0:
+            continue
+        folded_input_count = 0
+        for cat_input in cat_inputs:
+            if not isinstance(cat_input, torch.fx.Node):
+                continue
+            if (
+                cat_input.op == "call_function"
+                and str(cat_input.target) == "aten.contiguous.default"
+                and len(cat_input.args) >= 1
+                and isinstance(cat_input.args[0], torch.fx.Node)
+                and cat_input.args[0].op == "call_function"
+                and str(cat_input.args[0].target) == "aten.permute.default"
+            ):
+                cat_input_perm_arg = cat_input.args[0].args[1] if len(cat_input.args[0].args) >= 2 else None
+                cat_input_perm = (
+                    list(cast(list[int] | tuple[int, ...], cat_input_perm_arg))
+                    if isinstance(cat_input_perm_arg, (list, tuple))
+                    else None
+                )
+                if cat_input_perm == [0, 2, 3, 1]:
+                    folded_input_count += 1
+        if folded_input_count != len(cat_inputs):
+            continue
+        has_redundant_index_branch = False
+        for user in list(node.users):
+            if (
+                user.op != "call_function"
+                or str(user.target) != "aten.index.Tensor"
+                or len(user.args) < 2
+                or not isinstance(user.args[1], (list, tuple))
+            ):
+                continue
+            index_spec = list(cast(list[object] | tuple[object, ...], user.args[1]))
+            if len(index_spec) != 4 or index_spec[:3] != [None, None, None]:
+                continue
+            index_users = list(user.users)
+            if len(index_users) != 1:
+                continue
+            inverse_permute_node = index_users[0]
+            inverse_perm_arg = inverse_permute_node.args[1] if len(inverse_permute_node.args) >= 2 else None
+            inverse_perm = (
+                list(cast(list[int] | tuple[int, ...], inverse_perm_arg))
+                if isinstance(inverse_perm_arg, (list, tuple))
+                else None
+            )
+            if (
+                inverse_permute_node.op == "call_function"
+                and str(inverse_permute_node.target) == "aten.permute.default"
+                and inverse_perm == [0, 3, 1, 2]
+            ):
+                has_redundant_index_branch = True
+                break
+        if has_redundant_index_branch:
+            redundant_channel_last_concat_gather_bridge_count += 1
+    assert redundant_pool_bridge_count == 0
+    assert redundant_depthwise_permute_pad_bridge_count == 0
+    assert redundant_channel_last_concat_gather_bridge_count == 0
+
+
+def test_export_pytorch_package_imported_tflite_preserves_resnet_pool_target_shape_when_model_is_available(
+    tmp_path,
+) -> None:
+    model_path = Path("resnet18-v1-7.onnx")
+    if not model_path.exists():
+        pytest.skip("resnet18-v1-7.onnx is not available")
+    model_ir = lower_onnx_to_ir(
+        onnx.load(model_path),
+        output_file_name="resnet18_imported_tflite_pool_target_shape_test",
+        show_progress=False,
+    )
+    tflite_path = _write_model_ir_as_tflite(
+        str(tmp_path),
+        "resnet18_imported_tflite_pool_target_shape",
+        model_ir,
+    )
+    package_path = _try_export_native_package_from_tflite_import(
+        output_folder_path=str(tmp_path / "resnet18_imported_tflite_pool_target_shape_pytorch"),
+        fallback_tflite_path=tflite_path,
+        reference_model_ir=None,
+        reference_onnx_graph=None,
+    )
+    assert package_path is not None
+    package_dir = Path(package_path)
+    model_source = (package_dir / "model.py").read_text()
+    assert "resnetv15_p0_fwd_in_nhwc = resnetv15_p0_fwd_in_nhwc_cf" not in model_source
+    assert "target_shape=[1, 56, 64, 56]" not in model_source
+    assert "[0, 0, 1, 1, 1, 1]" in model_source
+    assert "channel_last=True" in model_source
+
+    pkg = _import_generated_package(package_path)
+    model = pkg.load_model()
+    x = torch.randn(1, 3, 224, 224, dtype=torch.float32)
+    out = model(x)
+    assert list(out.shape) == [1, 1000]
+
+    exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
+    assert exported_program_path is not None
+    assert Path(exported_program_path).exists()
+
+
+def test_export_dynamo_onnx_from_generated_package_folds_nanodet_channel_front_concat_bridges_when_model_is_available(
+    tmp_path,
+) -> None:
+    model_path = Path("nanodet-plus-m_416.onnx")
+    if not model_path.exists():
+        pytest.skip("nanodet-plus-m_416.onnx is not available")
+    model_ir = lower_onnx_to_ir(
+        onnx.load(model_path),
+        output_file_name="nanodet_dynamo_concat_bridge_fold_test",
+        show_progress=False,
+    )
+    tflite_path = _write_model_ir_as_tflite(
+        str(tmp_path),
+        "nanodet_dynamo_concat_bridge_fold",
+        model_ir,
+    )
+    package_path = _try_export_native_package_from_tflite_import(
+        output_folder_path=str(tmp_path / "nanodet_dynamo_concat_bridge_fold_pytorch"),
+        fallback_tflite_path=tflite_path,
+        reference_model_ir=None,
+        reference_onnx_graph=None,
+    )
+    assert package_path is not None
+
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
+    assert dynamo_onnx_path is not None
+    dynamo_onnx_file = Path(dynamo_onnx_path)
+    assert dynamo_onnx_file.exists()
+    assert _count_dynamo_channel_front_concat_input_transpose_bridges(dynamo_onnx_file) == 0
+    assert _count_dynamo_shared_concat_passthrough_transpose_bridges(dynamo_onnx_file) == 0
+    assert _count_dynamo_channel_front_gathernd_transpose_bridges(dynamo_onnx_file) == 0
+    assert _count_dynamo_channel_front_gathernd_double_transpose_bridges(dynamo_onnx_file) == 0
+    assert _count_dynamo_channel_front_gather_axis1_patterns(dynamo_onnx_file) >= 4
+
+
 def test_export_pytorch_package_bidirectional_sequence_lstm_stays_native(tmp_path) -> None:
     model_ir = _make_bidirectional_sequence_lstm_model_ir()
     package_path = export_pytorch_package_from_model_ir(
@@ -9469,6 +10159,14 @@ def test_export_pytorch_package_generates_native_pidnet_package_when_model_is_av
     assert "self.const_wa_spp_scale3_scale3_1_BatchNormalization_bn_add.permute(*(0, 3, 1, 2)).contiguous()" not in model_source
     assert "_align_binary_inputs(wasppscale1_scale10_average_p_in, self.const_wa_spp_x1_x512_d062, [1, 512, 3, 5])" not in model_source
     assert "_align_binary_inputs(wasppscale1_scale10_average_p_in, self.const_wa_spp_x1_x512_764b, [1, 512, 3, 5])" not in model_source
+    assert re.search(
+        r"_align_binary_inputs\([A-Za-z0-9_]*pag4_sig_out0, [A-Za-z0-9_]*pag4_resize1_out_nhwc, \[1, 64, 24, 40\]\)",
+        model_source,
+    ) is not None
+    assert re.search(
+        r"_binary_lhs_\d+, _binary_rhs_\d+ = [A-Za-z0-9_]*pag4_sig_out0, [A-Za-z0-9_]*pag4_resize1_out_nhwc",
+        model_source,
+    ) is None
     assert "resize3_out_nhwc_cf = _apply_resize(final_layerconv2_cv_out_nhwc_cf, [192, 320], method='bilinear', target_shape=[1, 19, 192, 320], align_corners=True, half_pixel_centers=False, channel_last=False)" in model_source
     assert "out_argmax = torch.argmax(resize3_out_nhwc, dim=_normalize_dim(1, resize3_out_nhwc.ndim), keepdim=False).to(dtype=torch.int64)" in model_source
 

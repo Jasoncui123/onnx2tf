@@ -785,6 +785,8 @@ def _resolve_channel_first_named_tensor_shape_for_codegen(
         model_ir=model_ir,
         tensor_name=str(tensor_name),
     )
+    if expected_channels is None and rank == 4:
+        return resolved
     if expected_channels is not None and len(resolved) >= 3:
         second_axis_matches = int(resolved[1]) == int(expected_channels)
         last_axis_matches = int(resolved[-1]) == int(expected_channels)
@@ -896,8 +898,26 @@ def _channel_first_concat_input_expr_for_codegen(
     if tensor is None:
         return None
     tensor_layout = normalize_logical_layout(tensor.logical_layout)
+    tensor_rank = len(list(tensor.shape))
     if is_channel_first_logical_layout(tensor_layout):
         return tensor_expr_fn(str(tensor_name))
+    if tensor_rank not in {4, 5}:
+        return None
+    perm_to_cf = _perm_cl_to_cf(tensor_rank)
+    if (
+        perm_to_cf is not None
+        and (
+            is_channel_last_logical_layout(tensor_layout)
+            or (
+                tensor_layout == LOGICAL_LAYOUT_UNKNOWN
+                and _tensor_name_suggests_channel_last_layout_for_codegen(str(tensor_name))
+            )
+        )
+    ):
+        base_expr = tensor_expr_fn(str(tensor_name))
+        return (
+            f"{base_expr}.permute({', '.join(str(int(v)) for v in perm_to_cf)}).contiguous()"
+        )
     return None
 
 
@@ -1065,6 +1085,67 @@ def _can_keep_channel_first_slice_output_for_codegen(
             continue
         return False
     return True
+
+
+def _concat_channel_first_codegen_breaks_channel_last_consumers_for_codegen(
+    *,
+    model_ir: ModelIR,
+    op: OperatorIR,
+) -> bool:
+    if str(op.op_type) != "CONCATENATION" or len(op.outputs) != 1:
+        return False
+    output_name = str(op.outputs[0])
+    output_tensor = model_ir.tensors.get(output_name, None)
+    if output_tensor is None:
+        return False
+    output_shape = [int(v) for v in list(output_tensor.shape)]
+    output_rank = len(output_shape)
+    if output_rank not in {3, 4, 5}:
+        return False
+    output_layout = normalize_logical_layout(output_tensor.logical_layout)
+    output_looks_channel_last = (
+        is_channel_last_logical_layout(output_layout)
+        or (
+            output_layout == LOGICAL_LAYOUT_UNKNOWN
+            and _tensor_name_suggests_channel_last_layout_for_codegen(output_name)
+        )
+    )
+    if not output_looks_channel_last:
+        return False
+    channel_axis = output_rank - 1
+    for consumer_op in model_ir.operators:
+        consumer_type = str(consumer_op.op_type)
+        if consumer_type == "GATHER":
+            if len(consumer_op.inputs) < 2 or str(consumer_op.inputs[0]) != output_name:
+                continue
+            axis = int(consumer_op.options.get("axis", 0))
+            if axis < 0:
+                axis += output_rank
+            if axis == channel_axis:
+                return True
+            continue
+        if consumer_type == "SPLIT":
+            if len(consumer_op.inputs) == 0 or str(consumer_op.inputs[-1]) != output_name:
+                continue
+            axis = int(consumer_op.options.get("axis", 0))
+            if len(consumer_op.inputs) >= 2:
+                axis_values = _constant_int_list(model_ir.tensors.get(str(consumer_op.inputs[0]), None))
+                if axis_values is not None and len(axis_values) == 1:
+                    axis = int(axis_values[0])
+            if axis < 0:
+                axis += output_rank
+            if axis == channel_axis:
+                return True
+            continue
+        if consumer_type == "UNPACK":
+            if len(consumer_op.inputs) == 0 or str(consumer_op.inputs[0]) != output_name:
+                continue
+            axis = int(consumer_op.options.get("axis", 0))
+            if axis < 0:
+                axis += output_rank
+            if axis == channel_axis:
+                return True
+    return False
 
 
 def _reshape_codegen_is_plain_data_only_for_codegen(
@@ -5609,14 +5690,21 @@ def _emit_native_concat_op_for_codegen(
         else LOGICAL_LAYOUT_UNKNOWN
     )
     output_rank = len(list(output_tensor.shape)) if output_tensor is not None else 0
+    has_channel_last_axis_sensitive_consumer = (
+        _concat_channel_first_codegen_breaks_channel_last_consumers_for_codegen(
+            model_ir=model_ir,
+            op=op,
+        )
+    )
     if (
         concat_cf_spec is not None
-        and output_rank in {3, 4, 5}
+        and output_rank in {4, 5}
         and output_layout in {
             LOGICAL_LAYOUT_UNKNOWN,
             channel_first_logical_layout(output_rank),
             channel_last_logical_layout(output_rank),
         }
+        and not has_channel_last_axis_sensitive_consumer
         and all(input_expr is not None for input_expr in concat_cf_inputs)
     ):
         concat_cf_axis, concat_cf_output_shape, concat_perm_from_cf = concat_cf_spec
@@ -13184,6 +13272,7 @@ def _onnx_fold_concat_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
         if len(consumer_map.get(str(concat_node.output[0]), [])) != 1:
             continue
         input_transpose_nodes: List[onnx.NodeProto] = []
+        passthrough_inverse_transpose_nodes: List[Optional[onnx.NodeProto]] = []
         for input_name in concat_node.input:
             transpose_node = producer_map.get(str(input_name))
             if transpose_node is None:
@@ -13196,11 +13285,49 @@ def _onnx_fold_concat_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
             continue
         if any(list(_onnx_node_attr(node, "perm") or []) != [0, 2, 3, 1] for node in input_transpose_nodes):
             continue
-        if any(len(consumer_map.get(str(node.output[0]), [])) != 1 for node in input_transpose_nodes):
+        valid = True
+        for transpose_node in input_transpose_nodes:
+            transpose_consumers = list(consumer_map.get(str(transpose_node.output[0]), []))
+            if len(transpose_consumers) == 1 and transpose_consumers[0] == concat_node:
+                passthrough_inverse_transpose_nodes.append(None)
+                continue
+            if len(transpose_consumers) != 2 or concat_node not in transpose_consumers:
+                valid = False
+                break
+            passthrough_consumer = next(
+                (
+                    node
+                    for node in transpose_consumers
+                    if node != concat_node
+                ),
+                None,
+            )
+            if (
+                passthrough_consumer is None
+                or str(passthrough_consumer.op_type) != "Transpose"
+                or list(_onnx_node_attr(passthrough_consumer, "perm") or []) != [0, 3, 1, 2]
+                or len(passthrough_consumer.input) != 1
+                or len(passthrough_consumer.output) != 1
+            ):
+                valid = False
+                break
+            passthrough_inverse_transpose_nodes.append(passthrough_consumer)
+        if not valid:
             continue
 
         for input_index, transpose_node in enumerate(input_transpose_nodes):
             concat_node.input[input_index] = str(transpose_node.input[0])
+        for input_transpose_node, passthrough_inverse_transpose_node in zip(
+            input_transpose_nodes,
+            passthrough_inverse_transpose_nodes,
+        ):
+            if passthrough_inverse_transpose_node is None:
+                continue
+            _onnx_replace_all_node_inputs(
+                graph,
+                old_name=str(passthrough_inverse_transpose_node.output[0]),
+                new_name=str(input_transpose_node.input[0]),
+            )
         _onnx_set_node_attr(concat_node, "axis", 1)
         _onnx_replace_all_node_inputs(
             graph,
@@ -13208,8 +13335,244 @@ def _onnx_fold_concat_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
             new_name=str(concat_node.output[0]),
         )
         remove_node_names.extend(
-            [str(node.name) for node in input_transpose_nodes] + [str(inverse_transpose_node.name)]
+            [str(node.name) for node in input_transpose_nodes]
+            + [
+                str(node.name)
+                for node in passthrough_inverse_transpose_nodes
+                if node is not None
+            ]
+            + [str(inverse_transpose_node.name)]
         )
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_channel_front_concat_layout_bridges_in_place(graph: onnx.GraphProto) -> None:
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for trailing_transpose_node in list(graph.node):
+        if str(trailing_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(trailing_transpose_node, "perm") or []) != [3, 0, 1, 2]:
+            continue
+        concat_node_name = str(trailing_transpose_node.input[0]) if trailing_transpose_node.input else ""
+        concat_node = producer_map.get(concat_node_name)
+        if concat_node is None or str(concat_node.op_type) != "Concat":
+            continue
+        if int(_onnx_node_attr(concat_node, "axis") or -1) != 3:
+            continue
+        if len(consumer_map.get(str(concat_node.output[0]), [])) != 1:
+            continue
+
+        rewritten_inputs: List[str] = []
+        input_transforms: List[Tuple[onnx.NodeProto, List[int]]] = []
+        local_remove_node_names: List[str] = []
+        expected_nhw_shape: Optional[List[int]] = None
+        transformed_cf_shapes: List[List[int]] = []
+        valid = True
+        rewritten_any = False
+        for input_name in list(concat_node.input):
+            input_node = producer_map.get(str(input_name))
+            if (
+                input_node is None
+                or str(input_node.op_type) != "Transpose"
+                or len(input_node.input) != 1
+                or len(consumer_map.get(str(input_node.output[0]), [])) != 1
+            ):
+                valid = False
+                break
+            source_name = str(input_node.input[0])
+            source_shape = _onnx_resolve_rank4_shape(
+                graph,
+                source_name,
+                producer_map=producer_map,
+            )
+            if source_shape is None:
+                valid = False
+                break
+            input_perm = [int(v) for v in list(_onnx_node_attr(input_node, "perm") or [])]
+            transformed_cf_shape: Optional[List[int]] = None
+            input_nhw_shape: Optional[List[int]] = None
+            if input_perm == [0, 2, 3, 1]:
+                transformed_cf_shape = [int(v) for v in list(source_shape)]
+                input_nhw_shape = [
+                    int(source_shape[0]),
+                    int(source_shape[2]),
+                    int(source_shape[3]),
+                    int(source_shape[1]),
+                ]
+                rewritten_inputs.append(source_name)
+                local_remove_node_names.append(str(input_node.name))
+                rewritten_any = True
+            elif input_perm == [1, 2, 3, 0]:
+                transformed_cf_shape = [
+                    int(source_shape[1]),
+                    int(source_shape[0]),
+                    int(source_shape[2]),
+                    int(source_shape[3]),
+                ]
+                input_nhw_shape = [
+                    int(source_shape[1]),
+                    int(source_shape[2]),
+                    int(source_shape[3]),
+                    int(source_shape[0]),
+                ]
+                rewritten_inputs.append(str(input_node.output[0]))
+                input_transforms.append((input_node, [1, 0, 2, 3]))
+                rewritten_any = True
+            else:
+                valid = False
+                break
+            assert transformed_cf_shape is not None
+            assert input_nhw_shape is not None
+            transformed_cf_shapes.append(transformed_cf_shape)
+            if expected_nhw_shape is None:
+                expected_nhw_shape = [int(v) for v in list(input_nhw_shape)]
+            else:
+                if (
+                    int(expected_nhw_shape[0]) != int(input_nhw_shape[0])
+                    or int(expected_nhw_shape[1]) != int(input_nhw_shape[1])
+                    or int(expected_nhw_shape[2]) != int(input_nhw_shape[2])
+                ):
+                    valid = False
+                    break
+        if not valid or not rewritten_any or len(rewritten_inputs) != len(list(concat_node.input)):
+            continue
+
+        expected_cf_output_shape = [int(v) for v in list(transformed_cf_shapes[0])]
+        expected_cf_output_shape[1] = int(sum(int(shape[1]) for shape in transformed_cf_shapes))
+        trailing_output_shape = _onnx_resolve_rank4_shape(
+            graph,
+            str(trailing_transpose_node.output[0]),
+            producer_map=producer_map,
+        )
+        if trailing_output_shape is not None:
+            expected_trailing_output_shape = [
+                int(expected_cf_output_shape[1]),
+                int(expected_cf_output_shape[0]),
+                int(expected_cf_output_shape[2]),
+                int(expected_cf_output_shape[3]),
+            ]
+            if [int(v) for v in list(trailing_output_shape)] != expected_trailing_output_shape:
+                continue
+
+        for input_index, rewritten_input_name in enumerate(rewritten_inputs):
+            concat_node.input[input_index] = str(rewritten_input_name)
+        for input_node, new_perm in input_transforms:
+            _onnx_set_node_attr(input_node, "perm", new_perm)
+        _onnx_set_node_attr(concat_node, "axis", 1)
+        _onnx_set_node_attr(trailing_transpose_node, "perm", [1, 0, 2, 3])
+        remove_node_names.extend(local_remove_node_names)
+    _onnx_remove_nodes_by_name(graph, remove_node_names)
+
+
+def _onnx_fold_channel_front_gathernd_transpose_bridges_in_place(graph: onnx.GraphProto) -> None:
+    producer_map, consumer_map = _onnx_node_maps(graph)
+    remove_node_names: List[str] = []
+    for source_transpose_node in list(graph.node):
+        if str(source_transpose_node.op_type) != "Transpose":
+            continue
+        if list(_onnx_node_attr(source_transpose_node, "perm") or []) != [1, 0, 2, 3]:
+            continue
+        if len(source_transpose_node.input) != 1 or len(source_transpose_node.output) != 1:
+            continue
+        source_input_name = str(source_transpose_node.input[0])
+        source_output_name = str(source_transpose_node.output[0])
+        source_input_shape = _onnx_resolve_rank4_shape(
+            graph,
+            source_input_name,
+            producer_map=producer_map,
+        )
+        if (
+            source_input_shape is None
+            or len(source_input_shape) != 4
+            or int(source_input_shape[0]) != 1
+        ):
+            continue
+        gather_nodes = list(consumer_map.get(source_output_name, []))
+        if len(gather_nodes) == 0:
+            continue
+        if not all(str(node.op_type) == "GatherND" for node in gather_nodes):
+            continue
+
+        local_remove_node_names: List[str] = [str(source_transpose_node.name)]
+        valid = True
+        for gather_node in gather_nodes:
+            if len(gather_node.input) != 2 or len(gather_node.output) != 1:
+                valid = False
+                break
+            gather_consumers = consumer_map.get(str(gather_node.output[0]), [])
+            if len(gather_consumers) != 1:
+                valid = False
+                break
+            trailing_transpose_node = gather_consumers[0]
+            trailing_output_name: Optional[str] = None
+            trailing_remove_node_names: List[str] = []
+            if (
+                str(trailing_transpose_node.op_type) == "Transpose"
+                and list(_onnx_node_attr(trailing_transpose_node, "perm") or []) == [1, 0, 2, 3]
+                and len(trailing_transpose_node.output) == 1
+            ):
+                trailing_output_name = str(trailing_transpose_node.output[0])
+                trailing_remove_node_names.append(str(trailing_transpose_node.name))
+            elif (
+                str(trailing_transpose_node.op_type) == "Transpose"
+                and list(_onnx_node_attr(trailing_transpose_node, "perm") or []) == [1, 2, 3, 0]
+                and len(trailing_transpose_node.output) == 1
+            ):
+                second_consumers = consumer_map.get(str(trailing_transpose_node.output[0]), [])
+                if len(second_consumers) != 1:
+                    valid = False
+                    break
+                second_transpose_node = second_consumers[0]
+                if (
+                    str(second_transpose_node.op_type) != "Transpose"
+                    or list(_onnx_node_attr(second_transpose_node, "perm") or []) != [0, 3, 1, 2]
+                    or len(second_transpose_node.output) != 1
+                ):
+                    valid = False
+                    break
+                trailing_output_name = str(second_transpose_node.output[0])
+                trailing_remove_node_names.extend(
+                    [
+                        str(trailing_transpose_node.name),
+                        str(second_transpose_node.name),
+                    ]
+                )
+            else:
+                valid = False
+                break
+            assert trailing_output_name is not None
+            indices_name = str(gather_node.input[1])
+            indices_array = _onnx_get_initializer_array(graph, indices_name)
+            if indices_array is None:
+                valid = False
+                break
+            indices_values = np.asarray(indices_array, dtype=np.int64)
+            if indices_values.ndim != 2 or indices_values.shape[1] != 1:
+                valid = False
+                break
+            flat_indices = indices_values.reshape(-1)
+            if np.any(flat_indices < 0):
+                valid = False
+                break
+            if int(source_input_shape[1]) > 0 and np.any(flat_indices >= int(source_input_shape[1])):
+                valid = False
+                break
+            new_indices_name = _onnx_make_unique_initializer_name(graph, f"{indices_name}_axis1")
+            _onnx_set_initializer_array(
+                graph,
+                name=new_indices_name,
+                array=flat_indices.astype(np.int64),
+            )
+            gather_node.op_type = "Gather"
+            gather_node.input[:] = [source_input_name, str(new_indices_name)]
+            gather_node.output[:] = [trailing_output_name]
+            del gather_node.attribute[:]
+            _onnx_set_node_attr(gather_node, "axis", 1)
+            local_remove_node_names.extend(trailing_remove_node_names)
+        if not valid:
+            continue
+        remove_node_names.extend(local_remove_node_names)
     _onnx_remove_nodes_by_name(graph, remove_node_names)
 
 
@@ -14267,6 +14630,8 @@ def _optimize_dynamo_exported_onnx_in_place(model: onnx.ModelProto) -> None:
         _onnx_fold_mul_add_clip_to_hardsigmoid_in_place(model.graph)
         _onnx_fold_singleton_binary_layout_bridges_in_place(model.graph)
         _onnx_fold_concat_layout_bridges_in_place(model.graph)
+        _onnx_fold_channel_front_concat_layout_bridges_in_place(model.graph)
+        _onnx_fold_channel_front_gathernd_transpose_bridges_in_place(model.graph)
         _onnx_fold_pad_concat_layout_bridges_in_place(model.graph)
         _onnx_fold_singleton_concat_layout_bridges_in_place(model.graph)
         _onnx_fold_softmax_layout_bridges_in_place(model.graph)
@@ -17332,6 +17697,66 @@ def _fold_inverse_permute_round_trips_in_exported_program_archive(
     def _run_one_pass() -> bool:
         local_changed = False
 
+        def _resolve_dim3_cat_input_as_cf(
+            cat_input: Any,
+            *,
+            insert_before: torch.fx.Node,
+        ) -> Optional[torch.fx.Node]:
+            if (
+                isinstance(cat_input, torch.fx.Node)
+                and cat_input.op == "call_function"
+                and str(cat_input.target) == "aten.contiguous.default"
+                and len(cat_input.args) >= 1
+                and isinstance(cat_input.args[0], torch.fx.Node)
+            ):
+                permute_node = cat_input.args[0]
+                if (
+                    permute_node.op == "call_function"
+                    and str(permute_node.target) == "aten.permute.default"
+                    and len(permute_node.args) >= 2
+                    and _normalize_perm(permute_node.args[1]) == [0, 2, 3, 1]
+                    and isinstance(permute_node.args[0], torch.fx.Node)
+                    and _rank_shape(permute_node.args[0]) is not None
+                    and len(_rank_shape(permute_node.args[0]) or []) == 4
+                ):
+                    return permute_node.args[0]
+            if (
+                not isinstance(cat_input, torch.fx.Node)
+                or cat_input.op != "call_function"
+                or str(cat_input.target) != "aten.index.Tensor"
+                or len(cat_input.args) < 2
+                or not isinstance(cat_input.args[0], torch.fx.Node)
+                or not isinstance(cat_input.args[1], (list, tuple))
+            ):
+                return None
+            source = cat_input.args[0]
+            source_dim_arg = source.args[1] if len(source.args) >= 2 else None
+            if (
+                source.op != "call_function"
+                or str(source.target) != "aten.cat.default"
+                or not isinstance(source_dim_arg, (int, bool))
+                or int(source_dim_arg) != 1
+            ):
+                return None
+            index_spec = list(cat_input.args[1])
+            if len(index_spec) != 4 or index_spec[0] is not None or index_spec[2] is not None:
+                return None
+            if index_spec[1] is not None and index_spec[3] is None:
+                return cat_input
+            if index_spec[1] is None and index_spec[3] is not None:
+                channel_indices = index_spec[3]
+                if not isinstance(channel_indices, (torch.fx.Node, torch.Tensor)):
+                    return None
+                with graph.inserting_before(insert_before):
+                    cf_index_node = graph.call_function(
+                        torch.ops.aten.index.Tensor,
+                        args=(source, [None, channel_indices, None, None]),
+                        kwargs={},
+                    )
+                cf_index_node.meta = dict(getattr(cat_input, "meta", {}))
+                return cf_index_node
+            return None
+
         for node in list(graph.nodes):
             if (
                 node.op != "call_function"
@@ -17640,6 +18065,80 @@ def _fold_inverse_permute_round_trips_in_exported_program_archive(
         for node in list(graph.nodes):
             if (
                 node.op != "call_function"
+                or str(node.target) != "aten.permute.default"
+                or len(node.args) < 2
+                or _normalize_perm(node.args[1]) != [0, 3, 1, 2]
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            source = node.args[0]
+            source_shape = _rank_shape(source)
+            node_users = list(node.users)
+            if (
+                len(node_users) != 1
+                or node_users[0].op != "call_function"
+                or str(node_users[0].target) != "aten.contiguous.default"
+            ):
+                continue
+            contiguous_node = node_users[0]
+            contiguous_shape = _rank_shape(contiguous_node)
+            if contiguous_shape is not None and len(contiguous_shape) != 4:
+                continue
+            contiguous_users = list(contiguous_node.users)
+            if (
+                len(contiguous_users) != 1
+                or contiguous_users[0].op != "call_function"
+                or str(contiguous_users[0].target) != "aten.pad.default"
+                or len(contiguous_users[0].args) < 2
+                or not isinstance(contiguous_users[0].args[1], (list, tuple))
+            ):
+                continue
+            pad_node = contiguous_users[0]
+            pad_values = [int(v) for v in list(pad_node.args[1])]
+            if len(pad_values) != 4:
+                continue
+            pad_users = list(pad_node.users)
+            if (
+                len(pad_users) != 1
+                or pad_users[0].op != "call_function"
+                or str(pad_users[0].target) != "aten.conv2d.default"
+                or len(pad_users[0].args) < 7
+            ):
+                continue
+            conv_node = pad_users[0]
+            groups_arg = conv_node.args[6]
+            if not isinstance(groups_arg, (int, bool)):
+                continue
+            groups = int(groups_arg)
+            if groups <= 1:
+                continue
+            if source_shape is not None and (len(source_shape) != 4 or int(source_shape[1]) != groups):
+                continue
+            if contiguous_shape is not None and int(contiguous_shape[1]) == groups:
+                continue
+            sibling_conv_users = [
+                user
+                for user in list(source.users)
+                if user is not node
+                and user.op == "call_function"
+                and str(user.target) == "aten.conv2d.default"
+            ]
+            if len(sibling_conv_users) == 0:
+                continue
+            pad_node.args = (source, *tuple(pad_node.args[1:]))
+            if source_shape is not None:
+                repaired_pad_shape = [
+                    int(source_shape[0]),
+                    int(source_shape[1]),
+                    int(source_shape[2]) + pad_values[2] + pad_values[3],
+                    int(source_shape[3]) + pad_values[0] + pad_values[1],
+                ]
+                pad_node.meta = _shape_meta_from_node(source, repaired_pad_shape)
+            local_changed = True
+
+        for node in list(graph.nodes):
+            if (
+                node.op != "call_function"
                 or str(node.target) != "aten.contiguous.default"
                 or len(node.args) < 1
                 or not isinstance(node.args[0], torch.fx.Node)
@@ -17891,6 +18390,125 @@ def _fold_inverse_permute_round_trips_in_exported_program_archive(
                 node_users[0].replace_all_uses_with(cat_node)
             else:
                 node.replace_all_uses_with(cat_node)
+            local_changed = True
+
+        for index_node in list(graph.nodes):
+            index_spec_arg = index_node.args[1] if len(index_node.args) >= 2 else None
+            cat_node = index_node.args[0] if len(index_node.args) >= 1 else None
+            cat_dim_arg = cat_node.args[1] if isinstance(cat_node, torch.fx.Node) and len(cat_node.args) >= 2 else None
+            if (
+                index_node.op != "call_function"
+                or str(index_node.target) != "aten.index.Tensor"
+                or not isinstance(cat_node, torch.fx.Node)
+                or cat_node.op != "call_function"
+                or str(cat_node.target) != "aten.cat.default"
+                or len(cat_node.args) < 2
+                or not isinstance(cat_node.args[0], (list, tuple))
+                or not isinstance(cat_dim_arg, (int, bool))
+                or int(cat_dim_arg) != 3
+                or not isinstance(index_spec_arg, (list, tuple))
+            ):
+                continue
+            index_spec = list(index_spec_arg)
+            if len(index_spec) != 4 or index_spec[:3] != [None, None, None]:
+                continue
+            channel_indices = index_spec[3]
+            if not isinstance(channel_indices, (torch.fx.Node, torch.Tensor)):
+                continue
+
+            folded_inputs = []
+            valid_inputs = True
+            for cat_input in list(cat_node.args[0]):
+                folded_input = _resolve_dim3_cat_input_as_cf(
+                    cat_input,
+                    insert_before=index_node,
+                )
+                if folded_input is None:
+                    valid_inputs = False
+                    break
+                folded_inputs.append(folded_input)
+            if not valid_inputs:
+                continue
+
+            index_users = list(index_node.users)
+            if len(index_users) == 0:
+                continue
+            replacement_meta_node: Optional[torch.fx.Node] = None
+            valid_users = True
+            for user in index_users:
+                if (
+                    user.op != "call_function"
+                    or str(user.target) != "aten.permute.default"
+                    or len(user.args) < 2
+                    or _normalize_perm(user.args[1]) != [0, 3, 1, 2]
+                ):
+                    valid_users = False
+                    break
+                replacement_meta_node = user
+            if not valid_users or replacement_meta_node is None:
+                continue
+
+            cat_node.args = (folded_inputs, 1)
+            cat_input_shape = _rank_shape(folded_inputs[0])
+            if cat_input_shape is not None and len(cat_input_shape) == 4:
+                cat_shape = list(cat_input_shape)
+                cat_shape[1] = sum(
+                    int((_rank_shape(inp) or cat_input_shape)[1])
+                    for inp in folded_inputs
+                    if _rank_shape(inp) is not None and len(_rank_shape(inp) or []) == 4
+                )
+                cat_node.meta = _shape_meta_from_node(folded_inputs[0], cat_shape)
+            index_node.args = (cat_node, [None, channel_indices, None, None])
+            replacement_shape = _rank_shape(replacement_meta_node)
+            if replacement_shape is not None:
+                index_node.meta = _shape_meta_from_node(replacement_meta_node, replacement_shape)
+            else:
+                index_node.meta = dict(getattr(replacement_meta_node, "meta", {}))
+            for sibling_user in list(cat_node.users):
+                sibling_index_spec_arg = sibling_user.args[1] if len(sibling_user.args) >= 2 else None
+                if (
+                    not isinstance(sibling_user, torch.fx.Node)
+                    or sibling_user.op != "call_function"
+                    or str(sibling_user.target) != "aten.index.Tensor"
+                    or not isinstance(sibling_index_spec_arg, (list, tuple))
+                ):
+                    continue
+                sibling_index_spec = list(sibling_index_spec_arg)
+                if (
+                    len(sibling_index_spec) == 4
+                    and sibling_index_spec[0] is None
+                    and sibling_index_spec[1] is None
+                    and sibling_index_spec[2] is None
+                    and sibling_index_spec[3] is not None
+                ):
+                    sibling_user.args = (cat_node, [None, sibling_index_spec[3], None, None])
+                    sibling_users = list(sibling_user.users)
+                    for sibling_perm_user in sibling_users:
+                        if (
+                            sibling_perm_user.op == "call_function"
+                            and str(sibling_perm_user.target) == "aten.permute.default"
+                            and len(sibling_perm_user.args) >= 2
+                            and _normalize_perm(sibling_perm_user.args[1]) == [0, 3, 1, 2]
+                        ):
+                            perm_users = list(sibling_perm_user.users)
+                            if (
+                                len(perm_users) == 1
+                                and perm_users[0].op == "call_function"
+                                and str(perm_users[0].target) == "aten.contiguous.default"
+                            ):
+                                perm_users[0].replace_all_uses_with(sibling_user)
+                            else:
+                                sibling_perm_user.replace_all_uses_with(sibling_user)
+            for user in index_users:
+                user_users = list(user.users)
+                if (
+                    len(user_users) == 1
+                    and user_users[0].op == "call_function"
+                    and str(user_users[0].target) == "aten.contiguous.default"
+                ):
+                    user_users[0].replace_all_uses_with(index_node)
+                else:
+                    user.replace_all_uses_with(index_node)
             local_changed = True
 
         for node in list(graph.nodes):
@@ -18795,20 +19413,23 @@ def _canonicalize_generated_model_source_for_raw_export(
     generic_apply_concat_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=(?P<axis>-?\d+), target_shape=\[(?P<shape>[0-9, ]+)\], fused='(?P<fused>[^']+)'\)$"
     )
+    channel_last_gather_slice_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\[:, :, :, \[(?P<indices>[0-9,\s-]+)\]\]$"
+    )
     pad_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<shape>[0-9, ]+)\]\), \[(?P<pad>[0-9, ]+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<shape>[0-9, ]+)\]\), \[(?P<pad>[0-9, ]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     rank3_const_pad_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     rank4_const_pad_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     rank4_const_pad6_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     aligned_rank4_const_pad6_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     apply_pool2d_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<shape>[0-9, ]+)\], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
@@ -18944,10 +19565,6 @@ def _canonicalize_generated_model_source_for_raw_export(
     pidnet_spp_scale4_add_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_add), \[1, 1, 1, 512\]\)$"
     )
-    pidnet_pag4_mul2_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\("
-        r"(?P<sig>[A-Za-z0-9_]*pag4_sig_out0), (?P<resize>[A-Za-z0-9_]*pag4_resize1_out_nhwc), \[1, 64, 24, 40\]\)$"
-    )
     pidnet_pag4_mul2_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]*pag4_mul2_out0) = _align_tensor_to_target_shape\("
         r"torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 64, 24, 40\]\)$"
@@ -18985,6 +19602,7 @@ def _canonicalize_generated_model_source_for_raw_export(
     changed = False
     cf_pad_aliases: set[str] = set()
     cf_aliases: set[str] = set()
+    forced_cf_aliases: set[str] = set()
     singleton_cf_seeds: set[str] = set()
     cf_materialized_alias_sources: Dict[str, str] = {}
     generic_alias_sources: Dict[str, str] = {}
@@ -19023,6 +19641,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             if next_name is None:
                 break
             resolved_name = next_name
+        if resolved_name in forced_cf_aliases:
+            return True
         resolved_tensor = (
             model_ir.tensors.get(_resolve_model_ir_tensor_name(resolved_name), None)
             if model_ir is not None
@@ -19061,6 +19681,23 @@ def _canonicalize_generated_model_source_for_raw_export(
             if assign_re.match(lines[candidate]) is not None:
                 return True
         return False
+
+    def _declares_channel_last_name(name: str) -> bool:
+        if name in forced_cf_aliases:
+            return False
+        resolved_name = _resolve_model_ir_tensor_name(name)
+        tensor = (
+            model_ir.tensors.get(resolved_name, None)
+            if model_ir is not None
+            else None
+        )
+        if tensor is not None:
+            layout = normalize_logical_layout(tensor.logical_layout)
+            if is_channel_last_logical_layout(layout):
+                return True
+            if is_channel_first_logical_layout(layout):
+                return False
+        return "_nhwc" in name
 
     def _infer_cf_channel_count(name: str) -> int | None:
         producer_module = module_output_producers.get(name, None)
@@ -19392,16 +20029,6 @@ def _canonicalize_generated_model_source_for_raw_export(
             )
             changed = True
             line = lines[index]
-        pidnet_pag4_mul2_align_match = pidnet_pag4_mul2_align_re.match(line)
-        if pidnet_pag4_mul2_align_match is not None:
-            lines[index] = (
-                f"{pidnet_pag4_mul2_align_match.group('indent')}{pidnet_pag4_mul2_align_match.group('lhs0')}, "
-                f"{pidnet_pag4_mul2_align_match.group('lhs1')} = "
-                f"{pidnet_pag4_mul2_align_match.group('sig')}, "
-                f"{pidnet_pag4_mul2_align_match.group('resize')}"
-            )
-            changed = True
-            line = lines[index]
         pidnet_pag4_mul2_out_match = pidnet_pag4_mul2_out_re.match(line)
         if pidnet_pag4_mul2_out_match is not None:
             lines[index] = (
@@ -19558,12 +20185,21 @@ def _canonicalize_generated_model_source_for_raw_export(
                 if source_tensor is not None
                 else LOGICAL_LAYOUT_UNKNOWN
             )
+            future_pool_consumer = any(
+                (
+                    apply_pool2d_re.match(lines[lookahead]) is not None
+                    and str(cast(re.Match[str], apply_pool2d_re.match(lines[lookahead])).group("input")) == alias
+                )
+                for lookahead in range(index + 1, min(index + 5, len(lines)))
+            )
             if (
                 alias_tensor is not None
                 and source_tensor is not None
                 and is_channel_last_logical_layout(alias_layout)
                 and is_channel_last_logical_layout(source_layout)
                 and list(alias_tensor.shape) == [n, h, w, c]
+                and not source.endswith("_cf")
+                and not future_pool_consumer
             ):
                 indent = str(cf_nhwc_materialize_match.group("indent"))
                 lines[index] = f"{indent}{alias} = {source}"
@@ -19791,18 +20427,43 @@ def _canonicalize_generated_model_source_for_raw_export(
             if (
                 str(generic_pool2d_match.group("channel_last")) == "True"
                 and (
-                    _is_known_cf_name(input_name, singleton_cf_seeds)
+                    (
+                        _is_known_cf_name(input_name, singleton_cf_seeds)
+                        and not _tensor_name_suggests_channel_last_layout_for_codegen(input_name)
+                    )
                     or input_name in cf_pad_aliases
                 )
             ):
                 indent = str(generic_pool2d_match.group("indent"))
                 lhs = str(generic_pool2d_match.group("lhs"))
                 rest = str(generic_pool2d_match.group("rest"))
-                shape = str(generic_pool2d_match.group("shape"))
+                shape_values = [
+                    int(value.strip())
+                    for value in str(generic_pool2d_match.group("shape")).split(",")
+                    if value.strip()
+                ]
+                exact_shape = _model_ir_exact_shape(lhs)
+                target_shape_literal = (
+                    repr(exact_shape)
+                    if exact_shape is not None and len(exact_shape) == 4
+                    else (
+                        repr(shape_values)
+                        if (
+                            len(shape_values) == 4
+                            and int(shape_values[1]) != int(shape_values[2])
+                            and int(shape_values[2]) == int(shape_values[3])
+                        )
+                        else (
+                            repr([shape_values[0], shape_values[3], shape_values[1], shape_values[2]])
+                            if len(shape_values) == 4
+                            else f"[{generic_pool2d_match.group('shape')}]"
+                        )
+                    )
+                )
                 is_max = str(generic_pool2d_match.group("is_max"))
                 lines[index] = (
                     f"{indent}{lhs} = _apply_pool2d({input_name}, {rest}, "
-                    f"target_shape=[{shape}], is_max_pool={is_max}, channel_last=False)"
+                    f"target_shape={target_shape_literal}, is_max_pool={is_max}, channel_last=False)"
                 )
                 cf_aliases.add(lhs)
                 changed = True
@@ -19825,9 +20486,17 @@ def _canonicalize_generated_model_source_for_raw_export(
         concat_match = concat_re.match(lines[index])
         if concat_match is not None:
             input_names = [name.strip() for name in str(concat_match.group("inputs")).split(",") if name.strip()]
+            next_channel_last_gather_slice_match = (
+                channel_last_gather_slice_re.match(lines[index + 1])
+                if index + 1 < len(lines)
+                else None
+            )
             if len(input_names) >= 2 and all(
                 ("_cf" in input_name) or (input_name in cf_pad_aliases) or (input_name in cf_aliases)
                 for input_name in input_names
+            ) and not (
+                next_channel_last_gather_slice_match is not None
+                and str(next_channel_last_gather_slice_match.group("input")) == str(concat_match.group("lhs"))
             ):
                 indent = str(concat_match.group("indent"))
                 lhs = str(concat_match.group("lhs"))
@@ -19844,6 +20513,11 @@ def _canonicalize_generated_model_source_for_raw_export(
             ]
             lhs = str(generic_cat_match.group("lhs"))
             axis = int(generic_cat_match.group("axis"))
+            next_channel_last_gather_slice_match = (
+                channel_last_gather_slice_re.match(lines[index + 1])
+                if index + 1 < len(lines)
+                else None
+            )
             if model_ir is not None and lhs in model_ir.outputs and axis != 1:
                 continue
             if (
@@ -19852,6 +20526,10 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and (
                     axis != 1
                     or normalized_inputs != input_names
+                )
+                and not (
+                    next_channel_last_gather_slice_match is not None
+                    and str(next_channel_last_gather_slice_match.group("input")) == lhs
                 )
                 and (_is_known_cf_name(lhs, singleton_cf_seeds) or _model_ir_is_channel_first(lhs) or lhs.endswith("_cf"))
             ):
@@ -20674,11 +21352,14 @@ def _canonicalize_generated_model_source_for_raw_export(
                 break
         rank4_const_pad6_match = rank4_const_pad6_re.match(lines[index])
         if rank4_const_pad6_match is not None:
+            input_name = str(rank4_const_pad6_match.group("input"))
+            input_name_looks_channel_last = _tensor_name_suggests_channel_last_layout_for_codegen(input_name)
             next_pool2d_match = apply_pool2d_re.match(lines[index + 1]) if index + 1 < len(lines) else None
             if (
                 next_pool2d_match is not None
                 and str(next_pool2d_match.group("input")) == str(rank4_const_pad6_match.group("lhs"))
                 and str(next_pool2d_match.group("channel_last")) == "True"
+                and not input_name_looks_channel_last
             ):
                 target_shape_values = [
                     int(value.strip())
@@ -20692,7 +21373,6 @@ def _canonicalize_generated_model_source_for_raw_export(
                 ):
                     indent = str(rank4_const_pad6_match.group("indent"))
                     lhs = str(rank4_const_pad6_match.group("lhs"))
-                    input_name = str(rank4_const_pad6_match.group("input"))
                     pad0 = int(rank4_const_pad6_match.group("pad0"))
                     pad1 = int(rank4_const_pad6_match.group("pad1"))
                     pad2 = int(rank4_const_pad6_match.group("pad2"))
@@ -20704,17 +21384,30 @@ def _canonicalize_generated_model_source_for_raw_export(
                         f"mode='constant', value={value})"
                     )
                     cf_pad_aliases.add(lhs)
+                    exact_pool_shape = _model_ir_exact_shape(str(next_pool2d_match.group("lhs")))
+                    target_shape_literal = (
+                        repr(exact_pool_shape)
+                        if exact_pool_shape is not None and len(exact_pool_shape) == 4
+                        else (
+                            repr(target_shape_values)
+                            if (
+                                len(target_shape_values) == 4
+                                and int(target_shape_values[1]) != int(target_shape_values[2])
+                                and int(target_shape_values[2]) == int(target_shape_values[3])
+                            )
+                            else f"[{next_pool2d_match.group('shape')}]"
+                        )
+                    )
                     lines[index + 1] = (
                         f"{next_pool2d_match.group('indent')}{next_pool2d_match.group('lhs')} = _apply_pool2d("
                         f"{lhs}, {next_pool2d_match.group('rest')}, "
-                        f"target_shape=[{next_pool2d_match.group('shape')}], "
+                        f"target_shape={target_shape_literal}, "
                         f"is_max_pool={next_pool2d_match.group('is_max')}, channel_last=False)"
                     )
                     cf_aliases.add(str(next_pool2d_match.group("lhs")))
                     changed = True
                     continue
-            input_name = str(rank4_const_pad6_match.group("input"))
-            if _is_known_cf_name(input_name, singleton_cf_seeds):
+            if _is_known_cf_name(input_name, singleton_cf_seeds) and not input_name_looks_channel_last:
                 indent = str(rank4_const_pad6_match.group("indent"))
                 lhs = str(rank4_const_pad6_match.group("lhs"))
                 pad0 = int(rank4_const_pad6_match.group("pad0"))
@@ -20732,7 +21425,10 @@ def _canonicalize_generated_model_source_for_raw_export(
         aligned_rank4_const_pad6_match = aligned_rank4_const_pad6_re.match(lines[index])
         if aligned_rank4_const_pad6_match is not None:
             input_name = str(aligned_rank4_const_pad6_match.group("input"))
-            if _is_known_cf_name(input_name, singleton_cf_seeds):
+            if (
+                _is_known_cf_name(input_name, singleton_cf_seeds)
+                and not _tensor_name_suggests_channel_last_layout_for_codegen(input_name)
+            ):
                 indent = str(aligned_rank4_const_pad6_match.group("indent"))
                 lhs = str(aligned_rank4_const_pad6_match.group("lhs"))
                 pad0 = int(aligned_rank4_const_pad6_match.group("pad0"))
@@ -20746,10 +21442,64 @@ def _canonicalize_generated_model_source_for_raw_export(
                     f"mode='constant', value={value})"
                 )
                 cf_pad_aliases.add(lhs)
+                next_pool2d_match = apply_pool2d_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+                if (
+                    next_pool2d_match is not None
+                    and str(next_pool2d_match.group("input")) == lhs
+                    and str(next_pool2d_match.group("channel_last")) == "True"
+                ):
+                    target_shape_values = [
+                        int(value.strip())
+                        for value in str(next_pool2d_match.group("shape")).split(",")
+                        if value.strip()
+                    ]
+                    if len(target_shape_values) == 4:
+                        exact_pool_shape = _model_ir_exact_shape(str(next_pool2d_match.group("lhs")))
+                        cf_target_shape = (
+                            [int(v) for v in list(exact_pool_shape)]
+                            if exact_pool_shape is not None and len(exact_pool_shape) == 4
+                            else (
+                                [int(v) for v in list(target_shape_values)]
+                                if (
+                                    int(target_shape_values[1]) != int(target_shape_values[2])
+                                    and int(target_shape_values[2]) == int(target_shape_values[3])
+                                )
+                                else [
+                                    int(target_shape_values[0]),
+                                    int(target_shape_values[3]),
+                                    int(target_shape_values[1]),
+                                    int(target_shape_values[2]),
+                                ]
+                            )
+                        )
+                        lines[index + 1] = (
+                            f"{next_pool2d_match.group('indent')}{next_pool2d_match.group('lhs')} = _apply_pool2d("
+                            f"{lhs}, {next_pool2d_match.group('rest')}, "
+                            f"target_shape={repr(cf_target_shape)}, "
+                            f"is_max_pool={next_pool2d_match.group('is_max')}, channel_last=False)"
+                        )
+                        cf_aliases.add(str(next_pool2d_match.group("lhs")))
                 changed = True
         concat_match = concat_re.match(lines[index])
         next_split_match = generic_split_re.match(lines[index + 1]) if index + 1 < len(lines) else None
         next_module_call_match = generic_module_call_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        next_channel_last_gather_slice_match = (
+            channel_last_gather_slice_re.match(lines[index + 1])
+            if index + 1 < len(lines)
+            else None
+        )
+        gather_slice_matches: List[Tuple[int, re.Match[str]]] = []
+        if concat_match is not None:
+            gather_slice_lookahead = index + 1
+            while gather_slice_lookahead < len(lines):
+                gather_slice_match = channel_last_gather_slice_re.match(lines[gather_slice_lookahead])
+                if (
+                    gather_slice_match is None
+                    or str(gather_slice_match.group("input")) != str(concat_match.group("lhs"))
+                ):
+                    break
+                gather_slice_matches.append((gather_slice_lookahead, gather_slice_match))
+                gather_slice_lookahead += 1
         aligned_rank4_seed_match = aligned_nhwc_rank4_re.match(lines[index])
         if aligned_rank4_seed_match is not None:
             lhs = str(aligned_rank4_seed_match.group("lhs"))
@@ -20819,7 +21569,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and len(target_shape_values) == 4
                 and int(next_split_match.group("axis")) == 3
                 and int(next_split_match.group("sections")) == target_shape_values[-1]
-                and all("_nhwc" not in input_name for input_name in normalized_input_names)
+                and all(not _declares_channel_last_name(input_name) for input_name in normalized_input_names)
             ):
                 should_rewrite_concat = True
             if (
@@ -20828,7 +21578,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and target_shape_values[1] < target_shape_values[2]
                 and target_shape_values[1] < target_shape_values[3]
                 and any(
-                    _is_known_cf_name(name, singleton_cf_vars) or "_nhwc" in name
+                    _is_known_cf_name(name, singleton_cf_vars) or _declares_channel_last_name(name)
                     for name in normalized_input_names
                 )
             ):
@@ -20838,14 +21588,78 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and target_looks_cf
                 and next_module_call_match is not None
                 and str(next_module_call_match.group("input")) == lhs
-                and all("_nhwc" not in input_name for input_name in normalized_input_names)
+                and all(not _declares_channel_last_name(input_name) for input_name in normalized_input_names)
                 and any(_is_known_cf_name(name, singleton_cf_vars) for name in normalized_input_names)
             ):
                 should_rewrite_concat = True
+            if (
+                should_rewrite_concat
+                and next_channel_last_gather_slice_match is not None
+                and str(next_channel_last_gather_slice_match.group("input")) == lhs
+            ):
+                function_end = _function_end_index(index)
+                supported_gather_slice_chain = len(gather_slice_matches) > 0
+                for gather_slice_index, gather_slice_match in gather_slice_matches:
+                    gather_slice_lhs = str(gather_slice_match.group("lhs"))
+                    gather_slice_supported = False
+                    for future_index in range(gather_slice_index + 1, min(function_end, gather_slice_index + 10)):
+                        permuted_use_match = permuted_cf_module_input_re.match(lines[future_index])
+                        if (
+                            permuted_use_match is not None
+                            and str(permuted_use_match.group("src")) == gather_slice_lhs
+                        ):
+                            gather_slice_supported = True
+                            break
+                        future_concat_match = generic_apply_concat_re.match(lines[future_index])
+                        if future_concat_match is not None:
+                            future_concat_inputs = {
+                                name.strip()
+                                for name in str(future_concat_match.group("inputs")).split(",")
+                                if name.strip()
+                            }
+                            if (
+                                gather_slice_lhs in future_concat_inputs
+                                and int(future_concat_match.group("axis")) == 3
+                            ):
+                                gather_slice_supported = True
+                                break
+                        future_legacy_concat_match = concat_re.match(lines[future_index])
+                        if future_legacy_concat_match is not None:
+                            future_concat_inputs = {
+                                name.strip()
+                                for name in str(future_legacy_concat_match.group("inputs")).split(",")
+                                if name.strip()
+                            }
+                            if gather_slice_lhs in future_concat_inputs:
+                                gather_slice_supported = True
+                                break
+                    if not gather_slice_supported:
+                        supported_gather_slice_chain = False
+                        break
+                if not supported_gather_slice_chain:
+                    should_rewrite_concat = False
             if should_rewrite_concat:
                 indent = str(concat_match.group("indent"))
                 lines[index] = f"{indent}{lhs} = torch.cat([{', '.join(normalized_input_names)}], dim=1)"
                 cf_aliases.add(lhs)
+                forced_cf_aliases.add(lhs)
+                for gather_slice_index, gather_slice_match in gather_slice_matches:
+                    gather_slice_lhs = str(gather_slice_match.group("lhs"))
+                    gather_slice_indent = str(gather_slice_match.group("indent"))
+                    gather_slice_indices = str(gather_slice_match.group("indices"))
+                    lines[gather_slice_index] = (
+                        f"{gather_slice_indent}{gather_slice_lhs} = "
+                        f"{lhs}[:, [{gather_slice_indices}], :, :]"
+                    )
+                    cf_aliases.add(gather_slice_lhs)
+                    forced_cf_aliases.add(gather_slice_lhs)
+                    gather_index_values = [
+                        token.strip()
+                        for token in gather_slice_indices.split(",")
+                        if token.strip()
+                    ]
+                    if len(gather_index_values) == 1:
+                        singleton_cf_vars.add(gather_slice_lhs)
                 if next_split_match is not None and str(next_split_match.group("input")) == lhs and int(next_split_match.group("axis")) == 3:
                     lines[index + 1] = (
                         f"{next_split_match.group('indent')}{next_split_match.group('outputs')} = list(torch.tensor_split("
@@ -20859,7 +21673,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and str(next_module_call_match.group("input")) == lhs
                 and len(target_shape_values) == 4
                 and target_looks_cf
-                and any("_nhwc" in input_name for input_name in normalized_input_names)
+                and any(_declares_channel_last_name(input_name) for input_name in normalized_input_names)
             ):
                 indent = str(concat_match.group("indent"))
                 n, c, h, w = target_shape_values
