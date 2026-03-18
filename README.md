@@ -382,16 +382,16 @@ The output directory contains:
 - `yolox_s_float32.tflite`
 - `yolox_s_float16.tflite`
 - `yolox_s_pytorch/`
-- `model.py`
-- `runtime.py`
-- `state_dict.pth`
-- `metadata.json`
-- `yolox_s_pytorch/yolox_s_jit.pt`
-- `yolox_s_pytorch/yolox_s_dynamo.onnx`
-- `yolox_s_pytorch/yolox_s_ep.pt2`
-- `yolox_s_accuracy_report.json` (`ONNX↔TFLite`)
-- `yolox_s_pytorch_accuracy_report.json` (`ONNX↔PyTorch`)
-- `yolox_s_accuracy_comparison_report.json`
+  - `model.py`
+  - `runtime.py`
+  - `state_dict.pth`
+  - `metadata.json`
+  - `yolox_s_pytorch/yolox_s_jit.pt`
+  - `yolox_s_pytorch/yolox_s_dynamo.onnx`
+  - `yolox_s_pytorch/yolox_s_ep.pt2`
+  - `yolox_s_accuracy_report.json` (`ONNX↔TFLite`)
+  - `yolox_s_pytorch_accuracy_report.json` (`ONNX↔PyTorch`)
+  - `yolox_s_accuracy_comparison_report.json`
 
 The generated PyTorch package is a normal `torch.nn.Module` package. You can
 load it and run eager inference directly:
