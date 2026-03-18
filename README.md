@@ -1,5 +1,5 @@
 # onnx2tf
-A tool for converting ONNX files to LiteRT/TFLite/TensorFlow and PyTorch native code (nn.Module), TorchScript (.pt), and Exported Program (.pt2). It also supports direct conversion from LiteRT to PyTorch.
+A tool for converting ONNX files to LiteRT/TFLite/TensorFlow, PyTorch native code (nn.Module), TorchScript (.pt), state_dict (.pt), Exported Program (.pt2), and Dynamo ONNX. It also supports direct conversion from LiteRT to PyTorch.
 
 You should use LiteRT Torch rather than onnx2tf. https://github.com/google-ai-edge/litert-torch and https://github.com/google-ai-edge/ai-edge-quantizer
 
