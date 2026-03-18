@@ -38162,6 +38162,63 @@ def test_flatbuffer_direct_sinet_late_residual_preadd_transpose_targets_are_fold
             assert op_names[idx] != "TRANSPOSE"
 
 
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_deep_skip_tail_transpose_targets_are_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        for idx in [56, 188, 192, 202]:
+            assert op_names[idx] != "TRANSPOSE"
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_deep_skip_shared_prelu_transpose_targets_are_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        for idx in [155, 167, 169, 179]:
+            assert op_names[idx] != "TRANSPOSE"
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_mid_residual_transpose_targets_are_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        for idx in [81, 89, 93, 101]:
+            assert op_names[idx] != "TRANSPOSE"
+
+
 def test_repair_mixed_singleton_nchw_inputs_for_nhwc_concat_inserts_local_reshape() -> None:
     model_ir = ModelIR(name="mixed_singleton_concat_repair")
     model_ir.tensors["gate_nchw"] = TensorIR(
