@@ -896,6 +896,38 @@ def test_apply_fast_precanonicalize_repairs_fix_stage1_and_gather_chain(
     assert "cv79_in = cv73_out_cf[:, [0, 24, 1, 25], :, :]" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_depth_to_space_nhwc_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, upsampler_out_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        depth_to_in_reordered = upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]",
+                "        _depth_to_space_x_0 = depth_to_in_reordered",
+                "        return _depth_to_space_x_0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "depth_to_in_reordered = upsampler_out_nhwc[:, :, :, [0, 16, 32, 1, 17, 33]]"
+        in rewritten
+    )
+    assert "depth_to_in_reordered = upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]" not in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain(
     tmp_path,
 ) -> None:

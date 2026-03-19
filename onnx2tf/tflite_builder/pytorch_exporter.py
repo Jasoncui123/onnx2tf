@@ -23770,6 +23770,9 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     gather_slice_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\[:, :, :, \[(?P<indices>[0-9,\s-]+)\]\]$"
     )
+    depth_to_space_nhwc_gather_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
+    )
     apply_concat_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=3, target_shape=\[(?P<shape>[0-9, ]+)\], fused='(?P<fused>[^']+)'\)$"
     )
@@ -24071,6 +24074,29 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                     f"self.{permuted_conv_input_match.group('module')}({input_name})"
                 )
                 cf_like_names.add(str(permuted_conv_input_match.group("lhs")))
+                changed = True
+        depth_to_space_nhwc_gather_match = depth_to_space_nhwc_gather_re.match(line)
+        if depth_to_space_nhwc_gather_match is not None:
+            input_name = str(depth_to_space_nhwc_gather_match.group("input"))
+            lhs_name = str(depth_to_space_nhwc_gather_match.group("lhs"))
+            next_line = str(lines[index + 1]) if index + 1 < len(lines) else ""
+            is_depth_to_space_reorder = (
+                input_name.endswith("_nhwc")
+                and (
+                    "depth_to" in lhs_name.lower()
+                    or "depthtospace" in lhs_name.lower()
+                    or (
+                        f"= {lhs_name}" in next_line
+                        and "_depth_to_space_" in next_line
+                    )
+                )
+            )
+            if is_depth_to_space_reorder:
+                lines[index] = (
+                    f"{depth_to_space_nhwc_gather_match.group('indent')}"
+                    f"{lhs_name} = {input_name}[:, :, :, "
+                    f"[{depth_to_space_nhwc_gather_match.group('indices')}]]"
+                )
                 changed = True
         gather_slice_match = gather_slice_re.match(line)
         if gather_slice_match is not None:
