@@ -59,6 +59,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _repair_channel_last_gap_conv_inputs,
     _reject_residual_layout_transposes,
     _remove_redundant_layout_transposes,
+    _restore_same_average_pool_exclude_pad_correction_for_native_runtime,
     _rewrite_generated_model_source_for_exported_program,
     _rewrite_channel_last_binary_bridge_chains,
     _rewrite_channel_last_gap_means_to_reduce_mean,
@@ -138,6 +139,24 @@ def _exported_program_structural_signature(exported_program: Any) -> dict[str, A
         "nodes": tuple(nodes),
         "node_counts": tuple(sorted(Counter(target for target, _ in nodes).items())),
     }
+
+
+def _make_average_pool_same_exclude_pad_model() -> onnx.ModelProto:
+    x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 3, 3])
+    y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 3, 3])
+    node = helper.make_node(
+        "AveragePool",
+        inputs=["input"],
+        outputs=["output"],
+        kernel_shape=[3, 3],
+        strides=[1, 1],
+        auto_pad="SAME_UPPER",
+        count_include_pad=0,
+    )
+    graph = helper.make_graph([node], "average_pool_same_exclude_pad_graph", [x], [y])
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 11)])
+    model.ir_version = 7
+    return model
 
 
 def _flatten_tensor_outputs(value: Any) -> list[torch.Tensor]:
@@ -1073,6 +1092,44 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
     assert "scores = torch.reshape(wa_squeeze_out0, _resolve_reshape_shape([-1, 1], wa_squeeze_out0, allow_zero=False))" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_fix_efficientformer_attention_scalar_mul_target(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_efficientformer_attention_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_onnx__Add_643', torch.zeros([1, 8, 49, 49], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, onnx_mul640: torch.Tensor) -> torch.Tensor:",
+                "        onnx_mul640 = _align_tensor_to_target_shape(torch.matmul(onnx_mul640, onnx_mul640), [1, 8, 49, 49])",
+                "        onnx_add642 = _align_tensor_to_target_shape(torch.mul(onnx_mul640, 0.1767766922712326), [1, 49, 8, 49])",
+                "        onnx_softmax644 = _align_tensor_to_target_shape(torch.add(onnx_add642, self.const_onnx__Add_643), [1, 8, 49, 49])",
+                "        onnx_mat_mul645 = _apply_softmax(onnx_softmax644, axis=3, beta=1.0, target_shape=[1, 8, 49, 49])",
+                "        return onnx_mat_mul645",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "onnx_add642 = _align_tensor_to_target_shape(torch.mul(onnx_mul640, 0.1767766922712326), [1, 8, 49, 49])"
+        in rewritten
+    )
+    assert "[1, 49, 8, 49]" not in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain(
     tmp_path,
 ) -> None:
@@ -1230,6 +1287,114 @@ def test_apply_fast_precanonicalize_repairs_fix_pool_lrn_conv_cf_chain(
     assert "cv23_x3_in_cf = self.conv_block_1(p1_norm1_out_nhwc)" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_restore_cf_same_pool_target_from_downstream_alignment(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_cf_same_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, average_p4_in_cf: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:",
+                "        average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=_tensor_shape_list(average_p4_in_cf), is_max_pool=False, channel_last=False)",
+                "        onnx_mul291_cf = torch.sub(average_p4_out, average_p4_in_cf)",
+                "        onnx_add292 = _align_tensor_to_target_shape(torch.mul(scale, onnx_mul291_cf), [1, 48, 56, 56])",
+                "        return onnx_add292",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, "
+        "padding='SAME', target_shape=[1, 48, 56, 56], is_max_pool=False, channel_last=False)"
+        in rewritten
+    )
+    assert "target_shape=_tensor_shape_list(average_p4_in_cf)" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_dynamic_cf_same_max_pool_target(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_cf_same_max_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scores_map: torch.Tensor) -> torch.Tensor:",
+                "        wadkd_max_p_out = _apply_pool2d(scores_map, filter_height=5, filter_width=5, stride_h=1, stride_w=1, padding='SAME', target_shape=_tensor_shape_list(scores_map), is_max_pool=True, channel_last=False)",
+                "        wadkd_equal_out0 = torch.eq(scores_map, wadkd_max_p_out)",
+                "        wadkd_equal_out0 = _align_tensor_to_target_shape(wadkd_equal_out0, [1, 192, 320, 1])",
+                "        return wadkd_equal_out0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "wadkd_max_p_out = _apply_pool2d(scores_map, filter_height=5, filter_width=5, stride_h=1, "
+        "stride_w=1, padding='SAME', target_shape=_tensor_shape_list(scores_map), "
+        "is_max_pool=True, channel_last=False)"
+        in rewritten
+    )
+    assert "target_shape=[1, 192, 320, 1]" not in rewritten.splitlines()[4]
+
+
+def test_apply_fast_precanonicalize_repairs_fix_nanodet_stage0_channel_last_pool_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_nanodet_stage0_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
+                "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
+                "        waback_stage2_branch1_cv_out331_f_cf = self.conv_block_1(wabackbonemaxpool_max_p_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        waback_stage2_branch2_f69_cf_73ca = self.conv_block_2(wabackbonemaxpool_max_p_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        return waback_stage2_branch1_cv_out331_f_cf, waback_stage2_branch2_f69_cf_73ca",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, "
+        "filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', "
+        "target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)"
+        in rewritten
+    )
+    assert "waback_stage2_branch1_cv_out331_f_cf = self.conv_block_1(wabackbonemaxpool_max_p_out_nhwc)" in rewritten
+    assert "waback_stage2_branch2_f69_cf_73ca = self.conv_block_2(wabackbonemaxpool_max_p_out_nhwc)" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_does_not_inject_humanseg_resize_aliases_without_markers(
     tmp_path,
 ) -> None:
@@ -1300,6 +1465,32 @@ def test_should_not_skip_expensive_raw_canonicalize_for_generic_package(
         encoding="utf-8",
     )
 
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_l1_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "efficientformer_l1_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, average_p4_in_cf, cv219_in_cf, onnx_add600_cf, onnx_add642):",
+                "        average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 48, 56, 56], is_max_pool=False, channel_last=False)",
+                "        onnx_shape601 = _align_tensor_to_target_shape(torch.add(cv219_in_cf, onnx_add600_cf), [1, 7, 7, 448])",
+                "        onnx_softmax644 = _align_tensor_to_target_shape(torch.add(onnx_add642, self.const_onnx__Add_643), [1, 8, 49, 49])",
+                "        return average_p4_out, onnx_shape601, onnx_softmax644",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
 
 
@@ -1623,6 +1814,33 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_imported_tflite_r
                 "        wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
                 "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
                 "        wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)",
+                "        wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_current_channel_last_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_current_channel_last_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data, wafpnupsample1_resize_in_nhwc, wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0):",
+                "        wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
+                "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
                 "        wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
                 "        out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
                 "        return out",
@@ -2252,6 +2470,85 @@ def test_canonicalize_generated_model_source_restores_nhwc_materialize_for_chann
     rewritten = model_path.read_text(encoding="utf-8")
     assert "x = _align_tensor_to_target_shape(x_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])" in rewritten
     assert "x = x_cf" not in rewritten
+
+
+def test_canonicalize_generated_model_source_prefers_exact_cf_pool_shape_over_dynamic_input_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "exact_cf_pool_shape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, average_p4_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 48, 56, 56], is_max_pool=False, channel_last=False)",
+                "        return average_p4_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="exact_cf_pool_shape")
+    model_ir.tensors["average_p4_out"] = TensorIR(
+        name="average_p4_out",
+        dtype="FLOAT32",
+        shape=[1, 48, 56, 56],
+        shape_signature=[1, 48, 56, 56],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "target_shape=[1, 48, 56, 56]" in rewritten
+    assert "target_shape=_tensor_shape_list(average_p4_in_cf)" not in rewritten
+
+
+def test_canonicalize_generated_model_source_keeps_dynamic_same_max_pool_shape_for_cf_input(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "dynamic_cf_same_max_pool_shape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scores_map: torch.Tensor) -> torch.Tensor:",
+                "        wadkd_max_p_out = _apply_pool2d(scores_map, filter_height=5, filter_width=5, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 192, 320, 1], is_max_pool=True, channel_last=False)",
+                "        return wadkd_max_p_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="dynamic_cf_same_max_pool_shape")
+    model_ir.tensors["scores_map"] = TensorIR(
+        name="scores_map",
+        dtype="FLOAT32",
+        shape=[1, 1, 192, 320],
+        shape_signature=[1, 1, 192, 320],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["wadkd_max_p_out"] = TensorIR(
+        name="wadkd_max_p_out",
+        dtype="FLOAT32",
+        shape=[1, 192, 320, 1],
+        shape_signature=[1, 192, 320, 1],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "target_shape=_tensor_shape_list(scores_map)" in rewritten
+    assert "target_shape=[1, 192, 320, 1]" not in rewritten
 
 
 def test_canonicalize_generated_model_source_rewrites_direct_torch_cat_after_cf_resize(tmp_path) -> None:
@@ -11682,6 +11979,61 @@ def test_export_pytorch_package_generates_native_pidnet_package_when_model_is_av
             pytest.fail(
                 f"Found redundant mean/mul layout bridge in ExportedProgram: {node.name} -> {inverse_node.name}"
             )
+
+
+def test_restore_same_average_pool_exclude_pad_correction_for_native_runtime() -> None:
+    model_ir = ModelIR(name="avg_pool_same_native_fix")
+    model_ir.inputs = ["x"]
+    model_ir.outputs = ["y"]
+    model_ir.tensors["x"] = TensorIR(
+        name="x",
+        dtype="FLOAT32",
+        shape=[1, 1, 3, 3],
+        shape_signature=[1, 1, 3, 3],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["y"] = TensorIR(
+        name="y",
+        dtype="FLOAT32",
+        shape=[1, 1, 3, 3],
+        shape_signature=[1, 1, 3, 3],
+        logical_layout="NCHW",
+    )
+    model_ir.operators.append(
+        OperatorIR(
+            op_type="AVERAGE_POOL_2D",
+            inputs=["x"],
+            outputs=["y"],
+            options={
+                "padding": "SAME",
+                "strideH": 1,
+                "strideW": 1,
+                "filterHeight": 3,
+                "filterWidth": 3,
+                "fusedActivationFunction": "NONE",
+            },
+        )
+    )
+
+    stats = _restore_same_average_pool_exclude_pad_correction_for_native_runtime(model_ir)
+    assert stats["restored_same_average_pool_exclude_pad_corrections"] == 1
+    assert [str(op.op_type) for op in model_ir.operators] == ["AVERAGE_POOL_2D", "MUL"]
+    assert str(model_ir.operators[0].outputs[0]).endswith("_include_pad")
+    assert list(model_ir.operators[1].outputs) == ["y"]
+
+    reciprocal_name = str(model_ir.operators[1].inputs[1])
+    reciprocal_tensor = model_ir.tensors[reciprocal_name]
+    assert reciprocal_tensor.logical_layout == "NHWC"
+    assert reciprocal_tensor.shape == [1, 3, 3, 1]
+    expected = np.asarray(
+        [
+            [[2.25], [1.5], [2.25]],
+            [[1.5], [1.0], [1.5]],
+            [[2.25], [1.5], [2.25]],
+        ],
+        dtype=np.float32,
+    ).reshape(1, 3, 3, 1)
+    np.testing.assert_allclose(np.asarray(reciprocal_tensor.data), expected, rtol=0.0, atol=0.0)
 
 
 def test_export_pytorch_package_conv2d_nchw(tmp_path) -> None:

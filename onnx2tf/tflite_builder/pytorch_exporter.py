@@ -61,6 +61,135 @@ class ModelIRPyTorchExportError(RuntimeError):
     pass
 
 
+def _restore_same_average_pool_exclude_pad_correction_for_native_runtime(
+    model_ir: ModelIR,
+) -> Dict[str, int]:
+    def _unique_tensor_name(base_name: str) -> str:
+        candidate = str(base_name)
+        suffix = 0
+        while candidate in model_ir.tensors:
+            suffix += 1
+            candidate = f"{base_name}_{suffix}"
+        return candidate
+
+    def _tensor_nhwc_shape(tensor: Optional[TensorIR]) -> Optional[List[int]]:
+        if tensor is None or len(tensor.shape) != 4:
+            return None
+        shape = [int(v) for v in list(tensor.shape)]
+        layout = normalize_logical_layout(tensor.logical_layout)
+        if is_channel_first_logical_layout(layout):
+            return [int(shape[0]), int(shape[2]), int(shape[3]), int(shape[1])]
+        if is_channel_last_logical_layout(layout):
+            return [int(shape[0]), int(shape[1]), int(shape[2]), int(shape[3])]
+        return None
+
+    rewritten_ops: List[OperatorIR] = []
+    restored = 0
+    for op in model_ir.operators:
+        rewritten_ops.append(op)
+        if str(op.op_type) != "AVERAGE_POOL_2D" or len(op.inputs) != 1 or len(op.outputs) != 1:
+            continue
+        if str(op.options.get("padding", "")).upper() != "SAME":
+            continue
+        output_name = str(op.outputs[0])
+        if output_name in {str(v) for v in list(model_ir.outputs)}:
+            pass
+        if str(output_name).endswith("_include_pad"):
+            continue
+        input_tensor = model_ir.tensors.get(str(op.inputs[0]), None)
+        output_tensor = model_ir.tensors.get(output_name, None)
+        input_nhwc_shape = _tensor_nhwc_shape(input_tensor)
+        output_nhwc_shape = _tensor_nhwc_shape(output_tensor)
+        if (
+            input_tensor is None
+            or output_tensor is None
+            or input_nhwc_shape is None
+            or output_nhwc_shape is None
+        ):
+            continue
+        _, input_h, input_w, _ = input_nhwc_shape
+        _, output_h, output_w, output_c = output_nhwc_shape
+        kernel_h = int(op.options.get("filterHeight", 0))
+        kernel_w = int(op.options.get("filterWidth", 0))
+        stride_h = int(op.options.get("strideH", 0))
+        stride_w = int(op.options.get("strideW", 0))
+        output_dtype = str(output_tensor.dtype).upper()
+        if (
+            input_h <= 0
+            or input_w <= 0
+            or output_h <= 0
+            or output_w <= 0
+            or output_c <= 0
+            or kernel_h <= 0
+            or kernel_w <= 0
+            or stride_h <= 0
+            or stride_w <= 0
+            or output_dtype not in {"FLOAT16", "FLOAT32"}
+        ):
+            continue
+        total_pad_h = max((int(output_h) - 1) * int(stride_h) + int(kernel_h) - int(input_h), 0)
+        total_pad_w = max((int(output_w) - 1) * int(stride_w) + int(kernel_w) - int(input_w), 0)
+        if total_pad_h == 0 and total_pad_w == 0:
+            continue
+        pad_top = int(total_pad_h) // 2
+        pad_left = int(total_pad_w) // 2
+        correction_hw = np.ones((int(output_h), int(output_w), 1), dtype=np.float32)
+        kernel_area = float(int(kernel_h) * int(kernel_w))
+        for out_y in range(int(output_h)):
+            start_y = int(out_y) * int(stride_h) - int(pad_top)
+            end_y = int(start_y) + int(kernel_h)
+            valid_h = max(min(end_y, int(input_h)) - max(start_y, 0), 0)
+            for out_x in range(int(output_w)):
+                start_x = int(out_x) * int(stride_w) - int(pad_left)
+                end_x = int(start_x) + int(kernel_w)
+                valid_w = max(min(end_x, int(input_w)) - max(start_x, 0), 0)
+                valid_count = int(valid_h) * int(valid_w)
+                if valid_count <= 0 or valid_count == int(kernel_h) * int(kernel_w):
+                    continue
+                correction_hw[out_y, out_x, 0] = float(kernel_area / float(valid_count))
+        reciprocal_values = np.broadcast_to(
+            correction_hw.reshape(1, int(output_h), int(output_w), 1),
+            (1, int(output_h), int(output_w), int(output_c)),
+        ).astype(np.float16 if output_dtype == "FLOAT16" else np.float32, copy=False)
+        reciprocal_name = _unique_tensor_name(f"{output_name}_div_reciprocal")
+        model_ir.tensors[reciprocal_name] = TensorIR(
+            name=reciprocal_name,
+            dtype=output_dtype,
+            shape=[1, int(output_h), int(output_w), int(output_c)],
+            shape_signature=[1, int(output_h), int(output_w), int(output_c)],
+            data=np.asarray(reciprocal_values),
+            logical_layout=normalize_logical_layout("NHWC"),
+        )
+        include_pad_name = _unique_tensor_name(f"{output_name}_include_pad")
+        model_ir.tensors[include_pad_name] = TensorIR(
+            name=include_pad_name,
+            dtype=str(output_tensor.dtype),
+            shape=[int(v) for v in list(output_tensor.shape)],
+            shape_signature=(
+                [int(v) for v in list(output_tensor.shape_signature)]
+                if output_tensor.shape_signature is not None
+                else [int(v) for v in list(output_tensor.shape)]
+            ),
+            quantization=copy.deepcopy(output_tensor.quantization),
+            logical_layout=normalize_logical_layout(output_tensor.logical_layout),
+        )
+        op.outputs = [include_pad_name]
+        rewritten_ops.append(
+            OperatorIR(
+                op_type="MUL",
+                inputs=[include_pad_name, reciprocal_name],
+                outputs=[output_name],
+                options={"fusedActivationFunction": "NONE"},
+            )
+        )
+        restored += 1
+    if restored > 0:
+        model_ir.operators = rewritten_ops
+    return {
+        "restored_same_average_pool_exclude_pad_corrections": int(restored),
+    }
+
+
 def _prepare_native_codegen_state(
     context: _NativeModelFileWriterContext,
 ) -> _NativeCodegenState:
@@ -20965,10 +21094,20 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and _is_known_cf_name(input_name, singleton_cf_seeds)
             ):
                 indent = str(pool2d_match.group("indent"))
+                is_max_pool = str(pool2d_match.group("is_max")) == "True"
+                target_shape_literal = (
+                    repr(exact_shape)
+                    if (
+                        not is_max_pool
+                        and exact_shape is not None
+                        and len(exact_shape) == 4
+                    )
+                    else f"_tensor_shape_list({input_name})"
+                )
                 lines[index] = (
                     f"{indent}{lhs} = _apply_pool2d("
                     f"{input_name}, {rest}, "
-                    f"target_shape=_tensor_shape_list({input_name}), is_max_pool={pool2d_match.group('is_max')}, channel_last=False)"
+                    f"target_shape={target_shape_literal}, is_max_pool={pool2d_match.group('is_max')}, channel_last=False)"
                 )
                 changed = True
             elif exact_shape is not None and len(exact_shape) == 4:
@@ -24207,6 +24346,15 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     aligned_binary_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
+    aligned_rank4_any_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+    aligned_scalar_binary_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"torch\.(?P<op>mul|add|sub|div)\((?P<input>[A-Za-z0-9_]+), "
+        r"(?P<scalar>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?)\), "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
     return_value_re = re.compile(
         r"^(?P<indent>\s*)return (?P<value>[A-Za-z0-9_]+)$"
     )
@@ -24215,6 +24363,12 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     )
     apply_pool2d_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+    )
+    dynamic_apply_pool2d_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=_tensor_shape_list\((?P<shape_input>[A-Za-z0-9_]+)\), is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
+    )
+    const_pad_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pads>[0-9,\s]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     apply_softmax_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
@@ -24272,6 +24426,73 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 or rhs_name.endswith("_out_cf")
             ):
                 cf_like_names.add(str(simple_alias_match.group("lhs")))
+        aligned_scalar_binary_match = aligned_scalar_binary_re.match(line)
+        if aligned_scalar_binary_match is not None and index > 0:
+            prev_aligned_rank4_match = aligned_rank4_any_re.match(lines[index - 1])
+            next_aligned_rank4_match = (
+                aligned_rank4_any_re.match(lines[index + 1])
+                if index + 1 < len(lines)
+                else None
+            )
+            next_apply_softmax_match = (
+                apply_softmax_re.match(lines[index + 1])
+                if index + 1 < len(lines)
+                else None
+            )
+            if (
+                prev_aligned_rank4_match is not None
+                and str(prev_aligned_rank4_match.group("lhs")) == str(aligned_scalar_binary_match.group("input"))
+            ):
+                prev_shape = [
+                    int(prev_aligned_rank4_match.group("n")),
+                    int(prev_aligned_rank4_match.group("d1")),
+                    int(prev_aligned_rank4_match.group("d2")),
+                    int(prev_aligned_rank4_match.group("d3")),
+                ]
+                current_shape = [
+                    int(aligned_scalar_binary_match.group("n")),
+                    int(aligned_scalar_binary_match.group("d1")),
+                    int(aligned_scalar_binary_match.group("d2")),
+                    int(aligned_scalar_binary_match.group("d3")),
+                ]
+                consumer_shape = None
+                current_lhs = str(aligned_scalar_binary_match.group("lhs"))
+                if (
+                    next_aligned_rank4_match is not None
+                    and re.search(
+                        rf"\b{re.escape(current_lhs)}\b",
+                        str(next_aligned_rank4_match.group("expr")),
+                    )
+                    is not None
+                ):
+                    consumer_shape = [
+                        int(next_aligned_rank4_match.group("n")),
+                        int(next_aligned_rank4_match.group("d1")),
+                        int(next_aligned_rank4_match.group("d2")),
+                        int(next_aligned_rank4_match.group("d3")),
+                    ]
+                elif (
+                    next_apply_softmax_match is not None
+                    and str(next_apply_softmax_match.group("input")) == current_lhs
+                ):
+                    consumer_shape = [
+                        int(next_apply_softmax_match.group("n")),
+                        int(next_apply_softmax_match.group("h")),
+                        int(next_apply_softmax_match.group("w")),
+                        int(next_apply_softmax_match.group("c")),
+                    ]
+                if (
+                    consumer_shape == prev_shape
+                    and current_shape != prev_shape
+                    and current_shape == [prev_shape[0], prev_shape[2], prev_shape[1], prev_shape[3]]
+                ):
+                    lines[index] = (
+                        f"{aligned_scalar_binary_match.group('indent')}{current_lhs} = "
+                        f"_align_tensor_to_target_shape(torch.{aligned_scalar_binary_match.group('op')}("
+                        f"{aligned_scalar_binary_match.group('input')}, {aligned_scalar_binary_match.group('scalar')}), "
+                        f"[{prev_shape[0]}, {prev_shape[1]}, {prev_shape[2]}, {prev_shape[3]}])"
+                    )
+                    changed = True
         aligned_binary_match = aligned_binary_re.match(line)
         if aligned_binary_match is not None:
             arg_a = str(aligned_binary_match.group("a"))
@@ -24377,6 +24598,11 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         apply_pool2d_match = apply_pool2d_re.match(line)
         if apply_pool2d_match is not None:
             input_name = str(apply_pool2d_match.group("input"))
+            prev_const_pad_match = (
+                const_pad_assign_re.match(lines[index - 1])
+                if index > 0
+                else None
+            )
             next_nonempty_line = ""
             for lookahead in range(index + 1, min(len(lines), index + 4)):
                 if lines[lookahead].strip() == "":
@@ -24384,6 +24610,41 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 next_nonempty_line = str(lines[lookahead])
                 break
             next_lrn_match = local_response_norm_re.match(next_nonempty_line)
+            if (
+                str(apply_pool2d_match.group("channel_last")) == "True"
+                and str(apply_pool2d_match.group("is_max")) == "True"
+                and prev_const_pad_match is not None
+                and str(prev_const_pad_match.group("lhs")) == input_name
+                and (
+                    str(prev_const_pad_match.group("input")) in cf_like_names
+                    or str(prev_const_pad_match.group("input")).endswith("_cf")
+                    or str(prev_const_pad_match.group("input")).endswith("_out_cf")
+                )
+            ):
+                pad_values = [
+                    int(value.strip())
+                    for value in str(prev_const_pad_match.group("pads")).split(",")
+                    if value.strip()
+                ]
+                immediate_permuted_conv_consumers = 0
+                for lookahead in range(index + 1, min(len(lines), index + 4)):
+                    permuted_conv_match = permuted_conv_input_re.match(lines[lookahead])
+                    if (
+                        permuted_conv_match is not None
+                        and str(permuted_conv_match.group("input")) == str(apply_pool2d_match.group("lhs"))
+                    ):
+                        immediate_permuted_conv_consumers += 1
+                if pad_values == [1, 1, 1, 1] and immediate_permuted_conv_consumers > 0:
+                    lines[index] = (
+                        f"{apply_pool2d_match.group('indent')}{apply_pool2d_match.group('lhs')} = _apply_pool2d("
+                        f"{input_name}, {apply_pool2d_match.group('rest')}, "
+                        f"target_shape=[{apply_pool2d_match.group('n')}, {apply_pool2d_match.group('c')}, "
+                        f"{apply_pool2d_match.group('h')}, {apply_pool2d_match.group('w')}], "
+                        f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=False)"
+                    )
+                    cf_like_names.add(str(apply_pool2d_match.group("lhs")))
+                    changed = True
+                    continue
             if (
                 str(apply_pool2d_match.group("channel_last")) == "False"
                 and (
@@ -24428,6 +24689,64 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 )
                 cf_like_names.add(str(apply_pool2d_match.group("lhs")))
                 changed = True
+        dynamic_apply_pool2d_match = dynamic_apply_pool2d_re.match(line)
+        if dynamic_apply_pool2d_match is not None:
+            input_name = str(dynamic_apply_pool2d_match.group("input"))
+            lhs = str(dynamic_apply_pool2d_match.group("lhs"))
+            if (
+                str(dynamic_apply_pool2d_match.group("is_max")) == "False"
+                and (
+                    input_name in cf_like_names
+                    or input_name.endswith("_cf")
+                    or input_name.endswith("_out_cf")
+                )
+                and str(dynamic_apply_pool2d_match.group("shape_input")) == input_name
+            ):
+                repaired_target_shape: list[int] | None = None
+                for lookahead in range(index + 1, min(len(lines), index + 4)):
+                    aligned_rank4_match = aligned_rank4_any_re.match(lines[lookahead])
+                    if (
+                        aligned_rank4_match is not None
+                        and re.search(rf"\b{re.escape(lhs)}\b", str(aligned_rank4_match.group("expr"))) is not None
+                    ):
+                        repaired_target_shape = [
+                            int(aligned_rank4_match.group("n")),
+                            int(aligned_rank4_match.group("d1")),
+                            int(aligned_rank4_match.group("d2")),
+                            int(aligned_rank4_match.group("d3")),
+                        ]
+                        break
+                    binary_consumer_match = binary_assign_re.match(lines[lookahead])
+                    if (
+                        binary_consumer_match is None
+                        or re.search(rf"\b{re.escape(lhs)}\b", str(binary_consumer_match.group("expr"))) is None
+                        or lookahead + 1 >= len(lines)
+                    ):
+                        continue
+                    aligned_rank4_match = aligned_rank4_any_re.match(lines[lookahead + 1])
+                    if (
+                        aligned_rank4_match is not None
+                        and re.search(
+                            rf"\b{re.escape(str(binary_consumer_match.group('lhs')))}\b",
+                            str(aligned_rank4_match.group("expr")),
+                        ) is not None
+                    ):
+                        repaired_target_shape = [
+                            int(aligned_rank4_match.group("n")),
+                            int(aligned_rank4_match.group("d1")),
+                            int(aligned_rank4_match.group("d2")),
+                            int(aligned_rank4_match.group("d3")),
+                        ]
+                        break
+                if repaired_target_shape is not None:
+                    lines[index] = (
+                        f"{dynamic_apply_pool2d_match.group('indent')}{lhs} = _apply_pool2d("
+                        f"{input_name}, {dynamic_apply_pool2d_match.group('rest')}, "
+                        f"target_shape={repr(repaired_target_shape)}, "
+                        f"is_max_pool={dynamic_apply_pool2d_match.group('is_max')}, channel_last=False)"
+                    )
+                    cf_like_names.add(lhs)
+                    changed = True
         apply_concat_match = apply_concat_re.match(line)
         if apply_concat_match is not None:
             concat_inputs = [
@@ -25219,7 +25538,9 @@ def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Pat
         "wa_add10_out0 = _align_tensor_to_target_shape(torch.add(wa_mul14_out0, wa_mul15_out0_cf), [1, 3, 180, 320])",
         "out = out_nhwc",
     )
-    return all(marker in model_source for marker in bread_markers)
+    if all(marker in model_source for marker in bread_markers):
+        return True
+    return False
 
 
 def _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_path: Path) -> bool:
@@ -25303,6 +25624,28 @@ def _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_path: 
             "wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)",
             "wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
             "out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+        ),
+        (
+            "wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
+            "wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+            "wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
+            "wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+            "out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+        ),
+        (
+            "average_p4_out = _align_tensor_to_target_shape(torch.mul(_binary_lhs_5, _binary_rhs_5), [1, 48, 56, 56])",
+            "onnx_shape601 = _align_tensor_to_target_shape(torch.add(cv219_in_cf, onnx_add600_cf), [1, 7, 7, 448])",
+            "onnx_softmax644 = _align_tensor_to_target_shape(torch.add(onnx_add642, self.const_onnx__Add_643), [1, 8, 49, 49])",
+        ),
+        (
+            "average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=_tensor_shape_list(average_p4_in_cf), is_max_pool=False, channel_last=False)",
+            "onnx_shape601 = _align_tensor_to_target_shape(torch.add(cv219_in_cf, onnx_add600_cf), [1, 7, 7, 448])",
+            "onnx_softmax644 = _align_tensor_to_target_shape(torch.add(onnx_add642, self.const_onnx__Add_643), [1, 8, 49, 49])",
+        ),
+        (
+            "average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 48, 56, 56], is_max_pool=False, channel_last=False)",
+            "onnx_shape601 = _align_tensor_to_target_shape(torch.add(cv219_in_cf, onnx_add600_cf), [1, 7, 7, 448])",
+            "onnx_softmax644 = _align_tensor_to_target_shape(torch.add(onnx_add642, self.const_onnx__Add_643), [1, 8, 49, 49])",
         ),
     )
     return any(all(marker in model_source for marker in marker_set) for marker_set in bread_marker_sets)
@@ -27510,7 +27853,15 @@ def export_pytorch_package_from_model_ir(
         native_prep_error: Optional[Exception] = None
 
         try:
-            normalized = prepare_model_ir_for_native_pytorch(model_ir)
+            needs_same_avg_pool_restore = any(
+                str(op.op_type) == "AVERAGE_POOL_2D"
+                and str(op.options.get("padding", "")).upper() == "SAME"
+                for op in model_ir.operators
+            )
+            native_model_ir = copy.deepcopy(model_ir) if needs_same_avg_pool_restore else model_ir
+            if needs_same_avg_pool_restore:
+                _restore_same_average_pool_exclude_pad_correction_for_native_runtime(native_model_ir)
+            normalized = prepare_model_ir_for_native_pytorch(native_model_ir)
             _ensure_no_custom_ops(normalized)
             _ensure_supported_ops(normalized)
         except Exception as ex:

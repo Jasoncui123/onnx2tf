@@ -2256,6 +2256,23 @@ def _make_average_pool_exclude_pad_model() -> onnx.ModelProto:
     return helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 13)])
 
 
+def _make_average_pool_same_exclude_pad_model() -> onnx.ModelProto:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 4, 4])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 4, 4])
+    node = helper.make_node(
+        "AveragePool",
+        ["x"],
+        ["y"],
+        name="AveragePoolSameExcludePadNode",
+        kernel_shape=[3, 3],
+        strides=[1, 1],
+        pads=[1, 1, 1, 1],
+        count_include_pad=0,
+    )
+    graph = helper.make_graph([node], "average_pool_same_exclude_pad_graph", [x], [y])
+    return helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 13)])
+
+
 def _make_average_pool_include_pad_model() -> onnx.ModelProto:
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 4, 4])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 2, 2])
@@ -30239,6 +30256,25 @@ def test_flatbuffer_direct_average_pool_exclude_pad_uses_divisor_correction() ->
     ]
     assert len(reciprocal_tensors) >= 1
     assert all(tensor.data is not None for tensor in reciprocal_tensors)
+
+
+def test_flatbuffer_direct_average_pool_same_exclude_pad_uses_builtin_same_pool() -> None:
+    model = _make_average_pool_same_exclude_pad_model()
+    register_default_preprocess_rules()
+    preprocessed_model, _ = run_preprocess_pipeline(onnx_graph=model)
+    model_ir = lower_onnx_to_ir(
+        onnx_graph=preprocessed_model,
+        output_file_name="average_pool_same_exclude_pad_builtin_test",
+    )
+    op_types = [str(op.op_type) for op in model_ir.operators]
+    assert op_types.count("AVERAGE_POOL_2D") == 1
+    assert op_types.count("DIV") == 0
+    reciprocal_tensors = [
+        tensor_name
+        for tensor_name in model_ir.tensors.keys()
+        if "div_reciprocal" in str(tensor_name)
+    ]
+    assert reciprocal_tensors == []
 
 
 def test_flatbuffer_direct_average_pool_include_pad_materializes_zero_padding() -> None:

@@ -1406,7 +1406,8 @@ def build_pool2d_op(node: Any, ctx: Any, op_type: str) -> None:
                 effective_pads[3] = int(effective_pads[3]) + int(deficit_pads[3])
         average_needs_exclude_pad_correction = (
             int(average_count_include_pad) == 0
-            and any(int(v) != 0 for v in effective_pads)
+            and explicit_pads is not None
+            and any(int(v) != 0 for v in explicit_pads)
         )
 
     if len(output_shape) != 4:
