@@ -59,9 +59,11 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _repair_channel_last_gap_conv_inputs,
     _reject_residual_layout_transposes,
     _remove_redundant_layout_transposes,
+    _restore_same_average_pool_exclude_pad_correction_for_native_runtime,
     _rewrite_generated_model_source_for_exported_program,
     _rewrite_channel_last_binary_bridge_chains,
     _rewrite_channel_last_gap_means_to_reduce_mean,
+    _onnx_repair_inferred_shapes_in_place,
     _sanitize_dynamo_exported_onnx_metadata,
     _should_avoid_model_ir_in_raw_canonicalize_for_native_package,
     _should_skip_expensive_raw_canonicalize_for_native_package,
@@ -137,6 +139,24 @@ def _exported_program_structural_signature(exported_program: Any) -> dict[str, A
         "nodes": tuple(nodes),
         "node_counts": tuple(sorted(Counter(target for target, _ in nodes).items())),
     }
+
+
+def _make_average_pool_same_exclude_pad_model() -> onnx.ModelProto:
+    x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 3, 3])
+    y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 3, 3])
+    node = helper.make_node(
+        "AveragePool",
+        inputs=["input"],
+        outputs=["output"],
+        kernel_shape=[3, 3],
+        strides=[1, 1],
+        auto_pad="SAME_UPPER",
+        count_include_pad=0,
+    )
+    graph = helper.make_graph([node], "average_pool_same_exclude_pad_graph", [x], [y])
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 11)])
+    model.ir_version = 7
+    return model
 
 
 def _flatten_tensor_outputs(value: Any) -> list[torch.Tensor]:
@@ -928,6 +948,188 @@ def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis(
     assert "depth_to_in_reordered = upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]" not in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_stage(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alike_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_1(self, scores_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:",
+                "        wadkd_flatten4_out0 = torch.reshape(scores_map, [61440, 64])",
+                "        wadkd_or_out0 = scores_map",
+                "        return (scores_map, wadkd_flatten4_out0, wadkd_or_out0)",
+                "    def _forward_stage_7(self, wadkd_mul29_out0: torch.Tensor, wadkd_add2_out0: torch.Tensor, wadkd_add7_out0: torch.Tensor, wadkd_add4_out0: torch.Tensor, wadkd_add10_out0: torch.Tensor, wadkd_div3_out0: torch.Tensor, wadkd_tr1_out0: torch.Tensor, wadkd_tr3_out0: torch.Tensor, wadkd_tr2_out0: torch.Tensor, wadkd_tr4_out0: torch.Tensor, wadkd_cast5_out0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        descriptors = _torch_permute(wadkd_div3_out0, [1, 0])",
+                "        wadkd_equal_out0 = _align_tensor_to_target_shape(torch.eq(wadkd_max_p_in, wadkd_max_p_out), [1, 192, 320, 1])",
+                "        wadkd_equal_out0_nchw = torch.reshape(wadkd_equal_out0.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_max_p1_out0 = torch.reshape(wadkd_max_p1_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_max_p2_out0 = torch.reshape(wadkd_max_p2_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_max_p3_out0 = torch.reshape(wadkd_max_p3_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_max_p4_out0 = torch.reshape(wadkd_max_p4_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_less_out0 = torch.reshape(torch.lt(wadkd_split1_out0, 0.0), [1, 1, 1, 1])",
+                "        wadkd_add_out0 = torch.reshape(torch.add(wadkd_floor_out0, 1.0), [1, 1, 1, 1])",
+                "        wadkd_and2_out0 = torch.reshape(torch.logical_and(wadkd_not2_out0, wadkd_not3_out0), [1, 1, 1, 1])",
+                "        wadkd_mul21_out0 = torch.reshape(torch.mul(wadkd_floor_out0, wadkd_cast5_out0), [1, 1, 1, 1])",
+                "        wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.float32)",
+                "        wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320.0), [1])",
+                "        wadkd_mul16_out0 = _align_tensor_to_target_shape(torch.mul(wadkd_cast4_out0, self.const_inline_literal_0), [1, 2])",
+                "        wadkd_reduce_l2_out0_reduce_l2_squared = _align_tensor_to_target_shape(torch.mul(wadkd_tr17_out0, wadkd_tr17_out0), [64, 1])",
+                "        _binary_rhs_191, _binary_lhs_191 = _align_binary_inputs_to_anchor(wadkd_expand23_out0_expand_ones, wadkd_clip_out0, [1, 1])",
+                "        wadkd_expand23_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_191, _binary_rhs_191), [1, 1])",
+                "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs_to_anchor(wadkd_tr17_out0, wadkd_expand23_out0, [64, 1])",
+                "        wadkd_div3_out0 = _align_tensor_to_target_shape(torch.div(_binary_lhs_196, _binary_rhs_196), [64, 1])",
+                "        wadkd_shape13_out0 = _shape_tensor(wadkd_add3_out0, dtype=torch.int32, device=wadkd_add3_out0.device)",
+                "        wadkd_shape17_out0 = _shape_tensor(wadkd_add8_out0, dtype=torch.int32, device=wadkd_add8_out0.device)",
+                "        wadkd_shape15_out0 = _shape_tensor(wadkd_add5_out0, dtype=torch.int32, device=wadkd_add5_out0.device)",
+                "        wadkd_shape19_out0 = _shape_tensor(wadkd_add11_out0, dtype=torch.int32, device=wadkd_add11_out0.device)",
+                "        wadkd_rs13_out0 = torch.reshape(wadkd_gather7_out0, _resolve_reshape_shape([-1, 1], wadkd_gather7_out0, allow_zero=False))",
+                "        wadkd_concat17_out0 = _apply_concat([self.const_inline_literal_5, wadkd_shape13_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs17_out0 = torch.reshape(wadkd_gather15_out0, _resolve_reshape_shape([-1, 1], wadkd_gather15_out0, allow_zero=False))",
+                "        wadkd_concat21_out0 = _apply_concat([self.const_inline_literal_5, wadkd_shape17_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs15_out0 = torch.reshape(wadkd_gather11_out0, _resolve_reshape_shape([-1, 1], wadkd_gather11_out0, allow_zero=False))",
+                "        wadkd_concat19_out0 = _apply_concat([self.const_inline_literal_5, wadkd_shape15_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs19_out0 = torch.reshape(wadkd_gather19_out0, _resolve_reshape_shape([-1, 1], wadkd_gather19_out0, allow_zero=False))",
+                "        wadkd_concat23_out0 = _apply_concat([self.const_inline_literal_5, wadkd_shape19_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_tr7_out0 = _torch_permute(wadkd_rs13_out0, [1, 0])",
+                "        wadkd_tr11_out0 = _torch_permute(wadkd_rs17_out0, [1, 0])",
+                "        wadkd_tr9_out0 = _torch_permute(wadkd_rs15_out0, [1, 0])",
+                "        wadkd_tr13_out0 = _torch_permute(wadkd_rs19_out0, [1, 0])",
+                "        wadkd_rs14_out0_rs_shape_dim0 = wadkd_concat17_out0.reshape(-1)[:1]",
+                "        wadkd_rs14_out0_rs_in_shape = _shape_tensor(wadkd_tr7_out0, dtype=torch.int32, device=wadkd_tr7_out0.device)",
+                "        wadkd_rs14_out0_rs_in_dim0 = wadkd_rs14_out0_rs_in_shape.reshape(-1)[:1]",
+                "        wadkd_rs14_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs14_out0_rs_shape_dim0, 0), [1])",
+                "        wadkd_rs14_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs14_out0_rs_shape_dim0_is_zero, wadkd_rs14_out0_rs_in_dim0, wadkd_rs14_out0_rs_shape_dim0)",
+                "        wadkd_rs14_out0_rs_shape_tail = wadkd_concat17_out0.reshape(-1)[1:]",
+                "        wadkd_rs14_out0_rs_shape_fixed = _apply_concat([wadkd_rs14_out0_rs_shape_dim0_fixed, wadkd_rs14_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs14_out0 = torch.reshape(wadkd_tr7_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs14_out0_rs_shape_fixed, wadkd_tr7_out0, allow_zero=False)))",
+                "        wadkd_rs18_out0_rs_shape_dim0 = wadkd_concat21_out0.reshape(-1)[:1]",
+                "        wadkd_rs18_out0_rs_in_shape = _shape_tensor(wadkd_tr11_out0, dtype=torch.int32, device=wadkd_tr11_out0.device)",
+                "        wadkd_rs18_out0_rs_in_dim0 = wadkd_rs18_out0_rs_in_shape.reshape(-1)[:1]",
+                "        wadkd_rs18_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs18_out0_rs_shape_dim0, 0), [1])",
+                "        wadkd_rs18_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs18_out0_rs_shape_dim0_is_zero, wadkd_rs18_out0_rs_in_dim0, wadkd_rs18_out0_rs_shape_dim0)",
+                "        wadkd_rs18_out0_rs_shape_tail = wadkd_concat21_out0.reshape(-1)[1:]",
+                "        wadkd_rs18_out0_rs_shape_fixed = _apply_concat([wadkd_rs18_out0_rs_shape_dim0_fixed, wadkd_rs18_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs18_out0 = torch.reshape(wadkd_tr11_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs18_out0_rs_shape_fixed, wadkd_tr11_out0, allow_zero=False)))",
+                "        wadkd_rs16_out0_rs_shape_dim0 = wadkd_concat19_out0.reshape(-1)[:1]",
+                "        wadkd_rs16_out0_rs_in_shape = _shape_tensor(wadkd_tr9_out0, dtype=torch.int32, device=wadkd_tr9_out0.device)",
+                "        wadkd_rs16_out0_rs_in_dim0 = wadkd_rs16_out0_rs_in_shape.reshape(-1)[:1]",
+                "        wadkd_rs16_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs16_out0_rs_shape_dim0, 0), [1])",
+                "        wadkd_rs16_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs16_out0_rs_shape_dim0_is_zero, wadkd_rs16_out0_rs_in_dim0, wadkd_rs16_out0_rs_shape_dim0)",
+                "        wadkd_rs16_out0_rs_shape_tail = wadkd_concat19_out0.reshape(-1)[1:]",
+                "        wadkd_rs16_out0_rs_shape_fixed = _apply_concat([wadkd_rs16_out0_rs_shape_dim0_fixed, wadkd_rs16_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs16_out0 = torch.reshape(wadkd_tr9_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs16_out0_rs_shape_fixed, wadkd_tr9_out0, allow_zero=False)))",
+                "        wadkd_rs20_out0_rs_shape_dim0 = wadkd_concat23_out0.reshape(-1)[:1]",
+                "        wadkd_rs20_out0_rs_in_shape = _shape_tensor(wadkd_tr13_out0, dtype=torch.int32, device=wadkd_tr13_out0.device)",
+                "        wadkd_rs20_out0_rs_in_dim0 = wadkd_rs20_out0_rs_in_shape.reshape(-1)[:1]",
+                "        wadkd_rs20_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs20_out0_rs_shape_dim0, 0), [1])",
+                "        wadkd_rs20_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs20_out0_rs_shape_dim0_is_zero, wadkd_rs20_out0_rs_in_dim0, wadkd_rs20_out0_rs_shape_dim0)",
+                "        wadkd_rs20_out0_rs_shape_tail = wadkd_concat23_out0.reshape(-1)[1:]",
+                "        wadkd_rs20_out0_rs_shape_fixed = _apply_concat([wadkd_rs20_out0_rs_shape_dim0_fixed, wadkd_rs20_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs20_out0 = torch.reshape(wadkd_tr13_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs20_out0_rs_shape_fixed, wadkd_tr13_out0, allow_zero=False)))",
+                "        _binary_lhs_266, _binary_rhs_266 = _align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])",
+                "        wadkd_mul30_out0 = torch.mul(_binary_lhs_266, _binary_rhs_266)",
+                "        _binary_lhs_267, _binary_rhs_267 = _align_binary_inputs_to_anchor(wadkd_rs18_out0, wadkd_tr3_out0, [1, 1, 1, 1])",
+                "        wadkd_mul38_out0 = torch.mul(_binary_lhs_267, _binary_rhs_267)",
+                "        _binary_lhs_268, _binary_rhs_268 = _align_binary_inputs_to_anchor(wadkd_rs16_out0, wadkd_tr2_out0, [1, 1, 1, 1])",
+                "        wadkd_mul34_out0 = torch.mul(_binary_lhs_268, _binary_rhs_268)",
+                "        _binary_lhs_269, _binary_rhs_269 = _align_binary_inputs_to_anchor(wadkd_rs20_out0, wadkd_tr4_out0, [1, 1, 1, 1])",
+                "        wadkd_mul42_out0 = torch.mul(_binary_lhs_269, _binary_rhs_269)",
+                "        wadkd_add6_out0 = torch.add(wadkd_mul30_out0, wadkd_mul34_out0)",
+                "        wadkd_add9_out0 = torch.add(wadkd_add6_out0, wadkd_mul38_out0)",
+                "        wadkd_add12_out0 = torch.add(wadkd_add9_out0, wadkd_mul42_out0)",
+                "        wadkd_tr14_out0 = _torch_permute(wadkd_add12_out0, [1, 0, 2, 3])",
+                "        _binary_lhs_274, _binary_rhs_274 = _align_binary_inputs_to_anchor(wadkd_tr14_out0, wadkd_cast5_out0, [1, 1, 1, 1])",
+                "        wadkd_mul44_out0 = torch.mul(_binary_lhs_274, _binary_rhs_274)",
+                "        wa_squeeze_out0 = torch.squeeze(wadkd_mul44_out0)",
+                "        scores = torch.reshape(wa_squeeze_out0, (([1]) + ([1])))",
+                "        return (descriptors, scores)",
+                "    def forward(self, scores_map: torch.Tensor, wadkd_mul29_out0: torch.Tensor, wadkd_add2_out0: torch.Tensor, wadkd_add7_out0: torch.Tensor, wadkd_add4_out0: torch.Tensor, wadkd_add10_out0: torch.Tensor, wadkd_div3_out0: torch.Tensor, wadkd_tr1_out0: torch.Tensor, wadkd_tr3_out0: torch.Tensor, wadkd_tr2_out0: torch.Tensor, wadkd_tr4_out0: torch.Tensor, wadkd_cast5_out0: torch.Tensor):",
+                "        scores_map, wadkd_flatten4_out0, wadkd_or_out0 = self._forward_stage_1(scores_map)",
+                "        descriptors, scores = self._forward_stage_7(wadkd_mul29_out0, wadkd_add2_out0, wadkd_add7_out0, wadkd_add4_out0, wadkd_add10_out0, wadkd_div3_out0, wadkd_tr1_out0, wadkd_tr3_out0, wadkd_tr2_out0, wadkd_tr4_out0, wadkd_cast5_out0)",
+                "        return descriptors, scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "wadkd_cast5_out0: torch.Tensor, scores_map: torch.Tensor)" in rewritten
+    assert "wadkd_cast5_out0, scores_map)" in rewritten
+    assert "wadkd_equal_out0 = torch.eq(wadkd_max_p_in, wadkd_max_p_out)" in rewritten
+    assert "wadkd_equal_out0_nchw = torch.reshape(wadkd_equal_out0, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_max_p1_out0 = torch.reshape(wadkd_max_p1_out, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_max_p2_out0 = torch.reshape(wadkd_max_p2_out, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_max_p3_out0 = torch.reshape(wadkd_max_p3_out, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_max_p4_out0 = torch.reshape(wadkd_max_p4_out, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_less_out0 = torch.lt(wadkd_split1_out0, 0.0)" in rewritten
+    assert "wadkd_add_out0 = torch.add(wadkd_floor_out0, 1.0)" in rewritten
+    assert "wadkd_and2_out0 = torch.logical_and(wadkd_not2_out0, wadkd_not3_out0)" in rewritten
+    assert "wadkd_mul21_out0 = torch.mul(wadkd_floor_out0, wadkd_cast5_out0)" in rewritten
+    assert "wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.int64)" in rewritten
+    assert "wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320, rounding_mode='floor'), [1])" in rewritten
+    assert "wadkd_mul16_out0 = torch.div(wadkd_cast4_out0, self.const_inline_literal_1)" in rewritten
+    assert "wadkd_reduce_l2_out0_reduce_l2_squared = torch.mul(wadkd_tr17_out0, wadkd_tr17_out0)" in rewritten
+    assert "_binary_rhs_191, _binary_lhs_191 = wadkd_clip_out0, wadkd_expand23_out0_expand_ones" in rewritten
+    assert "wadkd_expand23_out0 = torch.mul(_binary_lhs_191, _binary_rhs_191)" in rewritten
+    assert "_binary_lhs_196, _binary_rhs_196 = wadkd_tr17_out0, wadkd_expand23_out0" in rewritten
+    assert "wadkd_div3_out0 = torch.div(_binary_lhs_196, _binary_rhs_196)" in rewritten
+    assert "wadkd_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
+    assert "wadkd_shape_prefix_out0 = torch.ones([1], dtype=torch.int32, device=wadkd_shape13_out0.device)" in rewritten
+    assert "self.const_inline_literal_5" not in rewritten
+    assert "wadkd_gather7_out0 = _reshape_gather_output(torch.index_select(wadkd_flatten_out0, 0, wadkd_gather7_out0_indices.to(dtype=torch.int64).reshape(-1)), wadkd_flatten_out0, _shape_tensor(wadkd_gather7_out0_indices, dtype=torch.int64, device=wadkd_gather7_out0_indices.device), axis=0)" in rewritten
+    assert "wadkd_mul30_out0 = torch.mul(wadkd_rs14_out0, wadkd_tr1_out0)" in rewritten
+    assert "wadkd_tr14_out0 = _torch_permute(wadkd_add12_out0, [0, 1, 3, 2])" in rewritten
+    assert "_align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])" not in rewritten
+    assert "scores = torch.reshape(wa_squeeze_out0, _resolve_reshape_shape([-1, 1], wa_squeeze_out0, allow_zero=False))" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_efficientformer_attention_scalar_mul_target(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_efficientformer_attention_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_onnx__Add_643', torch.zeros([1, 8, 49, 49], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, onnx_mul640: torch.Tensor) -> torch.Tensor:",
+                "        onnx_mul640 = _align_tensor_to_target_shape(torch.matmul(onnx_mul640, onnx_mul640), [1, 8, 49, 49])",
+                "        onnx_add642 = _align_tensor_to_target_shape(torch.mul(onnx_mul640, 0.1767766922712326), [1, 49, 8, 49])",
+                "        onnx_softmax644 = _align_tensor_to_target_shape(torch.add(onnx_add642, self.const_onnx__Add_643), [1, 8, 49, 49])",
+                "        onnx_mat_mul645 = _apply_softmax(onnx_softmax644, axis=3, beta=1.0, target_shape=[1, 8, 49, 49])",
+                "        return onnx_mat_mul645",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "onnx_add642 = _align_tensor_to_target_shape(torch.mul(onnx_mul640, 0.1767766922712326), [1, 8, 49, 49])"
+        in rewritten
+    )
+    assert "[1, 49, 8, 49]" not in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain(
     tmp_path,
 ) -> None:
@@ -1085,6 +1287,114 @@ def test_apply_fast_precanonicalize_repairs_fix_pool_lrn_conv_cf_chain(
     assert "cv23_x3_in_cf = self.conv_block_1(p1_norm1_out_nhwc)" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_restore_cf_same_pool_target_from_downstream_alignment(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_cf_same_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, average_p4_in_cf: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:",
+                "        average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=_tensor_shape_list(average_p4_in_cf), is_max_pool=False, channel_last=False)",
+                "        onnx_mul291_cf = torch.sub(average_p4_out, average_p4_in_cf)",
+                "        onnx_add292 = _align_tensor_to_target_shape(torch.mul(scale, onnx_mul291_cf), [1, 48, 56, 56])",
+                "        return onnx_add292",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, "
+        "padding='SAME', target_shape=[1, 48, 56, 56], is_max_pool=False, channel_last=False)"
+        in rewritten
+    )
+    assert "target_shape=_tensor_shape_list(average_p4_in_cf)" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_dynamic_cf_same_max_pool_target(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_cf_same_max_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scores_map: torch.Tensor) -> torch.Tensor:",
+                "        wadkd_max_p_out = _apply_pool2d(scores_map, filter_height=5, filter_width=5, stride_h=1, stride_w=1, padding='SAME', target_shape=_tensor_shape_list(scores_map), is_max_pool=True, channel_last=False)",
+                "        wadkd_equal_out0 = torch.eq(scores_map, wadkd_max_p_out)",
+                "        wadkd_equal_out0 = _align_tensor_to_target_shape(wadkd_equal_out0, [1, 192, 320, 1])",
+                "        return wadkd_equal_out0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "wadkd_max_p_out = _apply_pool2d(scores_map, filter_height=5, filter_width=5, stride_h=1, "
+        "stride_w=1, padding='SAME', target_shape=_tensor_shape_list(scores_map), "
+        "is_max_pool=True, channel_last=False)"
+        in rewritten
+    )
+    assert "target_shape=[1, 192, 320, 1]" not in rewritten.splitlines()[4]
+
+
+def test_apply_fast_precanonicalize_repairs_fix_nanodet_stage0_channel_last_pool_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_nanodet_stage0_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
+                "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
+                "        waback_stage2_branch1_cv_out331_f_cf = self.conv_block_1(wabackbonemaxpool_max_p_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        waback_stage2_branch2_f69_cf_73ca = self.conv_block_2(wabackbonemaxpool_max_p_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        return waback_stage2_branch1_cv_out331_f_cf, waback_stage2_branch2_f69_cf_73ca",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, "
+        "filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', "
+        "target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)"
+        in rewritten
+    )
+    assert "waback_stage2_branch1_cv_out331_f_cf = self.conv_block_1(wabackbonemaxpool_max_p_out_nhwc)" in rewritten
+    assert "waback_stage2_branch2_f69_cf_73ca = self.conv_block_2(wabackbonemaxpool_max_p_out_nhwc)" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_does_not_inject_humanseg_resize_aliases_without_markers(
     tmp_path,
 ) -> None:
@@ -1155,6 +1465,32 @@ def test_should_not_skip_expensive_raw_canonicalize_for_generic_package(
         encoding="utf-8",
     )
 
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_l1_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "efficientformer_l1_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, average_p4_in_cf, cv219_in_cf, onnx_add600_cf, onnx_add642):",
+                "        average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 48, 56, 56], is_max_pool=False, channel_last=False)",
+                "        onnx_shape601 = _align_tensor_to_target_shape(torch.add(cv219_in_cf, onnx_add600_cf), [1, 7, 7, 448])",
+                "        onnx_softmax644 = _align_tensor_to_target_shape(torch.add(onnx_add642, self.const_onnx__Add_643), [1, 8, 49, 49])",
+                "        return average_p4_out, onnx_shape601, onnx_softmax644",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
 
 
@@ -1478,6 +1814,33 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_imported_tflite_r
                 "        wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
                 "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
                 "        wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)",
+                "        wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_current_channel_last_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_current_channel_last_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data, wafpnupsample1_resize_in_nhwc, wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0):",
+                "        wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
+                "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
                 "        wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
                 "        out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
                 "        return out",
@@ -2107,6 +2470,85 @@ def test_canonicalize_generated_model_source_restores_nhwc_materialize_for_chann
     rewritten = model_path.read_text(encoding="utf-8")
     assert "x = _align_tensor_to_target_shape(x_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])" in rewritten
     assert "x = x_cf" not in rewritten
+
+
+def test_canonicalize_generated_model_source_prefers_exact_cf_pool_shape_over_dynamic_input_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "exact_cf_pool_shape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, average_p4_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 48, 56, 56], is_max_pool=False, channel_last=False)",
+                "        return average_p4_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="exact_cf_pool_shape")
+    model_ir.tensors["average_p4_out"] = TensorIR(
+        name="average_p4_out",
+        dtype="FLOAT32",
+        shape=[1, 48, 56, 56],
+        shape_signature=[1, 48, 56, 56],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "target_shape=[1, 48, 56, 56]" in rewritten
+    assert "target_shape=_tensor_shape_list(average_p4_in_cf)" not in rewritten
+
+
+def test_canonicalize_generated_model_source_keeps_dynamic_same_max_pool_shape_for_cf_input(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "dynamic_cf_same_max_pool_shape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scores_map: torch.Tensor) -> torch.Tensor:",
+                "        wadkd_max_p_out = _apply_pool2d(scores_map, filter_height=5, filter_width=5, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 192, 320, 1], is_max_pool=True, channel_last=False)",
+                "        return wadkd_max_p_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="dynamic_cf_same_max_pool_shape")
+    model_ir.tensors["scores_map"] = TensorIR(
+        name="scores_map",
+        dtype="FLOAT32",
+        shape=[1, 1, 192, 320],
+        shape_signature=[1, 1, 192, 320],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["wadkd_max_p_out"] = TensorIR(
+        name="wadkd_max_p_out",
+        dtype="FLOAT32",
+        shape=[1, 192, 320, 1],
+        shape_signature=[1, 192, 320, 1],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "target_shape=_tensor_shape_list(scores_map)" in rewritten
+    assert "target_shape=[1, 192, 320, 1]" not in rewritten
 
 
 def test_canonicalize_generated_model_source_rewrites_direct_torch_cat_after_cf_resize(tmp_path) -> None:
@@ -11539,6 +11981,61 @@ def test_export_pytorch_package_generates_native_pidnet_package_when_model_is_av
             )
 
 
+def test_restore_same_average_pool_exclude_pad_correction_for_native_runtime() -> None:
+    model_ir = ModelIR(name="avg_pool_same_native_fix")
+    model_ir.inputs = ["x"]
+    model_ir.outputs = ["y"]
+    model_ir.tensors["x"] = TensorIR(
+        name="x",
+        dtype="FLOAT32",
+        shape=[1, 1, 3, 3],
+        shape_signature=[1, 1, 3, 3],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["y"] = TensorIR(
+        name="y",
+        dtype="FLOAT32",
+        shape=[1, 1, 3, 3],
+        shape_signature=[1, 1, 3, 3],
+        logical_layout="NCHW",
+    )
+    model_ir.operators.append(
+        OperatorIR(
+            op_type="AVERAGE_POOL_2D",
+            inputs=["x"],
+            outputs=["y"],
+            options={
+                "padding": "SAME",
+                "strideH": 1,
+                "strideW": 1,
+                "filterHeight": 3,
+                "filterWidth": 3,
+                "fusedActivationFunction": "NONE",
+            },
+        )
+    )
+
+    stats = _restore_same_average_pool_exclude_pad_correction_for_native_runtime(model_ir)
+    assert stats["restored_same_average_pool_exclude_pad_corrections"] == 1
+    assert [str(op.op_type) for op in model_ir.operators] == ["AVERAGE_POOL_2D", "MUL"]
+    assert str(model_ir.operators[0].outputs[0]).endswith("_include_pad")
+    assert list(model_ir.operators[1].outputs) == ["y"]
+
+    reciprocal_name = str(model_ir.operators[1].inputs[1])
+    reciprocal_tensor = model_ir.tensors[reciprocal_name]
+    assert reciprocal_tensor.logical_layout == "NHWC"
+    assert reciprocal_tensor.shape == [1, 3, 3, 1]
+    expected = np.asarray(
+        [
+            [[2.25], [1.5], [2.25]],
+            [[1.5], [1.0], [1.5]],
+            [[2.25], [1.5], [2.25]],
+        ],
+        dtype=np.float32,
+    ).reshape(1, 3, 3, 1)
+    np.testing.assert_allclose(np.asarray(reciprocal_tensor.data), expected, rtol=0.0, atol=0.0)
+
+
 def test_export_pytorch_package_conv2d_nchw(tmp_path) -> None:
     model_ir = _make_conv2d_model_ir()
     package_path = export_pytorch_package_from_model_ir(
@@ -12531,6 +13028,137 @@ def test_sanitize_dynamo_exported_onnx_metadata_folds_transpose_pad_transpose_br
     assert list(sanitized_model.graph.node[1].input) == ["x_pad"]
 
 
+def test_sanitize_dynamo_exported_onnx_metadata_folds_constant_scatternd(tmp_path) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 2, 3])
+    scatter_data = numpy_helper.from_array(
+        np.zeros((6,), dtype=np.float32),
+        name="scatter_data",
+    )
+    scatter_indices = numpy_helper.from_array(
+        np.asarray([[1], [5]], dtype=np.int64),
+        name="scatter_indices",
+    )
+    scatter_updates = numpy_helper.from_array(
+        np.asarray([3.0, 7.0], dtype=np.float32),
+        name="scatter_updates",
+    )
+    reshape_shape = numpy_helper.from_array(
+        np.asarray([1, 1, 2, 3], dtype=np.int64),
+        name="reshape_shape",
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "ScatterND",
+                ["scatter_data", "scatter_indices", "scatter_updates"],
+                ["scatter_flat"],
+                name="ConstantScatter",
+            ),
+            helper.make_node(
+                "Reshape",
+                ["scatter_flat", "reshape_shape"],
+                ["scatter_map"],
+                name="ScatterReshape",
+            ),
+            helper.make_node(
+                "Add",
+                ["x", "scatter_map"],
+                ["y"],
+                name="AddScatterMap",
+            ),
+        ],
+        "constant_scatternd_fold_graph",
+        [x],
+        [y],
+        initializer=[scatter_data, scatter_indices, scatter_updates, reshape_shape],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 18)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "constant_scatternd_fold.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert all(str(node.op_type) != "ScatterND" for node in sanitized_model.graph.node)
+    folded_initializer = next(
+        initializer
+        for initializer in sanitized_model.graph.initializer
+        if str(initializer.name) in {"scatter_flat", "scatter_map"}
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(folded_initializer),
+        np.asarray([[[[0.0, 3.0, 0.0], [0.0, 0.0, 7.0]]]], dtype=np.float32)
+        if str(folded_initializer.name) == "scatter_map"
+        else np.asarray([0.0, 3.0, 0.0, 0.0, 0.0, 7.0], dtype=np.float32),
+    )
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_constant_reshape_sub_chain(tmp_path) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 2, 3])
+    ones_flat = numpy_helper.from_array(
+        np.ones((6,), dtype=np.float32),
+        name="ones_flat",
+    )
+    zeros_flat = numpy_helper.from_array(
+        np.zeros((6,), dtype=np.float32),
+        name="zeros_flat",
+    )
+    scalar_one = numpy_helper.from_array(
+        np.asarray(1.0, dtype=np.float32),
+        name="scalar_one",
+    )
+    target_shape = numpy_helper.from_array(
+        np.asarray([1, 1, 2, 3], dtype=np.int64),
+        name="target_shape",
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Reshape", ["ones_flat", "target_shape"], ["view_23"], name="node_view_23"),
+            helper.make_node("Sub", ["scalar_one", "view_23"], ["sub"], name="node_sub"),
+            helper.make_node("Reshape", ["zeros_flat", "target_shape"], ["view_27"], name="node_view_27"),
+            helper.make_node("Add", ["x", "sub"], ["tmp"], name="AddSub"),
+            helper.make_node("Add", ["tmp", "view_27"], ["y"], name="AddView27"),
+        ],
+        "constant_reshape_sub_chain_fold_graph",
+        [x],
+        [y],
+        initializer=[ones_flat, zeros_flat, scalar_one, target_shape],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 18)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "constant_reshape_sub_chain_fold.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    remaining_node_names = {str(node.name) for node in sanitized_model.graph.node}
+    assert "node_view_23" not in remaining_node_names
+    assert "node_sub" not in remaining_node_names
+    assert "node_view_27" not in remaining_node_names
+    sub_initializer = next(
+        initializer
+        for initializer in sanitized_model.graph.initializer
+        if str(initializer.name) == "sub"
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(sub_initializer),
+        np.zeros((1, 1, 2, 3), dtype=np.float32),
+    )
+    view_27_initializer = next(
+        initializer
+        for initializer in sanitized_model.graph.initializer
+        if str(initializer.name) == "view_27"
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(view_27_initializer),
+        np.zeros((1, 1, 2, 3), dtype=np.float32),
+    )
+
+
 def test_sanitize_dynamo_exported_onnx_metadata_preserves_atan_rank4_output_shape(tmp_path) -> None:
     x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 224, 224])
     y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 224, 224])
@@ -12627,6 +13255,84 @@ def test_sanitize_dynamo_exported_onnx_metadata_restores_missing_output_shape_fr
         for dim in sanitized_model.graph.output[0].type.tensor_type.shape.dim
     ]
     assert output_dims == [1, 8]
+
+
+def test_onnx_repair_inferred_shapes_in_place_restores_missing_internal_pad_value_info(monkeypatch) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 192, 320])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 196, 324])
+    reshape_shape = numpy_helper.from_array(
+        np.asarray([1, 1, 192, 320], dtype=np.int64),
+        name="reshape_shape",
+    )
+    pads = numpy_helper.from_array(
+        np.asarray([0, 0, 2, 2, 0, 0, 2, 2], dtype=np.int64),
+        name="pads",
+    )
+    constant_value = numpy_helper.from_array(
+        np.asarray(-np.inf, dtype=np.float32),
+        name="constant_value",
+    )
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "Reshape",
+                    ["x", "reshape_shape"],
+                    ["scores_map"],
+                    name="node_view_1",
+                ),
+                helper.make_node(
+                    "Pad",
+                    ["scores_map", "pads", "constant_value"],
+                    ["pad_8"],
+                    name="node_pad_8",
+                    mode="constant",
+                ),
+                helper.make_node(
+                    "Relu",
+                    ["pad_8"],
+                    ["y"],
+                    name="relu_after_pad",
+                ),
+            ],
+            "restore_internal_pad_value_info",
+            [x],
+            [y],
+            value_info=[
+                helper.make_tensor_value_info("scores_map", TensorProto.FLOAT, [1, 1, 192, 320]),
+            ],
+            initializer=[reshape_shape, pads, constant_value],
+        ),
+        opset_imports=[helper.make_operatorsetid("", 18)],
+    )
+
+    monkeypatch.setattr(
+        onnx.shape_inference,
+        "infer_shapes",
+        lambda *args, **kwargs: args[0],
+    )
+
+    _onnx_repair_inferred_shapes_in_place(model)
+
+    restored_value_info = next(
+        value_info
+        for value_info in list(model.graph.value_info)
+        if str(value_info.name) == "pad_8"
+    )
+    restored_shape = [
+        int(dim.dim_value)
+        for dim in restored_value_info.type.tensor_type.shape.dim
+    ]
+    assert restored_shape == [1, 1, 196, 324]
+    preserved_scores_map = next(
+        value_info
+        for value_info in list(model.graph.value_info)
+        if str(value_info.name) == "scores_map"
+    )
+    assert [
+        int(dim.dim_value)
+        for dim in preserved_scores_map.type.tensor_type.shape.dim
+    ] == [1, 1, 192, 320]
 
 
 def test_sanitize_dynamo_exported_onnx_metadata_folds_relu_between_inverse_transposes(tmp_path) -> None:

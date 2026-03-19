@@ -244,6 +244,148 @@ def _rewrite_constant_divisors_to_multiplicative_reciprocals(
     }
 
 
+def _restore_precision_sensitive_reciprocal_divisions(
+    model_ir: ModelIR,
+) -> Dict[str, int]:
+    integer_output_dtypes = {
+        "INT8",
+        "INT16",
+        "INT32",
+        "INT64",
+        "UINT8",
+        "UINT16",
+        "UINT32",
+        "UINT64",
+    }
+    shape_only_passthrough_ops = {
+        "RESHAPE",
+        "TRANSPOSE",
+        "SQUEEZE",
+        "EXPAND_DIMS",
+        "SLICE",
+    }
+    affine_ops = {
+        "ADD",
+        "SUB",
+        "MUL",
+        "DIV",
+    }
+    consumer_index = _build_tensor_consumer_map(model_ir)
+
+    def _is_constant_float_tensor(tensor_name: str) -> bool:
+        tensor = model_ir.tensors.get(str(tensor_name), None)
+        if tensor is None or not isinstance(tensor.data, np.ndarray):
+            return False
+        return bool(np.issubdtype(np.asarray(tensor.data).dtype, np.floating))
+
+    def _feeds_integer_cast_through_affine_chain(start_tensor_name: str) -> bool:
+        pending: List[Tuple[str, int]] = [(str(start_tensor_name), 0)]
+        visited: set[Tuple[str, int]] = set()
+        max_depth = 8
+        while pending:
+            current_tensor_name, depth = pending.pop(0)
+            state = (str(current_tensor_name), int(depth))
+            if state in visited:
+                continue
+            visited.add(state)
+            if int(depth) >= int(max_depth):
+                continue
+            for consumer_idx in consumer_index.get(str(current_tensor_name), []):
+                consumer_op = model_ir.operators[int(consumer_idx)]
+                consumer_type = str(consumer_op.op_type)
+                if consumer_type == "CAST":
+                    out_dtype = str(consumer_op.options.get("outDataType", "")).upper()
+                    if out_dtype in integer_output_dtypes:
+                        return True
+                    if len(consumer_op.outputs) == 1:
+                        pending.append((str(consumer_op.outputs[0]), int(depth) + 1))
+                    continue
+                if len(consumer_op.outputs) != 1:
+                    continue
+                if consumer_type in shape_only_passthrough_ops:
+                    pending.append((str(consumer_op.outputs[0]), int(depth) + 1))
+                    continue
+                if (
+                    consumer_type in affine_ops
+                    and str(current_tensor_name) in {str(v) for v in list(consumer_op.inputs)}
+                ):
+                    other_inputs = [
+                        str(v)
+                        for v in list(consumer_op.inputs)
+                        if str(v) != str(current_tensor_name)
+                    ]
+                    if all(_is_constant_float_tensor(name) for name in other_inputs):
+                        pending.append((str(consumer_op.outputs[0]), int(depth) + 1))
+        return False
+
+    restored = 0
+    for op in model_ir.operators:
+        if str(op.op_type) != "MUL" or len(op.inputs) != 2 or len(op.outputs) != 1:
+            continue
+        output_name = str(op.outputs[0])
+        if output_name in {str(v) for v in list(model_ir.outputs)}:
+            continue
+        output_tensor = model_ir.tensors.get(output_name, None)
+        if output_tensor is None:
+            continue
+        output_dtype = str(output_tensor.dtype).upper()
+        if output_dtype in integer_output_dtypes:
+            continue
+        reciprocal_input_index: Optional[int] = None
+        for input_index, input_name in enumerate(op.inputs):
+            input_name_str = str(input_name)
+            if "div_reciprocal" not in input_name_str:
+                continue
+            reciprocal_tensor = model_ir.tensors.get(input_name_str, None)
+            if reciprocal_tensor is None or not isinstance(reciprocal_tensor.data, np.ndarray):
+                continue
+            reciprocal_values = np.asarray(reciprocal_tensor.data)
+            if (
+                not np.issubdtype(reciprocal_values.dtype, np.floating)
+                or not np.all(np.isfinite(reciprocal_values))
+                or np.any(np.equal(reciprocal_values, 0.0))
+            ):
+                continue
+            reciprocal_input_index = int(input_index)
+            break
+        if reciprocal_input_index is None:
+            continue
+        if not _feeds_integer_cast_through_affine_chain(output_name):
+            continue
+        reciprocal_name = str(op.inputs[int(reciprocal_input_index)])
+        reciprocal_tensor = model_ir.tensors[reciprocal_name]
+        reciprocal_values = np.asarray(reciprocal_tensor.data)
+        divisor_values = np.asarray(
+            np.reciprocal(reciprocal_values.astype(np.float32, copy=False)),
+            dtype=np.float32,
+        )
+        divisor_name = reciprocal_name.replace("div_reciprocal", "div_rhs_cast", 1)
+        suffix = 0
+        while divisor_name in model_ir.tensors:
+            suffix += 1
+            divisor_name = f"{reciprocal_name}_div_rhs_cast_{suffix}"
+        divisor_shape, divisor_signature = normalize_onnx_shape(list(divisor_values.shape))
+        model_ir.tensors[divisor_name] = TensorIR(
+            name=divisor_name,
+            dtype="FLOAT32",
+            shape=[int(v) for v in divisor_shape],
+            shape_signature=[int(v) for v in divisor_signature],
+            data=divisor_values,
+            logical_layout=normalize_logical_layout(reciprocal_tensor.logical_layout),
+        )
+        data_input_index = 1 - int(reciprocal_input_index)
+        op.op_type = "DIV"
+        op.inputs = [str(op.inputs[int(data_input_index)]), divisor_name]
+        op.options = {"fusedActivationFunction": "NONE"}
+        restored += 1
+
+    if restored > 0:
+        _prune_unused_tensors(model_ir)
+    return {
+        "restored_precision_sensitive_reciprocal_divisions": int(restored),
+    }
+
+
 class _ProgressSpinner:
     def __init__(self, progress_bar: Any) -> None:
         self._progress_bar = progress_bar
@@ -428,6 +570,96 @@ def _evaluate_constant_pad(
         )
     except Exception:
         return None
+
+
+def _evaluate_constant_scatter_nd(
+    *,
+    indices_data: Any,
+    updates_data: Any,
+    shape_data: Any,
+) -> Optional[np.ndarray]:
+    try:
+        indices = np.asarray(indices_data, dtype=np.int64)
+        updates = np.asarray(updates_data)
+        dense_shape = np.asarray(shape_data, dtype=np.int64).reshape(-1)
+    except Exception:
+        return None
+    if indices.ndim < 1 or dense_shape.ndim != 1:
+        return None
+    if indices.shape[-1] < 0 or np.any(dense_shape < 0):
+        return None
+
+    index_depth = int(indices.shape[-1])
+    output_rank = int(dense_shape.size)
+    if int(index_depth) > int(output_rank):
+        return None
+
+    prefix_shape = tuple(int(v) for v in list(indices.shape[:-1]))
+    suffix_shape = tuple(int(v) for v in list(dense_shape[index_depth:].tolist()))
+    if tuple(int(v) for v in list(updates.shape)) != prefix_shape + suffix_shape:
+        return None
+
+    try:
+        out = np.zeros(tuple(int(v) for v in list(dense_shape.tolist())), dtype=updates.dtype)
+    except Exception:
+        return None
+
+    flat_indices = indices.reshape((-1, int(index_depth)))
+    flat_updates = updates.reshape((int(flat_indices.shape[0]),) + suffix_shape)
+
+    if int(index_depth) == 0:
+        try:
+            np.add(out, np.sum(flat_updates, axis=0), out=out)
+        except Exception:
+            return None
+        return out
+
+    upper_bounds = np.asarray(dense_shape[:index_depth], dtype=np.int64)
+    if upper_bounds.size != int(index_depth):
+        return None
+    if np.any(flat_indices < 0) or np.any(flat_indices >= upper_bounds.reshape((1, -1))):
+        return None
+
+    try:
+        for update_idx, target_index in enumerate(flat_indices):
+            out[tuple(int(v) for v in list(target_index.tolist()))] += flat_updates[int(update_idx)]
+    except Exception:
+        return None
+    return out
+
+
+def _evaluate_constant_binary_elementwise(
+    *,
+    lhs_data: Any,
+    rhs_data: Any,
+    op_type: str,
+) -> Optional[np.ndarray]:
+    try:
+        lhs = np.asarray(lhs_data)
+        rhs = np.asarray(rhs_data)
+    except Exception:
+        return None
+    if not (
+        np.issubdtype(lhs.dtype, np.floating)
+        and np.issubdtype(rhs.dtype, np.floating)
+    ):
+        return None
+    try:
+        if str(op_type) == "ADD":
+            out = np.add(lhs, rhs)
+        elif str(op_type) == "SUB":
+            out = np.subtract(lhs, rhs)
+        elif str(op_type) == "MUL":
+            out = np.multiply(lhs, rhs)
+        elif str(op_type) == "DIV":
+            out = np.divide(lhs, rhs)
+        else:
+            return None
+    except Exception:
+        return None
+    if not np.all(np.isfinite(out)):
+        return None
+    return np.asarray(out)
 
 
 def _collect_constant_arrays(onnx_graph: onnx.ModelProto) -> Dict[str, np.ndarray]:
@@ -59217,6 +59449,162 @@ def _optimize_constant_input_pad_chains(model_ir: ModelIR) -> Dict[str, int]:
     return {"optimized_constant_input_pad_chains": int(rewritten)}
 
 
+def _optimize_constant_input_scatter_nd_chains(model_ir: ModelIR) -> Dict[str, int]:
+    """
+    Fold constant-input SCATTER_ND operators by materializing their dense outputs.
+
+    Rewrite:
+      CONST(indices) + CONST(updates) + CONST(shape) -> SCATTER_ND -> out
+    Into:
+      CONST(out_dense_data) and remove the SCATTER_ND op.
+    """
+    rewritten = 0
+
+    while True:
+        changed = False
+        for scatter_idx, scatter_op in enumerate(model_ir.operators):
+            if str(scatter_op.op_type) != "SCATTER_ND":
+                continue
+            if len(scatter_op.inputs) != 3 or len(scatter_op.outputs) != 1:
+                continue
+
+            indices_name = str(scatter_op.inputs[0])
+            updates_name = str(scatter_op.inputs[1])
+            shape_name = str(scatter_op.inputs[2])
+            out_name = str(scatter_op.outputs[0])
+            if "" in {indices_name, updates_name, shape_name, out_name}:
+                continue
+
+            indices_tensor = model_ir.tensors.get(indices_name, None)
+            updates_tensor = model_ir.tensors.get(updates_name, None)
+            shape_tensor = model_ir.tensors.get(shape_name, None)
+            out_tensor = model_ir.tensors.get(out_name, None)
+            if (
+                indices_tensor is None
+                or updates_tensor is None
+                or shape_tensor is None
+                or out_tensor is None
+            ):
+                continue
+            if bool(indices_tensor.is_variable) or indices_tensor.data is None:
+                continue
+            if bool(updates_tensor.is_variable) or updates_tensor.data is None:
+                continue
+            if bool(shape_tensor.is_variable) or shape_tensor.data is None:
+                continue
+
+            scattered = _evaluate_constant_scatter_nd(
+                indices_data=indices_tensor.data,
+                updates_data=updates_tensor.data,
+                shape_data=shape_tensor.data,
+            )
+            if scattered is None:
+                continue
+
+            out_dtype = str(out_tensor.dtype).upper()
+            casted = _cast_const_array_to_tflite_dtype(scattered, out_dtype)
+            if casted is None:
+                continue
+
+            out_tensor.data = casted
+            out_tensor.dtype = str(out_dtype)
+            out_tensor.shape = [int(v) for v in list(casted.shape)]
+            out_tensor.shape_signature = [int(v) for v in list(casted.shape)]
+            _append_tensor_lineage_event(
+                model_ir=model_ir,
+                event={
+                    "kind": "fold_constant_scatter_nd",
+                    "indices_name": str(indices_name),
+                    "updates_name": str(updates_name),
+                    "shape_name": str(shape_name),
+                    "output_name": str(out_name),
+                },
+            )
+
+            del model_ir.operators[int(scatter_idx)]
+            rewritten += 1
+            changed = True
+            break
+
+        if not changed:
+            break
+
+    if rewritten > 0:
+        _prune_unused_tensors(model_ir)
+    return {"optimized_constant_input_scatter_nd_chains": int(rewritten)}
+
+
+def _optimize_constant_binary_elementwise_chains(model_ir: ModelIR) -> Dict[str, int]:
+    """
+    Fold strict binary floating-point elementwise ops when both operands are constant.
+    """
+    rewritten = 0
+
+    while True:
+        changed = False
+        for op_idx, op in enumerate(model_ir.operators):
+            op_type = str(op.op_type)
+            if op_type not in {"ADD", "SUB", "MUL", "DIV"}:
+                continue
+            if len(op.inputs) != 2 or len(op.outputs) != 1:
+                continue
+            if str(op.options.get("fusedActivationFunction", "NONE")).upper() != "NONE":
+                continue
+
+            lhs_name = str(op.inputs[0])
+            rhs_name = str(op.inputs[1])
+            out_name = str(op.outputs[0])
+            lhs_tensor = model_ir.tensors.get(lhs_name, None)
+            rhs_tensor = model_ir.tensors.get(rhs_name, None)
+            out_tensor = model_ir.tensors.get(out_name, None)
+            if lhs_tensor is None or rhs_tensor is None or out_tensor is None:
+                continue
+            if bool(lhs_tensor.is_variable) or lhs_tensor.data is None:
+                continue
+            if bool(rhs_tensor.is_variable) or rhs_tensor.data is None:
+                continue
+
+            folded = _evaluate_constant_binary_elementwise(
+                lhs_data=lhs_tensor.data,
+                rhs_data=rhs_tensor.data,
+                op_type=op_type,
+            )
+            if folded is None:
+                continue
+
+            out_dtype = str(out_tensor.dtype).upper()
+            casted = _cast_const_array_to_tflite_dtype(folded, out_dtype)
+            if casted is None:
+                continue
+
+            out_tensor.data = casted
+            out_tensor.dtype = str(out_dtype)
+            out_tensor.shape = [int(v) for v in list(casted.shape)]
+            out_tensor.shape_signature = [int(v) for v in list(casted.shape)]
+            _append_tensor_lineage_event(
+                model_ir=model_ir,
+                event={
+                    "kind": "fold_constant_binary_elementwise",
+                    "op_type": str(op_type),
+                    "lhs_name": str(lhs_name),
+                    "rhs_name": str(rhs_name),
+                    "output_name": str(out_name),
+                },
+            )
+
+            del model_ir.operators[int(op_idx)]
+            rewritten += 1
+            changed = True
+            break
+
+        if not changed:
+            break
+
+    if rewritten > 0:
+        _prune_unused_tensors(model_ir)
+    return {"optimized_constant_binary_elementwise_chains": int(rewritten)}
+
+
 def _optimize_redundant_int64_to_int32_cast_chains(model_ir: ModelIR) -> Dict[str, int]:
     """
     Remove redundant CAST chains:
@@ -76821,6 +77209,7 @@ def lower_onnx_to_ir(
         _topologically_sort_operators(fallback_ir)
         _rewrite_constant_divisors_to_multiplicative_reciprocals(fallback_ir)
         _optimize_fold_consecutive_mul_constants_chains(fallback_ir)
+        _restore_precision_sensitive_reciprocal_divisions(fallback_ir)
         _topologically_sort_operators(fallback_ir)
         fallback_layout_problems = validate_model_ir_layout_annotations(fallback_ir)
         if len(fallback_layout_problems) > 0:
@@ -76834,6 +77223,7 @@ def lower_onnx_to_ir(
 
     _rewrite_constant_divisors_to_multiplicative_reciprocals(model_ir)
     _optimize_fold_consecutive_mul_constants_chains(model_ir)
+    _restore_precision_sensitive_reciprocal_divisions(model_ir)
     _set_post_progress_desc("topological sort")
     _topologically_sort_operators(model_ir)
     if apply_safe_transpose_reduction_lite_on_no_layout_opt:
