@@ -23758,6 +23758,9 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     binary_assign_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>torch\.(?:mul|add|sub|div|minimum|maximum)\(.+\))$"
     )
+    simple_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)$"
+    )
     simple_binary_expr_re = re.compile(
         r"^torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)$"
     )
@@ -23822,6 +23825,15 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         if len(non_singleton_dims) == 1:
             const_channel_counts[str(register_buffer_match.group("name"))] = int(non_singleton_dims[0])
     for index, line in enumerate(lines[:-1]):
+        simple_alias_match = simple_alias_re.match(line)
+        if simple_alias_match is not None:
+            rhs_name = str(simple_alias_match.group("rhs"))
+            if (
+                rhs_name in cf_like_names
+                or rhs_name.endswith("_cf")
+                or rhs_name.endswith("_out_cf")
+            ):
+                cf_like_names.add(str(simple_alias_match.group("lhs")))
         aligned_binary_match = aligned_binary_re.match(line)
         if aligned_binary_match is not None:
             arg_a = str(aligned_binary_match.group("a"))

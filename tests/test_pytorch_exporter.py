@@ -1018,6 +1018,37 @@ def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_malformed_cf_r
     assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_propagates_cf_aliases_to_softmax_and_concat(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, box_out_cf: torch.Tensor, obj_out_cf: torch.Tensor, cls_logits_cf: torch.Tensor) -> torch.Tensor:",
+                "        cls_logits_nhwc = cls_logits_cf",
+                "        cls_scores = _apply_softmax(cls_logits_nhwc, axis=3, beta=1.0, target_shape=[1, 22, 22, 80])",
+                "        out_public_layout_bridge = _apply_concat([box_out_cf, obj_out_cf, cls_scores], axis=3, target_shape=[1, 22, 22, 85], fused='NONE')",
+                "        return out_public_layout_bridge",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "cls_logits_nhwc = cls_logits_cf" in rewritten
+    assert "cls_scores = _apply_softmax(cls_logits_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])" in rewritten
+    assert "out_public_layout_bridge = torch.cat([box_out_cf, obj_out_cf, cls_scores], dim=1)" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_does_not_inject_humanseg_resize_aliases_without_markers(
     tmp_path,
 ) -> None:
