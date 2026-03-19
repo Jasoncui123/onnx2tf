@@ -42,6 +42,7 @@ from onnx2tf.tflite_builder.pytorch_accuracy_evaluator import (
 )
 from onnx2tf.tflite_builder.pytorch_exporter import (
     ModelIRPyTorchExportError,
+    _apply_fast_precanonicalize_repairs,
     _build_metadata_payload,
     _build_tensor_var_name_map,
     _build_torchscript_example_inputs,
@@ -62,9 +63,12 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _rewrite_channel_last_binary_bridge_chains,
     _rewrite_channel_last_gap_means_to_reduce_mean,
     _sanitize_dynamo_exported_onnx_metadata,
+    _should_avoid_model_ir_in_raw_canonicalize_for_native_package,
+    _should_skip_expensive_raw_canonicalize_for_native_package,
     _should_prefer_tflite_backed_package,
     _target_shape_values_for_model_ir,
     _tensor_exact_static_shape_list_for_model_ir,
+    _try_export_native_package_from_tflite_import,
     _write_native_model_file,
     export_dynamo_onnx_from_generated_package,
     export_exported_program_from_generated_package,
@@ -594,6 +598,53 @@ def test_rewrite_generated_model_source_for_exported_program_preserves_rank3_res
     )
 
 
+def test_rewrite_generated_model_source_for_exported_program_keeps_cf_add_target_before_direct_conv(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "exported_program_cf_add_conv_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 3, stride=2, padding=1)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=32,",
+                "            out_channels=64,",
+                "        )",
+                "",
+                "    def forward(self, lhs_cf: torch.Tensor, rhs_cf: torch.Tensor) -> torch.Tensor:",
+                "        out = _align_tensor_to_target_shape(torch.add(lhs_cf, rhs_cf), [1, 32, 48, 80])",
+                "        out = torch.relu(out)",
+                "        y_cf = self.conv_block_0(out)",
+                "        return y_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _rewrite_generated_model_source_for_exported_program(package_dir, model_ir=None)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "out = _align_tensor_to_target_shape(torch.add(lhs_cf, rhs_cf), [1, 32, 48, 80])"
+        in rewritten
+    )
+    assert "[1, 80, 32, 48]" not in rewritten
+
+
 def test_canonicalize_generated_model_source_rewrites_cf_softmax_axis3_to_axis1_when_target_shape_is_cf(
     tmp_path,
 ) -> None:
@@ -623,6 +674,872 @@ def test_canonicalize_generated_model_source_rewrites_cf_softmax_axis3_to_axis1_
         "in196 = _apply_softmax(onnx_softmax1092_cf, axis=1, beta=1.0, target_shape=[1, 4, 10, 3600])"
         in rewritten
     )
+
+
+def test_canonicalize_generated_model_source_rewrites_channel_last_singleton_gate_before_cf_binary(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_singleton_gate_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, t_469: torch.Tensor, cv58_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        t_471 = torch.reshape(t_469, [1, 1, 1, 64])",
+                "        cv70_in_cf = torch.mul(t_471, cv58_out_cf)",
+                "        return cv70_in_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "t_471 = torch.reshape(t_469, [1, 64, 1, 1])" in rewritten
+    assert "cv70_in_cf = torch.mul(t_471, cv58_out_cf)" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_cf_channel_last_gather_slice_axis(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_gather_slice_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv73_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        cv79_in = cv73_out_cf[:, :, :, [0, 24, 1, 25, 2, 26, 3, 27]]",
+                "        return cv79_in",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "cv79_in = cv73_out_cf[:, [0, 24, 1, 25, 2, 26, 3, 27], :, :]" in rewritten
+    assert "cv73_out_cf[:, :, :, [0, 24, 1, 25, 2, 26, 3, 27]]" not in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_cf_softmax_mask_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_softmax_mask_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_268_bn_mul', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_BatchNormalization_268_bn_add', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, resize267_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        batch_normalization268_mul_out = _align_tensor_to_target_shape(torch.mul(resize267_out_cf, self.const_BatchNormalization_268_bn_mul), [1, 80, 80, 2])",
+                "        t_753 = _align_tensor_to_target_shape(torch.add(batch_normalization268_mul_out, self.const_BatchNormalization_268_bn_add), [1, 80, 80, 2])",
+                "        t_756 = _apply_softmax(t_753, axis=3, beta=1.0, target_shape=[1, 80, 80, 2])",
+                "        t_757 = _reduce_max(t_756, _normalize_axes([3], t_756.ndim), False)",
+                "        t_771 = _align_tensor_to_target_shape(torch.sub(1.0, t_757), [1, 80, 80])",
+                "        t_772 = torch.reshape(t_771, [1, 80, 80, 1])",
+                "        return t_772",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "batch_normalization268_mul_out = _align_tensor_to_target_shape("
+        "torch.mul(resize267_out_cf, torch.reshape(self.const_BatchNormalization_268_bn_mul, [1, 2, 1, 1])), [1, 2, 80, 80])"
+        in rewritten
+    )
+    assert (
+        "t_753 = _align_tensor_to_target_shape("
+        "torch.add(batch_normalization268_mul_out, torch.reshape(self.const_BatchNormalization_268_bn_add, [1, 2, 1, 1])), [1, 2, 80, 80])"
+        in rewritten
+    )
+    assert "t_756 = _apply_softmax(t_753, axis=1, beta=1.0, target_shape=[1, 2, 80, 80])" in rewritten
+    assert "t_757 = _reduce_max(t_756, _normalize_axes([1], t_756.ndim), False)" in rewritten
+    assert "t_771 = _align_tensor_to_target_shape(torch.sub(1.0, t_757), [1, 1, 80, 80])" in rewritten
+    assert "t_772 = t_771" in rewritten
+
+
+def test_canonicalize_generated_model_source_keeps_cf_batchnorm_when_target_is_already_cf(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_batchnorm_noop_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_33_bn_mul', torch.zeros([1, 1, 1, 48], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_BatchNormalization_33_bn_add', torch.zeros([1, 1, 1, 48], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, lhs_a_cf: torch.Tensor, lhs_b_cf: torch.Tensor) -> torch.Tensor:",
+                "        t_430 = _align_tensor_to_target_shape(torch.cat([lhs_a_cf, lhs_b_cf], dim=1), [1, 48, 80, 80])",
+                "        batch_normalization33_mul_out = _align_tensor_to_target_shape(torch.mul(t_430, self.const_BatchNormalization_33_bn_mul), [1, 48, 80, 80])",
+                "        t_431 = _align_tensor_to_target_shape(torch.add(batch_normalization33_mul_out, self.const_BatchNormalization_33_bn_add), [1, 48, 80, 80])",
+                "        return t_431",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "batch_normalization33_mul_out = _align_tensor_to_target_shape("
+        "torch.mul(t_430, self.const_BatchNormalization_33_bn_mul), [1, 48, 80, 80])"
+        in rewritten
+    )
+    assert (
+        "t_431 = _align_tensor_to_target_shape("
+        "torch.add(batch_normalization33_mul_out, self.const_BatchNormalization_33_bn_add), [1, 48, 80, 80])"
+        in rewritten
+    )
+    assert "[1, 80, 48, 80]" not in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_cf_binary_add_target_when_nhwc_swapped(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_binary_add_target_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_110_bn_mul', torch.zeros([1, 1, 1, 96], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, lhs_a: torch.Tensor, lhs_b: torch.Tensor) -> torch.Tensor:",
+                "        cv92_in = lhs_a",
+                "        t517_cf = lhs_b",
+                "        t_518 = _align_tensor_to_target_shape(torch.add(cv92_in, t517_cf), [1, 40, 40, 96])",
+                "        batch_normalization110_mul_out = _align_tensor_to_target_shape(torch.mul(t_518, self.const_BatchNormalization_110_bn_mul), [1, 40, 40, 96])",
+                "        return batch_normalization110_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "t_518 = _align_tensor_to_target_shape(torch.add(cv92_in, t517_cf), [1, 96, 40, 40])" in rewritten
+    assert "[1, 40, 40, 96]" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_stage1_and_gather_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, t_469: torch.Tensor, cv58_out_cf: torch.Tensor, cv70_in_cf: torch.Tensor, cv73_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        t_471 = torch.reshape(t_469, [1, 1, 1, 64])",
+                "        cv70_in_cf = torch.mul(t_471, cv58_out_cf)",
+                "        cv70_out_cf = self.conv_block_15(cv70_in_cf)",
+                "        cv73_in = self.prelu_13(cv70_out_cf)",
+                "        cv73_out_cf = self.conv_block_16(cv73_in.permute(0, 3, 1, 2).contiguous())",
+                "        cv79_in = cv73_out_cf[:, :, :, [0, 24, 1, 25]]",
+                "        return cv79_in",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "t_471 = torch.reshape(t_469, [1, 64, 1, 1])" in rewritten
+    assert "cv73_out_cf = self.conv_block_16(cv73_in)" in rewritten
+    assert "cv79_in = cv73_out_cf[:, [0, 24, 1, 25], :, :]" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_depth_to_space_nhwc_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, upsampler_out_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        depth_to_in_reordered = upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]",
+                "        _depth_to_space_x_0 = depth_to_in_reordered",
+                "        return _depth_to_space_x_0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "depth_to_in_reordered = upsampler_out_nhwc[:, :, :, [0, 16, 32, 1, 17, 33]]"
+        in rewritten
+    )
+    assert "depth_to_in_reordered = upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_mask_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_268_bn_mul', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_BatchNormalization_268_bn_add', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_tensor786_expand_x80_x2_af49', torch.zeros([1, 80, 80, 2], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, cv265_out_cf: torch.Tensor, t_791: torch.Tensor) -> torch.Tensor:",
+                "        resize267_out = _apply_resize(cv265_out_cf, [80, 80], method='bilinear', target_shape=[1, 80, 80, 2], align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        batch_normalization268_mul_out = _align_tensor_to_target_shape(torch.mul(resize267_out, self.const_BatchNormalization_268_bn_mul), [1, 80, 80, 2])",
+                "        t_753 = _align_tensor_to_target_shape(torch.add(batch_normalization268_mul_out, self.const_BatchNormalization_268_bn_add), [1, 80, 80, 2])",
+                "        t_756 = _apply_softmax(t_753, axis=3, beta=1.0, target_shape=[1, 80, 80, 2])",
+                "        t_757 = _reduce_max(t_756, _normalize_axes([3], t_756.ndim), False)",
+                "        t_771 = _align_tensor_to_target_shape(torch.sub(torch.as_tensor(1.0, dtype=torch.float32, device=_module_device(self)), t_757), [1, 80, 80])",
+                "        t_772 = torch.reshape(t_771, [1, 80, 80, 1])",
+                "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49, [1, 2, 80, 80])",
+                "        t_786 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_196, _binary_rhs_196), [1, 2, 80, 80])",
+                "        return t_786",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "resize267_out = _apply_resize(cv265_out_cf, [80, 80], method='bilinear', target_shape=[1, 2, 80, 80], align_corners=True, half_pixel_centers=False, channel_last=False)" in rewritten
+    assert "t_756 = _apply_softmax(t_753, axis=1, beta=1.0, target_shape=[1, 2, 80, 80])" in rewritten
+    assert "t_771 = _align_tensor_to_target_shape(torch.sub(torch.as_tensor(1.0, dtype=torch.float32, device=_module_device(self)), t_757), [1, 1, 80, 80])" in rewritten
+    assert "t_772 = t_771" in rewritten
+    assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_malformed_cf_resize_target(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_mask_cf_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_268_bn_mul', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_BatchNormalization_268_bn_add', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_tensor786_expand_x80_x2_af49', torch.zeros([1, 80, 80, 2], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, cv265_out_cf: torch.Tensor, t_790: torch.Tensor) -> torch.Tensor:",
+                "        resize267_out = _apply_resize(cv265_out_cf, [80, 80], method='bilinear', target_shape=[1, 80, 2, 80], align_corners=True, half_pixel_centers=False, channel_last=False)",
+                "        batch_normalization268_mul_out = _align_tensor_to_target_shape(torch.mul(resize267_out, torch.reshape(self.const_BatchNormalization_268_bn_mul, [1, 2, 1, 1])), [1, 2, 80, 80])",
+                "        t_753 = _align_tensor_to_target_shape(torch.add(batch_normalization268_mul_out, torch.reshape(self.const_BatchNormalization_268_bn_add, [1, 2, 1, 1])), [1, 2, 80, 80])",
+                "        t_756 = _apply_softmax(t_753, axis=1, beta=1.0, target_shape=[1, 2, 80, 80])",
+                "        t_757 = _reduce_max(t_756, _normalize_axes([1], t_756.ndim), False)",
+                "        t_771 = _align_tensor_to_target_shape(torch.sub(torch.as_tensor(1.0, dtype=torch.float32, device=_module_device(self)), t_757), [1, 1, 80, 80])",
+                "        t_772 = t_771",
+                "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])",
+                "        t_786 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_196, _binary_rhs_196), [1, 2, 80, 80])",
+                "        _binary_rhs_198, _binary_lhs_198 = _align_binary_inputs_to_anchor(t_753, t_790, [1, 80, 80, 2])",
+                "        resize308_in_nhwc = _align_tensor_to_target_shape(torch.add(_binary_lhs_198, _binary_rhs_198), [1, 80, 80, 2])",
+                "        return resize308_in_nhwc",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "resize267_out = _apply_resize(cv265_out_cf, [80, 80], method='bilinear', target_shape=[1, 2, 80, 80], align_corners=True, half_pixel_centers=False, channel_last=False)" in rewritten
+    assert "batch_normalization268_mul_out = _align_tensor_to_target_shape(torch.mul(resize267_out, torch.reshape(self.const_BatchNormalization_268_bn_mul, [1, 2, 1, 1])), [1, 2, 80, 80])" in rewritten
+    assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_propagates_cf_aliases_to_softmax_and_concat(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, box_out_cf: torch.Tensor, obj_out_cf: torch.Tensor, cls_logits_cf: torch.Tensor) -> torch.Tensor:",
+                "        cls_logits_nhwc = cls_logits_cf",
+                "        cls_scores = _apply_softmax(cls_logits_nhwc, axis=3, beta=1.0, target_shape=[1, 22, 22, 80])",
+                "        out_public_layout_bridge = _apply_concat([box_out_cf, obj_out_cf, cls_scores], axis=3, target_shape=[1, 22, 22, 85], fused='NONE')",
+                "        return out_public_layout_bridge",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "cls_logits_nhwc = cls_logits_cf" in rewritten
+    assert "cls_scores = _apply_softmax(cls_logits_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])" in rewritten
+    assert "out_public_layout_bridge = torch.cat([box_out_cf, obj_out_cf, cls_scores], dim=1)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_pool_lrn_conv_cf_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_pool_lrn_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, p13_x3_s2_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 56, 56, 64], is_max_pool=True, channel_last=False)",
+                "        p1_norm1_out_nhwc = F.local_response_norm(p13_x3_s2_out, size=5, alpha=2e-5, beta=0.75, k=1.0)",
+                "        cv23_x3_in_cf = self.conv_block_1(p1_norm1_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        return cv23_x3_in_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf, filter_height=3, filter_width=3, "
+        "stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 64, 56, 56], "
+        "is_max_pool=True, channel_last=False)"
+        in rewritten
+    )
+    assert "cv23_x3_in_cf = self.conv_block_1(p1_norm1_out_nhwc)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_does_not_inject_humanseg_resize_aliases_without_markers(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "no_humanseg_fast_repair_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    original = "\n".join(
+        [
+            "import torch",
+            "class Model(torch.nn.Module):",
+            "    def forward(self, tmp34_nhwc_bridge_cf):",
+            "        _binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor(foo, tmp34_nhwc_bridge_cf, [1, 8, 16, 672])",
+            "        return _binary_rhs_117",
+            "",
+        ]
+    )
+    model_path.write_text(original, encoding="utf-8")
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "resize9_out_nhwc" not in rewritten
+    assert "foo, tmp34_nhwc_bridge_cf" in rewritten
+
+
+def test_should_skip_expensive_raw_canonicalize_for_sinet_fast_repaired_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "sinet_fast_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, t_469, cv73_out_cf, t_771):",
+                "        t_471 = torch.reshape(t_469, [1, 64, 1, 1])",
+                "        cv79_in = cv73_out_cf[:, [0, 24, 1, 25], :, :]",
+                "        t_772 = t_771",
+                "        x = self.const_tensor786_expand_x80_x2_af49",
+                "        return x",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_not_skip_expensive_raw_canonicalize_for_generic_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "generic_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x):",
+                "        return x",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, wa_slice_out0, wamodel_fdnetdow_downmaxpo_a6_cf_b28e, wamodel_fdnetup1_upup_resize_out_nhwc, out_nhwc):",
+                "        wa_mul_out0 = _align_tensor_to_target_shape(torch.mul(wa_slice_out0, 0.29899999499320984), [1, 1, 180, 320])",
+                "        wamodel_fdnetup1_upconvconvconv0_cv_in = _apply_concat([wamodel_fdnetdow_downmaxpo_a6_cf_b28e, wamodel_fdnetup1_upup_resize_out_nhwc], axis=3, target_shape=[1, 128, 90, 160], fused='NONE')",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_onnx_native_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_onnx_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc, fdnetdow_downmaxp_convmaxp_d5_cf4777, fdnetup2_upup_resize_out_nhwc, out_nhwc):",
+                "        fdnetup1_upconvconvconv0_cv_in = _apply_concat([fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc], axis=3, target_shape=[1, 128, 90, 160], fused='NONE')",
+                "        fdnetup2_upconvconvconv0_cv_in = _apply_concat([fdnetdow_downmaxp_convmaxp_d5_cf4777, fdnetup2_upup_resize_out_nhwc], axis=3, target_shape=[1, 64, 180, 320], fused='NONE')",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_partially_fast_repaired_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_wamodel_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, wamodel_fdnetdow_downmaxpo_a6_cf_b28e, wamodel_fdnetup1_upup_resize_out_nhwc, wamodel_fdnetdow_downmaxpo_e5_cf_e334, wamodel_fdnetup2_upup_resize_out_nhwc, out_nhwc):",
+                "        wamodel_fdnetup1_upconvconvconv0_cv_in = torch.cat([wamodel_fdnetdow_downmaxpo_a6_cf_b28e, wamodel_fdnetup1_upup_resize_out_nhwc], dim=1)",
+                "        wamodel_fdnetup2_upconvconvconv0_cv_in = torch.cat([wamodel_fdnetdow_downmaxpo_e5_cf_e334, wamodel_fdnetup2_upup_resize_out_nhwc], dim=1)",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_plain_partially_fast_repaired_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_plain_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc, fdnetdow_downmaxp_convmaxp_d5_cf4777, fdnetup2_upup_resize_out_nhwc, out_nhwc):",
+                "        fdnetup1_upconvconvconv0_cv_in = torch.cat([fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc], dim=1)",
+                "        fdnetup2_upconvconvconv0_cv_in = torch.cat([fdnetdow_downmaxp_convmaxp_d5_cf4777, fdnetup2_upup_resize_out_nhwc], dim=1)",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_nonfm_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_nonfm_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, canetdow_downmaxp_convmaxp_e_cf_c141, canetup1_upup_resize_out_nhwc, canetdow_downmaxp_convmaxp_p4859_cf_8dba, canetup2_upup_resize_out_nhwc, out_nhwc):",
+                "        canetup1_upconvconvconv0_cv_in = _apply_concat([canetdow_downmaxp_convmaxp_e_cf_c141, canetup1_upup_resize_out_nhwc], axis=3, target_shape=[1, 128, 90, 160], fused='NONE')",
+                "        canetup2_upconvconvconv0_cv_in = _apply_concat([canetdow_downmaxp_convmaxp_p4859_cf_8dba, canetup2_upup_resize_out_nhwc], axis=3, target_shape=[1, 64, 180, 320], fused='NONE')",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_nonfm_partially_fast_repaired_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_nonfm_partial_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, canetdow_downmaxp_convmaxp_e_cf_c141, canetup1_upup_resize_out_nhwc, canetdow_downmaxp_convmaxp_p4859_cf_8dba, canetup2_upup_resize_out_nhwc, out_nhwc):",
+                "        canetup1_upconvconvconv0_cv_in = torch.cat([canetdow_downmaxp_convmaxp_e_cf_c141, canetup1_upup_resize_out_nhwc], dim=1)",
+                "        canetup2_upconvconvconv0_cv_in = torch.cat([canetdow_downmaxp_convmaxp_p4859_cf_8dba, canetup2_upup_resize_out_nhwc], dim=1)",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_nonfm_wamodel_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_nonfm_wamodel_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, wamodel_canetdow_downmaxpo_f545_cf_946b, wamodel_canetup1_upup_resize_out_nhwc, wamodel_canetdow_downmaxpo_p3051_cf_d062, wamodel_canetup2_upup_resize_out_nhwc, out_nhwc):",
+                "        wamodel_canetup1_upconvconvconv0_cv_in = _apply_concat([wamodel_canetdow_downmaxpo_f545_cf_946b, wamodel_canetup1_upup_resize_out_nhwc], axis=3, target_shape=[1, 128, 90, 160], fused='NONE')",
+                "        wamodel_canetup2_upconvconvconv0_cv_in = _apply_concat([wamodel_canetdow_downmaxpo_p3051_cf_d062, wamodel_canetup2_upup_resize_out_nhwc], axis=3, target_shape=[1, 64, 180, 320], fused='NONE')",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_resnet_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "resnet_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data, resnetv15_p0_fwd_in_nhwc_cf, resnetv15_p0_fwd_in_nhwc):",
+                "        resnetv15_p0_fwd_in_nhwc_cf = self.conv_block_0(data)",
+                "        resnetv15_p0_fwd_in_nhwc = _align_tensor_to_target_shape(resnetv15_p0_fwd_in_nhwc_cf.permute(0, 2, 3, 1).contiguous(), [1, 112, 112, 64])",
+                "        resnetv15_p0_fwd_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(resnetv15_p0_fwd_in_nhwc, [1, 112, 112, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        resnetv15_p0_fwd_out = _apply_pool2d(resnetv15_p0_fwd_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 64, 56, 56], is_max_pool=True, channel_last=True)",
+                "        return resnetv15_p0_fwd_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, backbonemaxpool_max_p_in_cf, fpnupsample1_resize_in_nhwc, head_rs_out0, head_rs1_out0, head_rs2_out0, head_rs3_out0):",
+                "        backbonemaxpool_max_p_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(backbonemaxpool_max_p_in_cf, [1, 208, 208, 24]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        fpnupsample1_resize_out_nhwc = _apply_resize(fpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([head_rs_out0, head_rs1_out0, head_rs2_out0, head_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_wamodel_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_wamodel_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, wabackbonemaxpool_max_p_in_cf, wafpnupsample1_resize_in_nhwc, wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0):",
+                "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(wabackbonemaxpool_max_p_in_cf, [1, 208, 208, 24]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_simplified_pool_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_simplified_pool_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data, fpnupsample1_resize_in_nhwc, head_rs_out0, head_rs1_out0, head_rs2_out0, head_rs3_out0):",
+                "        backbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
+                "        backbonemaxpool_max_p_in_nhwc_padded = F.pad(backbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        backbonemaxpool_max_p_out_nhwc = _apply_pool2d(backbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)",
+                "        fpnupsample1_resize_out_nhwc = _apply_resize(fpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([head_rs_out0, head_rs1_out0, head_rs2_out0, head_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_imported_tflite_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_imported_tflite_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data, wafpnupsample1_resize_in_nhwc, wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0):",
+                "        wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data.permute(0, 3, 1, 2).contiguous())",
+                "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)",
+                "        wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_imported_tflite_reference_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_imported_tflite_reference_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data, wafpnupsample1_resize_in_nhwc, wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0):",
+                "        wabackbonemaxpool_max_p_in_cf = self.conv_block_0(data)",
+                "        wabackbonemaxpool_max_p_in_nhwc_padded = F.pad(wabackbonemaxpool_max_p_in_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        wabackbonemaxpool_max_p_out_nhwc = _apply_pool2d(wabackbonemaxpool_max_p_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)",
+                "        wafpnupsample1_resize_out_nhwc = _apply_resize(wafpnupsample1_resize_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([wahead_rs_out0, wahead_rs1_out0, wahead_rs2_out0, wahead_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_bread_after_fast_canonical_form(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, wa_slice_out0, wamodel_fdnetdow_downmaxpo_a6_cf_b28e, wamodel_fdnetup1_upup_resize_out_nhwc, wa_mul14_out0, wa_mul15_out0_cf, out_nhwc):",
+                "        wa_mul_out0 = torch.reshape(torch.mul(wa_slice_out0, 0.29899999499320984), [1, 1, 180, 320])",
+                "        wamodel_fdnetup1_upconvconvconv0_cv_in = torch.cat([wamodel_fdnetdow_downmaxpo_a6_cf_b28e, wamodel_fdnetup1_upup_resize_out_nhwc], dim=1)",
+                "        wa_add10_out0 = _align_tensor_to_target_shape(torch.add(wa_mul14_out0, wa_mul15_out0_cf), [1, 3, 180, 320])",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_not_skip_expensive_raw_canonicalize_for_bread_fast_canonical_form_from_onnx_path(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_onnx_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc, fdnetdow_downmaxp_convmaxp_d5_cf4777, fdnetup2_upup_resize_out_nhwc, clip7_clip_min_out_cf):",
+                "        fdnetup1_upconvconvconv0_cv_in = torch.cat([fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc], dim=1)",
+                "        fdnetup2_upconvconvconv0_cv_in = torch.cat([fdnetdow_downmaxp_convmaxp_d5_cf4777, fdnetup2_upup_resize_out_nhwc], dim=1)",
+                "        out_nhwc = _align_tensor_to_target_shape(torch.clamp(clip7_clip_min_out_cf, max=255.0), [1, 3, 180, 320])",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
 
 
 def test_canonicalize_generated_model_source_restores_rank4_transpose_conv_bridge_from_model_ir(
@@ -807,7 +1724,7 @@ def test_canonicalize_generated_model_source_restores_public_output_resize_targe
     assert "target_shape=[1, 256, 21, 128]" not in rewritten
 
 
-def test_canonicalize_generated_model_source_rewrites_pidnet_pag4_mul2_to_channel_first(tmp_path) -> None:
+def test_canonicalize_generated_model_source_preserves_pidnet_pag4_mul2_alignment(tmp_path) -> None:
     package_dir = tmp_path / "pidnet_pag4_mul2_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
@@ -831,7 +1748,7 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_pag4_mul2_to_channe
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert (
-        "_binary_lhs_99, _binary_rhs_99 = pag4_sig_out0, pag4_resize1_out_nhwc"
+        "_binary_lhs_99, _binary_rhs_99 = _align_binary_inputs(pag4_sig_out0, pag4_resize1_out_nhwc, [1, 64, 24, 40])"
         in rewritten
     )
     assert (
@@ -1244,6 +2161,41 @@ def test_canonicalize_generated_model_source_rewrites_direct_torch_cat_after_cf_
         in rewritten
     )
     assert "out = torch.cat([other_cf, resize_out_nhwc], dim=1)" in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_channel_last_pool_before_lrn(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pool_before_lrn_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, p13_x3_s2_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 56, 56, 64], is_max_pool=True, channel_last=True)",
+                "        p1_norm1_out_nhwc = F.local_response_norm(p13_x3_s2_out, size=5, alpha=2e-5, beta=0.75, k=1.0)",
+                "        cv23_x3_in_cf = self.conv_block_1(p1_norm1_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        return cv23_x3_in_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf, filter_height=3, filter_width=3, "
+        "stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 56, 56, 64], "
+        "is_max_pool=True, channel_last=True)"
+        in rewritten
+    )
+    assert "channel_last=False" not in rewritten
 
 
 def test_canonicalize_generated_model_source_restores_rank3_reshape_materialize_for_channel_last_rank4_source(
@@ -3043,6 +3995,317 @@ def _make_concat_with_ambiguous_axis_only_match_model_ir() -> ModelIR:
         )
     )
     return model_ir
+
+
+def _make_nhwc_concat_last_axis_gather_model_ir() -> ModelIR:
+    model_ir = ModelIR(name="nhwc_concat_last_axis_gather_model_ir")
+    model_ir.inputs = ["x_nhwc", "y_nhwc"]
+    model_ir.outputs = ["gathered_even_nhwc"]
+    model_ir.tensors["x_nhwc"] = TensorIR(
+        name="x_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 2, 2, 3],
+        shape_signature=[1, 2, 2, 3],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["y_nhwc"] = TensorIR(
+        name="y_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 2, 2, 3],
+        shape_signature=[1, 2, 2, 3],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["concat_out_nhwc"] = TensorIR(
+        name="concat_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 2, 2, 6],
+        shape_signature=[1, 2, 2, 6],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["gather_even_indices"] = TensorIR(
+        name="gather_even_indices",
+        dtype="INT32",
+        shape=[3],
+        shape_signature=[3],
+        data=np.asarray([0, 2, 4], dtype=np.int32),
+    )
+    model_ir.tensors["gathered_even_nhwc"] = TensorIR(
+        name="gathered_even_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 2, 2, 3],
+        shape_signature=[1, 2, 2, 3],
+        logical_layout="NHWC",
+    )
+    model_ir.operators.extend(
+        [
+            OperatorIR(
+                op_type="CONCATENATION",
+                inputs=["x_nhwc", "y_nhwc"],
+                outputs=["concat_out_nhwc"],
+                options={"axis": 3, "fusedActivationFunction": "NONE"},
+            ),
+            OperatorIR(
+                op_type="GATHER",
+                inputs=["concat_out_nhwc", "gather_even_indices"],
+                outputs=["gathered_even_nhwc"],
+                options={"axis": 3, "batchDims": 0},
+            ),
+        ]
+    )
+    return model_ir
+
+
+def _count_dynamo_channel_front_concat_input_transpose_bridges(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    producer_map = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            producer_map[str(output_name)] = node
+    count = 0
+    for trailing_transpose_node in model.graph.node:
+        if str(trailing_transpose_node.op_type) != "Transpose":
+            continue
+        trailing_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in trailing_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if trailing_perm != [3, 0, 1, 2]:
+            continue
+        concat_node = producer_map.get(str(trailing_transpose_node.input[0]) if trailing_transpose_node.input else "")
+        if concat_node is None or str(concat_node.op_type) != "Concat":
+            continue
+        concat_axis = next(
+            (
+                int(attr.i)
+                for attr in concat_node.attribute
+                if str(attr.name) == "axis"
+            ),
+            -1,
+        )
+        if concat_axis != 3:
+            continue
+        input_has_layout_bridge = False
+        for input_name in concat_node.input:
+            input_node = producer_map.get(str(input_name))
+            if input_node is None or str(input_node.op_type) != "Transpose":
+                continue
+            input_perm = next(
+                (
+                    [int(v) for v in list(attr.ints)]
+                    for attr in input_node.attribute
+                    if str(attr.name) == "perm"
+                ),
+                [],
+            )
+            if input_perm == [0, 2, 3, 1]:
+                input_has_layout_bridge = True
+                break
+        if input_has_layout_bridge:
+            count += 1
+    return count
+
+
+def _count_dynamo_shared_concat_passthrough_transpose_bridges(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    producer_map = {}
+    consumer_map = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            producer_map[str(output_name)] = node
+        for input_name in node.input:
+            consumer_map.setdefault(str(input_name), []).append(node)
+    count = 0
+    for input_transpose_node in model.graph.node:
+        if str(input_transpose_node.op_type) != "Transpose":
+            continue
+        input_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in input_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if input_perm != [0, 2, 3, 1]:
+            continue
+        input_output_name = str(input_transpose_node.output[0]) if input_transpose_node.output else ""
+        consumers = consumer_map.get(input_output_name, [])
+        if len(consumers) != 2:
+            continue
+        concat_node = next((node for node in consumers if str(node.op_type) == "Concat"), None)
+        passthrough_inverse_node = next(
+            (
+                node
+                for node in consumers
+                if str(node.op_type) == "Transpose"
+                and next(
+                    (
+                        [int(v) for v in list(attr.ints)]
+                        for attr in node.attribute
+                        if str(attr.name) == "perm"
+                    ),
+                    [],
+                ) == [0, 3, 1, 2]
+            ),
+            None,
+        )
+        if concat_node is None or passthrough_inverse_node is None:
+            continue
+        concat_axis = next(
+            (
+                int(attr.i)
+                for attr in concat_node.attribute
+                if str(attr.name) == "axis"
+            ),
+            -1,
+        )
+        if concat_axis != 3:
+            continue
+        trailing_consumers = consumer_map.get(str(concat_node.output[0]) if concat_node.output else "", [])
+        if len(trailing_consumers) != 1:
+            continue
+        trailing_transpose_node = trailing_consumers[0]
+        trailing_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in trailing_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if trailing_perm == [0, 3, 1, 2]:
+            count += 1
+    return count
+
+
+def _count_dynamo_channel_front_gathernd_transpose_bridges(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    producer_map = {}
+    consumer_map = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            producer_map[str(output_name)] = node
+        for input_name in node.input:
+            consumer_map.setdefault(str(input_name), []).append(node)
+    count = 0
+    for source_transpose_node in model.graph.node:
+        if str(source_transpose_node.op_type) != "Transpose":
+            continue
+        source_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in source_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if source_perm != [1, 0, 2, 3]:
+            continue
+        source_output_name = str(source_transpose_node.output[0]) if source_transpose_node.output else ""
+        for gather_node in consumer_map.get(source_output_name, []):
+            if str(gather_node.op_type) != "GatherND":
+                continue
+            gather_output_name = str(gather_node.output[0]) if gather_node.output else ""
+            gather_consumers = consumer_map.get(gather_output_name, [])
+            if len(gather_consumers) != 1:
+                continue
+            trailing_transpose_node = gather_consumers[0]
+            if str(trailing_transpose_node.op_type) != "Transpose":
+                continue
+            trailing_perm = next(
+                (
+                    [int(v) for v in list(attr.ints)]
+                    for attr in trailing_transpose_node.attribute
+                    if str(attr.name) == "perm"
+                ),
+                [],
+            )
+            if trailing_perm == [1, 0, 2, 3]:
+                count += 1
+    return count
+
+
+def _count_dynamo_channel_front_gathernd_double_transpose_bridges(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    producer_map = {}
+    consumer_map = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            producer_map[str(output_name)] = node
+        for input_name in node.input:
+            consumer_map.setdefault(str(input_name), []).append(node)
+    count = 0
+    for source_transpose_node in model.graph.node:
+        if str(source_transpose_node.op_type) != "Transpose":
+            continue
+        source_perm = next(
+            (
+                [int(v) for v in list(attr.ints)]
+                for attr in source_transpose_node.attribute
+                if str(attr.name) == "perm"
+            ),
+            [],
+        )
+        if source_perm != [1, 0, 2, 3]:
+            continue
+        source_output_name = str(source_transpose_node.output[0]) if source_transpose_node.output else ""
+        for gather_node in consumer_map.get(source_output_name, []):
+            if str(gather_node.op_type) != "GatherND":
+                continue
+            gather_output_name = str(gather_node.output[0]) if gather_node.output else ""
+            first_consumers = consumer_map.get(gather_output_name, [])
+            if len(first_consumers) != 1:
+                continue
+            first_transpose_node = first_consumers[0]
+            first_perm = next(
+                (
+                    [int(v) for v in list(attr.ints)]
+                    for attr in first_transpose_node.attribute
+                    if str(attr.name) == "perm"
+                ),
+                [],
+            )
+            if first_perm != [1, 2, 3, 0]:
+                continue
+            first_output_name = str(first_transpose_node.output[0]) if first_transpose_node.output else ""
+            second_consumers = consumer_map.get(first_output_name, [])
+            if len(second_consumers) != 1:
+                continue
+            second_transpose_node = second_consumers[0]
+            second_perm = next(
+                (
+                    [int(v) for v in list(attr.ints)]
+                    for attr in second_transpose_node.attribute
+                    if str(attr.name) == "perm"
+                ),
+                [],
+            )
+            if second_perm == [0, 3, 1, 2]:
+                count += 1
+    return count
+
+
+def _count_dynamo_channel_front_gather_axis1_patterns(onnx_path: Path) -> int:
+    model = onnx.load(str(onnx_path))
+    count = 0
+    for node in model.graph.node:
+        if str(node.op_type) != "Gather":
+            continue
+        axis = next(
+            (
+                int(attr.i)
+                for attr in node.attribute
+                if str(attr.name) == "axis"
+            ),
+            0,
+        )
+        if axis == 1:
+            count += 1
+    return count
 
 
 def _make_sigmoid_mul_nchw_model_ir() -> ModelIR:
@@ -7939,8 +9202,41 @@ def test_export_pytorch_package_avoids_early_permute_chain_for_human_segmentatio
     assert "cv20_out_nhwc_cf.permute(0, 2, 3, 1).contiguous()" not in model_source
     assert "cv21_in_nhwc.permute(0, 3, 1, 2).contiguous()" not in model_source
     assert "cv22_out_nhwc_cf.permute(0, 2, 3, 1).contiguous()" not in model_source
-    assert "save_infer_modelscale0_tmp1 = _apply_softmax(resize13_out_nhwc, axis=1, beta=1.0, target_shape=[1, 2, 192, 192])" in model_source
-    assert "_torch_permute(save_infer_modelscale_layout_bridge_cf94, [0, 3, 1, 2])" not in model_source
+    assert "resize10_in_nhwc = _align_tensor_to_target_shape(torch.add(_binary_lhs_116, _binary_rhs_116), [1, 32, 24, 24])" in model_source
+    assert "resize11_in_nhwc = _align_tensor_to_target_shape(torch.add(_binary_lhs_117, _binary_rhs_117), [1, 64, 12, 12])" in model_source
+    assert "resize12_in = _align_tensor_to_target_shape(torch.add(tmp37_nhwc_bridge_cf, cv70_out_cf), [1, 128, 6, 6])" in model_source
+    assert "cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)" in model_source
+    assert "cv71_in = _apply_concat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], axis=3, target_shape=[1, 240, 48, 48], fused='NONE')" not in model_source
+    assert "save_infer_modelscale_layout_bridge_cf94 = _apply_softmax(resize13_out_nhwc, axis=3, beta=1.0, target_shape=[1, 192, 192, 2])" in model_source
+    assert "save_infer_modelscale0_tmp1 = _torch_permute(save_infer_modelscale_layout_bridge_cf94, [0, 3, 1, 2])" in model_source
+
+
+def test_export_pytorch_package_preserves_fast_raw_codegen_shape_for_version_rfb_when_model_is_available(tmp_path) -> None:
+    model_path = Path("version-RFB-640.onnx")
+    if not model_path.exists():
+        pytest.skip("version-RFB-640.onnx is not available")
+    model_proto = onnx.load(model_path)
+    model_ir = clone_model_ir_with_float32(
+        lower_onnx_to_ir(
+            model_proto,
+            output_file_name="version_rfb_native_codegen_test",
+            show_progress=False,
+        )
+    )
+    prune_identity_cast_operators(model_ir, preserve_model_outputs=True)
+    optimize_redundant_transpose_operators(model_ir, preserve_model_outputs=True)
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=model_ir,
+        output_folder_path=str(tmp_path / "version_rfb_native_pytorch"),
+    )
+    package_dir = Path(package_path)
+    metadata = json.loads((package_dir / "metadata.json").read_text())
+    model_source = (package_dir / "model.py").read_text()
+    assert metadata["execution_backend"] == "native"
+    assert "sng_cv45_in = _align_tensor_to_target_shape(torch.add(sng_cv42_out_cf, sng_cv29_out_cf), [1, 60, 80, 64])" in model_source
+    assert "sng_cv51_in_cf = self.conv_block_25(sng_cv45_in.permute(0, 3, 1, 2).contiguous())" in model_source
+    assert "t_459 = _apply_concat([t_328, t_374, t_414, t_446], axis=1, target_shape=[1, 17640, 2], fused='NONE')" in model_source
+    assert "boxes = _apply_concat([t_480, t_485], axis=2, target_shape=[1, 17640, 4], fused='NONE')" in model_source
 
 
 def test_export_pytorch_package_generates_native_mobilebert_package_when_model_is_available(tmp_path) -> None:
@@ -8067,6 +9363,384 @@ def test_export_pytorch_package_imported_tflite_with_cumsum_stays_native(tmp_pat
     torchscript_path = export_torchscript_from_generated_package(package_dir=package_path)
     assert torchscript_path is not None
     assert Path(torchscript_path).exists()
+
+
+def test_export_pytorch_package_imported_tflite_keeps_channel_last_concat_for_last_axis_gather(tmp_path) -> None:
+    model_ir = _make_nhwc_concat_last_axis_gather_model_ir()
+    tflite_path = _write_model_ir_as_tflite(
+        str(tmp_path),
+        "concat_last_axis_gather_native",
+        model_ir,
+    )
+    package_path = _try_export_native_package_from_tflite_import(
+        output_folder_path=str(tmp_path / "concat_last_axis_gather_native_pytorch"),
+        fallback_tflite_path=tflite_path,
+        reference_model_ir=None,
+        reference_onnx_graph=None,
+    )
+    assert package_path is not None
+    package_dir = Path(package_path)
+    metadata = json.loads((package_dir / "metadata.json").read_text())
+    model_source = (package_dir / "model.py").read_text()
+    assert metadata["execution_backend"] == "native"
+    assert "concat_out_nhwc_cf = torch.cat([x_nhwc, y_nhwc], dim=1)" not in model_source
+    assert "_apply_concat([x, y], axis=3, target_shape=[1, 2, 2, 6], fused='NONE')" in model_source
+
+    pkg = _import_generated_package(package_path)
+    model = pkg.load_model()
+    x = torch.arange(12, dtype=torch.float32).reshape(1, 2, 2, 3)
+    y = torch.arange(12, 24, dtype=torch.float32).reshape(1, 2, 2, 3)
+    out = model(x, y)
+    expected = torch.index_select(
+        torch.cat([x, y], dim=3),
+        dim=3,
+        index=torch.tensor([0, 2, 4], dtype=torch.int64),
+    )
+    assert torch.allclose(out, expected)
+
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
+    exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
+    assert dynamo_onnx_path is not None
+    assert exported_program_path is not None
+    assert Path(dynamo_onnx_path).exists()
+    assert Path(exported_program_path).exists()
+
+
+def test_export_pytorch_package_imported_tflite_preserves_rank3_concat_for_nanodet_when_model_is_available(tmp_path) -> None:
+    model_path = Path("nanodet-plus-m_416.onnx")
+    if not model_path.exists():
+        pytest.skip("nanodet-plus-m_416.onnx is not available")
+    model_ir = lower_onnx_to_ir(
+        onnx.load(model_path),
+        output_file_name="nanodet_imported_tflite_rank3_concat_test",
+        show_progress=False,
+    )
+    tflite_path = _write_model_ir_as_tflite(
+        str(tmp_path),
+        "nanodet_imported_tflite_rank3_concat",
+        model_ir,
+    )
+    package_path = _try_export_native_package_from_tflite_import(
+        output_folder_path=str(tmp_path / "nanodet_imported_tflite_rank3_concat_pytorch"),
+        fallback_tflite_path=tflite_path,
+        reference_model_ir=None,
+        reference_onnx_graph=None,
+    )
+    assert package_path is not None
+    package_dir = Path(package_path)
+    model_source = (package_dir / "model.py").read_text()
+    assert (
+        "out = torch.cat([wahead_rs_out0.permute(0, 2, 1).contiguous(), "
+        "wahead_rs1_out0.permute(0, 2, 1).contiguous(), "
+        "wahead_rs2_out0.permute(0, 2, 1).contiguous(), "
+        "wahead_rs3_out0.permute(0, 2, 1).contiguous()], dim=1)"
+    ) not in model_source
+    assert "out = _apply_concat([" in model_source
+    assert "axis=1, target_shape=[1, 3598, 37], fused='NONE')" in model_source
+
+    pkg = _import_generated_package(package_path)
+    model = pkg.load_model()
+    x = torch.randn(1, 3, 416, 416, dtype=torch.float32)
+    out = model(x)
+    assert list(out.shape) == [1, 3598, 37]
+
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
+    exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
+    assert dynamo_onnx_path is not None
+    assert exported_program_path is not None
+    assert Path(dynamo_onnx_path).exists()
+    assert Path(exported_program_path).exists()
+    exported_program = torch.export.load(str(exported_program_path))
+    redundant_pool_bridge_count = 0
+    redundant_channel_last_concat_gather_bridge_count = 0
+    redundant_depthwise_permute_pad_bridge_count = 0
+    for node in exported_program.module().graph.nodes:
+        perm_arg = node.args[1] if len(node.args) >= 2 else None
+        perm = (
+            list(cast(list[int] | tuple[int, ...], perm_arg))
+            if isinstance(perm_arg, (list, tuple))
+            else None
+        )
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.permute.default"
+            or perm != [0, 2, 3, 1]
+        ):
+            continue
+        permute_users = list(node.users)
+        if len(permute_users) != 1:
+            continue
+        contiguous_node = permute_users[0]
+        if (
+            contiguous_node.op != "call_function"
+            or str(contiguous_node.target) != "aten.contiguous.default"
+        ):
+            continue
+        contiguous_users = list(contiguous_node.users)
+        if len(contiguous_users) != 1:
+            continue
+        pad_node = contiguous_users[0]
+        pad_values_arg = pad_node.args[1] if len(pad_node.args) >= 2 else None
+        pad_values = (
+            list(cast(list[int] | tuple[int, ...], pad_values_arg))
+            if isinstance(pad_values_arg, (list, tuple))
+            else None
+        )
+        if (
+            pad_node.op != "call_function"
+            or str(pad_node.target) != "aten.pad.default"
+            or pad_values != [0, 0, 1, 1, 1, 1]
+        ):
+            continue
+        pad_users = list(pad_node.users)
+        if len(pad_users) != 1:
+            continue
+        inverse_permute_node = pad_users[0]
+        inverse_perm_arg = inverse_permute_node.args[1] if len(inverse_permute_node.args) >= 2 else None
+        inverse_perm = (
+            list(cast(list[int] | tuple[int, ...], inverse_perm_arg))
+            if isinstance(inverse_perm_arg, (list, tuple))
+            else None
+        )
+        if (
+            inverse_permute_node.op != "call_function"
+            or str(inverse_permute_node.target) != "aten.permute.default"
+            or inverse_perm != [0, 3, 1, 2]
+        ):
+            continue
+        inverse_users = list(inverse_permute_node.users)
+        if len(inverse_users) != 1:
+            continue
+        inverse_contiguous_node = inverse_users[0]
+        if (
+            inverse_contiguous_node.op != "call_function"
+            or str(inverse_contiguous_node.target) != "aten.contiguous.default"
+        ):
+            continue
+        inverse_contiguous_users = list(inverse_contiguous_node.users)
+        if (
+            len(inverse_contiguous_users) == 1
+            and inverse_contiguous_users[0].op == "call_function"
+            and str(inverse_contiguous_users[0].target) == "aten.max_pool2d.default"
+        ):
+            redundant_pool_bridge_count += 1
+        continue
+    for node in exported_program.module().graph.nodes:
+        perm_arg = node.args[1] if len(node.args) >= 2 else None
+        perm = (
+            list(cast(list[int] | tuple[int, ...], perm_arg))
+            if isinstance(perm_arg, (list, tuple))
+            else None
+        )
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.permute.default"
+            or perm != [0, 3, 1, 2]
+            or len(node.args) < 1
+            or not isinstance(node.args[0], torch.fx.Node)
+        ):
+            continue
+        source_node = node.args[0]
+        permute_users = list(node.users)
+        if len(permute_users) != 1:
+            continue
+        contiguous_node = permute_users[0]
+        if (
+            contiguous_node.op != "call_function"
+            or str(contiguous_node.target) != "aten.contiguous.default"
+        ):
+            continue
+        contiguous_shape_meta = getattr(contiguous_node, "meta", {}).get("val", None)
+        contiguous_shape = list(contiguous_shape_meta.shape) if isinstance(contiguous_shape_meta, torch.Tensor) else None
+        if contiguous_shape is not None and (len(contiguous_shape) != 4):
+            continue
+        contiguous_users = list(contiguous_node.users)
+        if len(contiguous_users) != 1:
+            continue
+        pad_node = contiguous_users[0]
+        pad_values_arg = pad_node.args[1] if len(pad_node.args) >= 2 else None
+        pad_values = (
+            list(cast(list[int] | tuple[int, ...], pad_values_arg))
+            if isinstance(pad_values_arg, (list, tuple))
+            else None
+        )
+        if (
+            pad_node.op != "call_function"
+            or str(pad_node.target) != "aten.pad.default"
+            or pad_values is None
+            or len(pad_values) != 4
+        ):
+            continue
+        pad_users = list(pad_node.users)
+        if len(pad_users) != 1:
+            continue
+        conv_node = pad_users[0]
+        groups_arg = conv_node.args[6] if len(conv_node.args) >= 7 else None
+        sibling_conv_users = [
+            user
+            for user in list(source_node.users)
+            if user is not node
+            and user.op == "call_function"
+            and str(user.target) == "aten.conv2d.default"
+        ]
+        if (
+            conv_node.op == "call_function"
+            and str(conv_node.target) == "aten.conv2d.default"
+            and isinstance(groups_arg, int)
+            and groups_arg > 1
+            and len(sibling_conv_users) > 0
+            and not (contiguous_shape is not None and contiguous_shape[1] == groups_arg)
+        ):
+            redundant_depthwise_permute_pad_bridge_count += 1
+    for node in exported_program.module().graph.nodes:
+        cat_dim = None
+        if len(node.args) >= 2 and isinstance(node.args[1], int):
+            cat_dim = int(node.args[1])
+        elif isinstance(node.kwargs, dict) and "dim" in node.kwargs:
+            cat_dim = int(node.kwargs["dim"])
+        if (
+            node.op != "call_function"
+            or str(node.target) != "aten.cat.default"
+            or cat_dim != 3
+            or len(node.args) < 1
+            or not isinstance(node.args[0], (list, tuple))
+        ):
+            continue
+        cat_inputs = list(cast(list[torch.fx.Node] | tuple[torch.fx.Node, ...], node.args[0]))
+        if len(cat_inputs) == 0:
+            continue
+        folded_input_count = 0
+        for cat_input in cat_inputs:
+            if not isinstance(cat_input, torch.fx.Node):
+                continue
+            if (
+                cat_input.op == "call_function"
+                and str(cat_input.target) == "aten.contiguous.default"
+                and len(cat_input.args) >= 1
+                and isinstance(cat_input.args[0], torch.fx.Node)
+                and cat_input.args[0].op == "call_function"
+                and str(cat_input.args[0].target) == "aten.permute.default"
+            ):
+                cat_input_perm_arg = cat_input.args[0].args[1] if len(cat_input.args[0].args) >= 2 else None
+                cat_input_perm = (
+                    list(cast(list[int] | tuple[int, ...], cat_input_perm_arg))
+                    if isinstance(cat_input_perm_arg, (list, tuple))
+                    else None
+                )
+                if cat_input_perm == [0, 2, 3, 1]:
+                    folded_input_count += 1
+        if folded_input_count != len(cat_inputs):
+            continue
+        has_redundant_index_branch = False
+        for user in list(node.users):
+            if (
+                user.op != "call_function"
+                or str(user.target) != "aten.index.Tensor"
+                or len(user.args) < 2
+                or not isinstance(user.args[1], (list, tuple))
+            ):
+                continue
+            index_spec = list(cast(list[object] | tuple[object, ...], user.args[1]))
+            if len(index_spec) != 4 or index_spec[:3] != [None, None, None]:
+                continue
+            index_users = list(user.users)
+            if len(index_users) != 1:
+                continue
+            inverse_permute_node = index_users[0]
+            inverse_perm_arg = inverse_permute_node.args[1] if len(inverse_permute_node.args) >= 2 else None
+            inverse_perm = (
+                list(cast(list[int] | tuple[int, ...], inverse_perm_arg))
+                if isinstance(inverse_perm_arg, (list, tuple))
+                else None
+            )
+            if (
+                inverse_permute_node.op == "call_function"
+                and str(inverse_permute_node.target) == "aten.permute.default"
+                and inverse_perm == [0, 3, 1, 2]
+            ):
+                has_redundant_index_branch = True
+                break
+        if has_redundant_index_branch:
+            redundant_channel_last_concat_gather_bridge_count += 1
+    assert redundant_pool_bridge_count == 0
+    assert redundant_depthwise_permute_pad_bridge_count == 0
+    assert redundant_channel_last_concat_gather_bridge_count == 0
+
+
+def test_export_pytorch_package_imported_tflite_preserves_resnet_pool_target_shape_when_model_is_available(
+    tmp_path,
+) -> None:
+    model_path = Path("resnet18-v1-7.onnx")
+    if not model_path.exists():
+        pytest.skip("resnet18-v1-7.onnx is not available")
+    model_ir = lower_onnx_to_ir(
+        onnx.load(model_path),
+        output_file_name="resnet18_imported_tflite_pool_target_shape_test",
+        show_progress=False,
+    )
+    tflite_path = _write_model_ir_as_tflite(
+        str(tmp_path),
+        "resnet18_imported_tflite_pool_target_shape",
+        model_ir,
+    )
+    package_path = _try_export_native_package_from_tflite_import(
+        output_folder_path=str(tmp_path / "resnet18_imported_tflite_pool_target_shape_pytorch"),
+        fallback_tflite_path=tflite_path,
+        reference_model_ir=None,
+        reference_onnx_graph=None,
+    )
+    assert package_path is not None
+    package_dir = Path(package_path)
+    model_source = (package_dir / "model.py").read_text()
+    assert "resnetv15_p0_fwd_in_nhwc = resnetv15_p0_fwd_in_nhwc_cf" not in model_source
+    assert "target_shape=[1, 56, 64, 56]" not in model_source
+    assert "[0, 0, 1, 1, 1, 1]" in model_source
+    assert "channel_last=True" in model_source
+
+    pkg = _import_generated_package(package_path)
+    model = pkg.load_model()
+    x = torch.randn(1, 3, 224, 224, dtype=torch.float32)
+    out = model(x)
+    assert list(out.shape) == [1, 1000]
+
+    exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
+    assert exported_program_path is not None
+    assert Path(exported_program_path).exists()
+
+
+def test_export_dynamo_onnx_from_generated_package_folds_nanodet_channel_front_concat_bridges_when_model_is_available(
+    tmp_path,
+) -> None:
+    model_path = Path("nanodet-plus-m_416.onnx")
+    if not model_path.exists():
+        pytest.skip("nanodet-plus-m_416.onnx is not available")
+    model_ir = lower_onnx_to_ir(
+        onnx.load(model_path),
+        output_file_name="nanodet_dynamo_concat_bridge_fold_test",
+        show_progress=False,
+    )
+    tflite_path = _write_model_ir_as_tflite(
+        str(tmp_path),
+        "nanodet_dynamo_concat_bridge_fold",
+        model_ir,
+    )
+    package_path = _try_export_native_package_from_tflite_import(
+        output_folder_path=str(tmp_path / "nanodet_dynamo_concat_bridge_fold_pytorch"),
+        fallback_tflite_path=tflite_path,
+        reference_model_ir=None,
+        reference_onnx_graph=None,
+    )
+    assert package_path is not None
+
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
+    assert dynamo_onnx_path is not None
+    dynamo_onnx_file = Path(dynamo_onnx_path)
+    assert dynamo_onnx_file.exists()
+    assert _count_dynamo_channel_front_concat_input_transpose_bridges(dynamo_onnx_file) == 0
+    assert _count_dynamo_shared_concat_passthrough_transpose_bridges(dynamo_onnx_file) == 0
+    assert _count_dynamo_channel_front_gathernd_transpose_bridges(dynamo_onnx_file) == 0
+    assert _count_dynamo_channel_front_gathernd_double_transpose_bridges(dynamo_onnx_file) == 0
+    assert _count_dynamo_channel_front_gather_axis1_patterns(dynamo_onnx_file) >= 4
 
 
 def test_export_pytorch_package_bidirectional_sequence_lstm_stays_native(tmp_path) -> None:
@@ -8715,6 +10389,10 @@ def test_export_pytorch_package_iat_llie_smoke_inference_when_model_is_available
         model_ir=model_ir,
         output_folder_path=str(tmp_path / "iat_llie_native_pytorch"),
     )
+    model_source = (Path(package_path) / "model.py").read_text()
+    assert "onnx_shape1019 = _align_tensor_to_target_shape(torch.add(_binary_lhs_19, _binary_rhs_19), [1, 45, 80, 64])" in model_source
+    assert "cv108_out_cf = self.conv_block_16(cv108_in.permute(0, 3, 1, 2).contiguous())" in model_source
+    assert "img_high = _align_tensor_to_target_shape(torch.add(onnx_add1004_nhwc_bridge, onnx_add1003_cf), [1, 180, 320, 3])" in model_source
     report = smoke_test_pytorch_package_inference(
         onnx_graph=model_proto,
         package_dir=str(package_path),
@@ -8723,6 +10401,67 @@ def test_export_pytorch_package_iat_llie_smoke_inference_when_model_is_available
         seed=0,
     )
     assert report["inference_pass"] is True
+
+
+def test_export_pytorch_package_bread_smoke_inference_when_model_is_available(tmp_path) -> None:
+    model_path = Path("bread_180x320.onnx")
+    if not model_path.exists():
+        pytest.skip("bread_180x320.onnx is not available")
+    model_proto = onnx.load(model_path)
+    model_ir = lower_onnx_to_ir(
+        model_proto,
+        output_file_name="bread_native_codegen_test",
+        show_progress=False,
+    )
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=model_ir,
+        output_folder_path=str(tmp_path / "bread_native_pytorch"),
+    )
+    model_source = (Path(package_path) / "model.py").read_text()
+    assert "out = out_nhwc" in model_source
+    assert "out = _torch_permute(out_nhwc, [0, 3, 1, 2])" not in model_source
+    assert (
+        "wamodel_fdnetup1_upconvconvconv0_cv_in = torch.cat([wamodel_fdnetdow_downmaxpo_a6_cf_b28e, wamodel_fdnetup1_upup_resize_out_nhwc], dim=1)" in model_source
+        or "fdnetup1_upconvconvconv0_cv_in = torch.cat([fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc], dim=1)" in model_source
+    )
+    report = smoke_test_pytorch_package_inference(
+        onnx_graph=model_proto,
+        package_dir=str(package_path),
+        output_report_path=str(tmp_path / "bread_smoke_report.json"),
+        num_samples=1,
+        seed=0,
+    )
+    assert report["inference_pass"] is True
+
+
+def test_export_pytorch_package_sinet_smoke_and_aux_exports_when_model_is_available(tmp_path) -> None:
+    model_path = Path("sinet_320_op.onnx")
+    if not model_path.exists():
+        pytest.skip("sinet_320_op.onnx is not available")
+    model_proto = onnx.load(model_path)
+    model_ir = lower_onnx_to_ir(
+        model_proto,
+        output_file_name="sinet_native_codegen_test",
+        show_progress=False,
+    )
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=model_ir,
+        output_folder_path=str(tmp_path / "sinet_native_pytorch"),
+    )
+    report = smoke_test_pytorch_package_inference(
+        onnx_graph=model_proto,
+        package_dir=str(package_path),
+        output_report_path=str(tmp_path / "sinet_smoke_report.json"),
+        num_samples=1,
+        seed=0,
+    )
+    assert report["inference_pass"] is True
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(package_dir=package_path)
+    assert dynamo_onnx_path is not None
+    assert Path(dynamo_onnx_path).exists()
+    exported_program_path = export_exported_program_from_generated_package(package_dir=package_path)
+    assert exported_program_path is not None
+    assert Path(exported_program_path).exists()
 
 
 def test_export_pytorch_package_avoids_public_bridge_permute_pairs_for_swinir_when_model_is_available(tmp_path) -> None:
@@ -8953,19 +10692,18 @@ def test_export_pytorch_package_canonicalizes_bread_nonfm_source_for_raw_export_
 
     assert "torch.tensor_split(in_public_layout_bridge, 3, dim=_normalize_dim(1, in_public_layout_bridge.ndim))" in model_source
     assert "mul_out0 = torch.mul(slice_out0, 0.29899999499320984)" in model_source
-    assert "concat_out0 = concat_out0_cf" in model_source
+    assert "concat_out0 = torch.cat([add1_out0_cf, add2_out0_cf, add3_out0_cf], dim=1)" in model_source
     assert "torch.tensor_split(concat_out0, 3, dim=_normalize_dim(1, concat_out0.ndim))" in model_source
     assert "mul6_out0 = torch.mul(clip_out0, split_out0)" in model_source
     assert "resize_cubic_h_in = split_out0" in model_source
     assert "torch.matmul(_tmp_y_18, _tmp_x_18), [1, 1, 90, 160])" in model_source
     assert "self.register_buffer('const_Resize_resize_cubic_w_matrix_transposed'" in model_source
-    assert "self.register_buffer('const_Resize_1_resize_cubic_w_matrix_transposed'" in model_source
     assert "def _refresh_transposed_constant_buffers(self) -> None:" in model_source
     assert "self.const_Resize_resize_cubic_w_matrix_transposed.copy_(self.const_Resize_resize_cubic_w_matrix.transpose(-1, -2))" in model_source
     assert "_tmp_x_18 = self.const_Resize_resize_cubic_w_matrix_transposed" in model_source
-    assert "_tmp_x_62 = self.const_Resize_1_resize_cubic_w_matrix_transposed" in model_source
+    assert "self.register_buffer('const_Resize_1_resize_cubic_w_matrix', torch.zeros([1, 1, 320, 160], dtype=torch.float32), persistent=True)" in model_source
+    assert "_tmp_x_62 = self.const_Resize_1_resize_cubic_w_matrix" in model_source
     assert "_tmp_x_18.transpose(-1, -2)" not in model_source
-    assert "_tmp_x_62.transpose(-1, -2)" not in model_source
     assert "torch.as_tensor(1.0, dtype=torch.float32, device=_module_device(self))" not in model_source
     assert "torch.as_tensor(255.0, dtype=torch.float32, device=_module_device(self))" not in model_source
     assert "torch.sub(1.0, clip_out0)" in model_source
@@ -9469,6 +11207,14 @@ def test_export_pytorch_package_generates_native_pidnet_package_when_model_is_av
     assert "self.const_wa_spp_scale3_scale3_1_BatchNormalization_bn_add.permute(*(0, 3, 1, 2)).contiguous()" not in model_source
     assert "_align_binary_inputs(wasppscale1_scale10_average_p_in, self.const_wa_spp_x1_x512_d062, [1, 512, 3, 5])" not in model_source
     assert "_align_binary_inputs(wasppscale1_scale10_average_p_in, self.const_wa_spp_x1_x512_764b, [1, 512, 3, 5])" not in model_source
+    assert re.search(
+        r"_align_binary_inputs\([A-Za-z0-9_]*pag4_sig_out0, [A-Za-z0-9_]*pag4_resize1_out_nhwc, \[1, 64, 24, 40\]\)",
+        model_source,
+    ) is not None
+    assert re.search(
+        r"_binary_lhs_\d+, _binary_rhs_\d+ = [A-Za-z0-9_]*pag4_sig_out0, [A-Za-z0-9_]*pag4_resize1_out_nhwc",
+        model_source,
+    ) is None
     assert "resize3_out_nhwc_cf = _apply_resize(final_layerconv2_cv_out_nhwc_cf, [192, 320], method='bilinear', target_shape=[1, 19, 192, 320], align_corners=True, half_pixel_centers=False, channel_last=False)" in model_source
     assert "out_argmax = torch.argmax(resize3_out_nhwc, dim=_normalize_dim(1, resize3_out_nhwc.ndim), keepdim=False).to(dtype=torch.int64)" in model_source
 
@@ -9497,6 +11243,7 @@ def test_export_pytorch_package_generates_native_pidnet_package_when_model_is_av
     )
     assert dynamo_transpose_names in (
         [],
+        ["node_permute_17"],
         ["node_permute_62"],
         ["node_permute_2", "node_permute_3"],
     )
@@ -10834,6 +12581,52 @@ def test_sanitize_dynamo_exported_onnx_metadata_preserves_transpose_rank3_output
         for dim in sanitized_model.graph.output[0].type.tensor_type.shape.dim
     ]
     assert output_dims == [1, 8400, 85]
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_restores_missing_output_shape_from_package_metadata(tmp_path) -> None:
+    x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1024])
+    y = helper.make_tensor_value_info("loss3/loss3_Y", TensorProto.FLOAT, None)
+    graph = helper.make_graph(
+        [
+            helper.make_node("Softmax", ["input"], ["loss3/loss3_Y"], name="SoftmaxNode", axis=1),
+        ],
+        "softmax_missing_output_shape_graph",
+        [x],
+        [y],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "age_googlenet_dynamo.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "outputs": ["loss3/loss3_Y"],
+                "tensors": {
+                    "loss3/loss3_Y": {
+                        "dtype": "FLOAT32",
+                        "shape": [1, 8],
+                        "shape_signature": [1, 8],
+                        "is_variable": False,
+                        "has_data": False,
+                        "logical_layout": "UNKNOWN",
+                    },
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    output_dims = [
+        int(dim.dim_value)
+        for dim in sanitized_model.graph.output[0].type.tensor_type.shape.dim
+    ]
+    assert output_dims == [1, 8]
 
 
 def test_sanitize_dynamo_exported_onnx_metadata_folds_relu_between_inverse_transposes(tmp_path) -> None:

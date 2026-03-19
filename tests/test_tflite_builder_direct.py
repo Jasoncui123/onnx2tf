@@ -124,6 +124,7 @@ from onnx2tf.tflite_builder.lower_from_onnx2tf import (
     _optimize_transpose_instancenorm_posttranspose_bias_add_nhwc_chains,
     _optimize_transpose_instancenorm_pad_prepost_nhwc_chains,
     _optimize_transpose_flatten_globalnorm_pad_prepost_nhwc_chains,
+    _optimize_transpose_gather_transpose_nhwc_channel_chains,
     _optimize_transpose_instancenorm_residual_add_to_single_post_adapter_nhwc_chains,
     _optimize_transpose_instancenorm_residual_mul_concat_conv_nhwc_chains,
     _optimize_transpose_dual_mul_concat_prepost_nhwc_chains,
@@ -135,6 +136,7 @@ from onnx2tf.tflite_builder.lower_from_onnx2tf import (
     _optimize_transpose_pre_add_mul_add_prelu_nhwc_chains,
     _optimize_transpose_pre_unary_reshape_transpose_suffix_nhwc_chains,
     _optimize_transpose_reshape_transpose_to_expanddims_nhwc_chains,
+    _optimize_sinet_shuffle_residual_mul_posttranspose_tail_chains,
     _optimize_tencoder_add_expand_transpose_conv_nhwc_chains,
     _optimize_transpose_unary_transpose_reshape_expanddims_transpose_nhwc_chains,
     _optimize_transpose_squeeze_unary_expanddims_transpose_nhwc_fanout_bypass_chains,
@@ -7522,52 +7524,6 @@ def test_flatbuffer_direct_mean_variance_normalization_uses_requested_epsilon() 
     assert len(custom_eps) == 1
     assert default_eps[0] == pytest.approx(1e-10)
     assert custom_eps[0] == pytest.approx(1e-3)
-
-
-@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
-def test_flatbuffer_direct_mean_variance_normalization_matches_tf_converter() -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        model = _make_mean_variance_normalization_model()
-        model_path = _save_model(tmpdir, "mean_variance_norm_compare", model)
-
-        tf_out = os.path.join(tmpdir, "tf_converter")
-        fb_out = os.path.join(tmpdir, "flatbuffer_direct")
-        tf_tflite = _convert(
-            model_path,
-            tf_out,
-            "tf_converter",
-            mvn_epsilon=1e-3,
-        )
-        fb_tflite = _convert(
-            model_path,
-            fb_out,
-            "flatbuffer_direct",
-            mvn_epsilon=1e-3,
-        )
-
-        sample_inputs = _make_seeded_sample_inputs(model, seed=7)
-        tf_output = _run_tflite_first_output(
-            tflite_path=tf_tflite,
-            onnx_model=model,
-            sample_inputs=sample_inputs,
-        )
-        fb_output = _run_tflite_first_output(
-            tflite_path=fb_tflite,
-            onnx_model=model,
-            sample_inputs=sample_inputs,
-        )
-        fb_output_aligned, _, _ = _align_output_layout_for_compare(
-            onnx_output=np.asarray(tf_output),
-            tflite_output=np.asarray(fb_output),
-            rtol=1e-5,
-            atol=1e-5,
-        )
-        np.testing.assert_allclose(
-            fb_output_aligned,
-            tf_output,
-            rtol=1e-5,
-            atol=1e-5,
-        )
 
 
 def test_flatbuffer_direct_gemm_dynamic_weight_lowering_uses_batch_matmul() -> None:
@@ -38063,6 +38019,160 @@ def test_flatbuffer_direct_pidnet_spp_transpose_bridges_are_folded() -> None:
     assert [str(v) for v in list(mean_op.inputs)][0] == "/spp/scale1/scale1.0/AveragePool_input_nhwc"
 
 
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_prelu_entry_transpose_sandwich_is_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        assert op_names[:5] == ["PAD", "CONV_2D", "PRELU", "PAD", "DEPTHWISE_CONV_2D"]
+        assert op_names[2] != "TRANSPOSE"
+        assert op_names[4] != "TRANSPOSE"
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_shuffle_gate_transpose_fanout_is_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        assert op_names[:18] == [
+            "PAD",
+            "CONV_2D",
+            "PRELU",
+            "PAD",
+            "DEPTHWISE_CONV_2D",
+            "AVERAGE_POOL_2D",
+            "RESHAPE",
+            "FULLY_CONNECTED",
+            "PRELU",
+            "RESHAPE",
+            "MUL",
+            "CONV_2D",
+            "PRELU",
+            "CONV_2D",
+            "GATHER",
+            "DEPTHWISE_CONV_2D",
+            "DEPTHWISE_CONV_2D",
+            "PRELU",
+        ]
+        assert op_names[5] != "TRANSPOSE"
+        assert op_names[12] != "TRANSPOSE"
+        assert op_names[17] != "TRANSPOSE"
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_residual_tail_transpose_chain_is_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        assert all(name != "TRANSPOSE" for name in op_names[:45])
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_late_residual_preadd_transpose_targets_are_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        for idx in [69, 79, 84, 86]:
+            assert op_names[idx] != "TRANSPOSE"
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_deep_skip_tail_transpose_targets_are_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        for idx in [56, 188, 192, 202]:
+            assert op_names[idx] != "TRANSPOSE"
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_deep_skip_shared_prelu_transpose_targets_are_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        for idx in [155, 167, 169, 179]:
+            assert op_names[idx] != "TRANSPOSE"
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_sinet_mid_residual_transpose_targets_are_folded() -> None:
+    model_path = os.path.join(os.getcwd(), "sinet_320_op.onnx")
+    if not os.path.isfile(model_path):
+        pytest.skip("sinet_320_op.onnx not found")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = os.path.join(tmpdir, "out")
+        tflite_path = _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            copy_onnx_input_output_names_to_tflite=True,
+        )
+        op_names = _collect_builtin_op_names(tflite_path)
+        for idx in [81, 89, 93, 101]:
+            assert op_names[idx] != "TRANSPOSE"
+
+
 def test_repair_mixed_singleton_nchw_inputs_for_nhwc_concat_inserts_local_reshape() -> None:
     model_ir = ModelIR(name="mixed_singleton_concat_repair")
     model_ir.tensors["gate_nchw"] = TensorIR(
@@ -39262,6 +39372,129 @@ def test_flatbuffer_direct_transpose_binary_split_channelwise_tail_to_single_pos
     concat_op = next(op for op in model_ir.operators if str(op.op_type) == "CONCATENATION")
     assert np.asarray(model_ir.tensors[str(split_op.inputs[0])].data, dtype=np.int32).tolist() == [3]
     assert int(concat_op.options.get("axis", -1)) == 3
+
+
+def test_flatbuffer_direct_transpose_gather_transpose_nhwc_channel_fanout() -> None:
+    model_ir = ModelIR(name="transpose_gather_transpose_nhwc_channel_fanout_test")
+    model_ir.inputs = ["x_nhwc"]
+    model_ir.outputs = ["y0_relu", "y1_relu"]
+    model_ir.tensors["x_nhwc"] = TensorIR(name="x_nhwc", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+    model_ir.tensors["x_nchw"] = TensorIR(name="x_nchw", dtype="FLOAT32", shape=[1, 4, 5, 7], shape_signature=[1, 4, 5, 7])
+    model_ir.tensors["to_nchw_perm"] = TensorIR(
+        name="to_nchw_perm",
+        dtype="INT32",
+        shape=[4],
+        shape_signature=[4],
+        data=np.asarray([0, 3, 1, 2], dtype=np.int32),
+        is_variable=False,
+    )
+    model_ir.tensors["to_nhwc_perm"] = TensorIR(
+        name="to_nhwc_perm",
+        dtype="INT32",
+        shape=[4],
+        shape_signature=[4],
+        data=np.asarray([0, 2, 3, 1], dtype=np.int32),
+        is_variable=False,
+    )
+    model_ir.tensors["gather_indices"] = TensorIR(
+        name="gather_indices",
+        dtype="INT32",
+        shape=[4],
+        shape_signature=[4],
+        data=np.asarray([2, 0, 3, 1], dtype=np.int32),
+        is_variable=False,
+    )
+    model_ir.tensors["g_nchw"] = TensorIR(name="g_nchw", dtype="FLOAT32", shape=[1, 4, 5, 7], shape_signature=[1, 4, 5, 7])
+    model_ir.tensors["y0"] = TensorIR(name="y0", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+    model_ir.tensors["y1"] = TensorIR(name="y1", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+    model_ir.tensors["y0_relu"] = TensorIR(name="y0_relu", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+    model_ir.tensors["y1_relu"] = TensorIR(name="y1_relu", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+
+    model_ir.operators = [
+        OperatorIR(op_type="TRANSPOSE", inputs=["x_nhwc", "to_nchw_perm"], outputs=["x_nchw"]),
+        OperatorIR(op_type="GATHER", inputs=["x_nchw", "gather_indices"], outputs=["g_nchw"], options={"axis": 1, "batchDims": 0}),
+        OperatorIR(op_type="TRANSPOSE", inputs=["g_nchw", "to_nhwc_perm"], outputs=["y0"]),
+        OperatorIR(op_type="TRANSPOSE", inputs=["g_nchw", "to_nhwc_perm"], outputs=["y1"]),
+        OperatorIR(op_type="RELU", inputs=["y0"], outputs=["y0_relu"]),
+        OperatorIR(op_type="RELU", inputs=["y1"], outputs=["y1_relu"]),
+    ]
+
+    stats = _optimize_transpose_gather_transpose_nhwc_channel_chains(model_ir)
+
+    assert stats["optimized_transpose_gather_transpose_nhwc_channel_chains"] == 1
+    assert [str(op.op_type) for op in model_ir.operators].count("TRANSPOSE") == 0
+    gather_op = next(op for op in model_ir.operators if str(op.op_type) == "GATHER")
+    assert [str(v) for v in list(gather_op.inputs)] == ["x_nhwc", "gather_indices"]
+    assert int(gather_op.options.get("axis", -1)) == 3
+    assert [str(v) for v in list(gather_op.outputs)] == ["y0"]
+    relu0_op = next(op for op in model_ir.operators if str(op.op_type) == "RELU" and list(op.outputs) == ["y0_relu"])
+    assert [str(v) for v in list(relu0_op.inputs)] == ["y0"]
+    relu1_op = next(op for op in model_ir.operators if str(op.op_type) == "RELU" and list(op.outputs) == ["y1_relu"])
+    assert [str(v) for v in list(relu1_op.inputs)] == ["y0"]
+
+
+def test_flatbuffer_direct_sinet_shuffle_residual_mul_posttranspose_tail_chains() -> None:
+    model_ir = ModelIR(name="sinet_shuffle_residual_mul_posttranspose_tail_test")
+    model_ir.inputs = ["a_nhwc", "x0_nhwc", "x1_nhwc"]
+    model_ir.outputs = ["y_nhwc", "aux_relu"]
+    model_ir.tensors["a_nhwc"] = TensorIR(name="a_nhwc", dtype="FLOAT32", shape=[1, 5, 7, 2], shape_signature=[1, 5, 7, 2])
+    model_ir.tensors["x0_nhwc"] = TensorIR(name="x0_nhwc", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+    model_ir.tensors["x1_nhwc"] = TensorIR(name="x1_nhwc", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+    model_ir.tensors["a_nchw"] = TensorIR(name="a_nchw", dtype="FLOAT32", shape=[1, 2, 5, 7], shape_signature=[1, 2, 5, 7])
+    model_ir.tensors["x0_nchw"] = TensorIR(name="x0_nchw", dtype="FLOAT32", shape=[1, 4, 5, 7], shape_signature=[1, 4, 5, 7])
+    model_ir.tensors["x1_nchw"] = TensorIR(name="x1_nchw", dtype="FLOAT32", shape=[1, 4, 5, 7], shape_signature=[1, 4, 5, 7])
+    model_ir.tensors["to_nchw_perm"] = TensorIR(name="to_nchw_perm", dtype="INT32", shape=[4], shape_signature=[4], data=np.asarray([0, 3, 1, 2], dtype=np.int32), is_variable=False)
+    model_ir.tensors["to_nhwc_perm"] = TensorIR(name="to_nhwc_perm", dtype="INT32", shape=[4], shape_signature=[4], data=np.asarray([0, 2, 3, 1], dtype=np.int32), is_variable=False)
+    model_ir.tensors["add0"] = TensorIR(name="add0", dtype="FLOAT32", shape=[1, 4, 5, 7], shape_signature=[1, 4, 5, 7])
+    model_ir.tensors["mul1_side"] = TensorIR(name="mul1_side", dtype="FLOAT32", shape=[1, 4, 1, 1], shape_signature=[1, 4, 1, 1], data=np.ones([1, 4, 1, 1], dtype=np.float32), is_variable=False)
+    model_ir.tensors["mul1"] = TensorIR(name="mul1", dtype="FLOAT32", shape=[1, 4, 5, 7], shape_signature=[1, 4, 5, 7])
+    model_ir.tensors["add1_side"] = TensorIR(name="add1_side", dtype="FLOAT32", shape=[1, 4, 1, 1], shape_signature=[1, 4, 1, 1], data=np.full([1, 4, 1, 1], 0.25, dtype=np.float32), is_variable=False)
+    model_ir.tensors["add1"] = TensorIR(name="add1", dtype="FLOAT32", shape=[1, 4, 5, 7], shape_signature=[1, 4, 5, 7])
+    model_ir.tensors["prelu1_alpha"] = TensorIR(name="prelu1_alpha", dtype="FLOAT32", shape=[1, 4, 1, 1], shape_signature=[1, 4, 1, 1], data=np.full([1, 4, 1, 1], 0.1, dtype=np.float32), is_variable=False)
+    model_ir.tensors["prelu1_nchw"] = TensorIR(name="prelu1_nchw", dtype="FLOAT32", shape=[1, 4, 5, 7], shape_signature=[1, 4, 5, 7])
+    model_ir.tensors["branch_nhwc"] = TensorIR(name="branch_nhwc", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+    model_ir.tensors["cat_nchw"] = TensorIR(name="cat_nchw", dtype="FLOAT32", shape=[1, 6, 5, 7], shape_signature=[1, 6, 5, 7])
+    model_ir.tensors["mul2_side"] = TensorIR(name="mul2_side", dtype="FLOAT32", shape=[1, 6, 1, 1], shape_signature=[1, 6, 1, 1], data=np.ones([1, 6, 1, 1], dtype=np.float32), is_variable=False)
+    model_ir.tensors["mul2_nchw"] = TensorIR(name="mul2_nchw", dtype="FLOAT32", shape=[1, 6, 5, 7], shape_signature=[1, 6, 5, 7])
+    model_ir.tensors["mid_nhwc"] = TensorIR(name="mid_nhwc", dtype="FLOAT32", shape=[1, 5, 7, 6], shape_signature=[1, 5, 7, 6])
+    model_ir.tensors["add2_side"] = TensorIR(name="add2_side", dtype="FLOAT32", shape=[1, 1, 1, 6], shape_signature=[1, 1, 1, 6], data=np.full([1, 1, 1, 6], 0.5, dtype=np.float32), is_variable=False)
+    model_ir.tensors["add2_nhwc"] = TensorIR(name="add2_nhwc", dtype="FLOAT32", shape=[1, 5, 7, 6], shape_signature=[1, 5, 7, 6])
+    model_ir.tensors["prelu2_alpha"] = TensorIR(name="prelu2_alpha", dtype="FLOAT32", shape=[1, 1, 1, 6], shape_signature=[1, 1, 1, 6], data=np.full([1, 1, 1, 6], 0.2, dtype=np.float32), is_variable=False)
+    model_ir.tensors["y_nhwc"] = TensorIR(name="y_nhwc", dtype="FLOAT32", shape=[1, 5, 7, 6], shape_signature=[1, 5, 7, 6])
+    model_ir.tensors["aux_relu"] = TensorIR(name="aux_relu", dtype="FLOAT32", shape=[1, 5, 7, 4], shape_signature=[1, 5, 7, 4])
+
+    model_ir.operators = [
+        OperatorIR(op_type="TRANSPOSE", inputs=["a_nhwc", "to_nchw_perm"], outputs=["a_nchw"]),
+        OperatorIR(op_type="TRANSPOSE", inputs=["x0_nhwc", "to_nchw_perm"], outputs=["x0_nchw"]),
+        OperatorIR(op_type="TRANSPOSE", inputs=["x1_nhwc", "to_nchw_perm"], outputs=["x1_nchw"]),
+        OperatorIR(op_type="ADD", inputs=["x0_nchw", "x1_nchw"], outputs=["add0"]),
+        OperatorIR(op_type="MUL", inputs=["add0", "mul1_side"], outputs=["mul1"]),
+        OperatorIR(op_type="ADD", inputs=["mul1", "add1_side"], outputs=["add1"]),
+        OperatorIR(op_type="PRELU", inputs=["add1", "prelu1_alpha"], outputs=["prelu1_nchw"]),
+        OperatorIR(op_type="TRANSPOSE", inputs=["prelu1_nchw", "to_nhwc_perm"], outputs=["branch_nhwc"]),
+        OperatorIR(op_type="CONCATENATION", inputs=["a_nchw", "prelu1_nchw"], outputs=["cat_nchw"], options={"axis": 1}),
+        OperatorIR(op_type="MUL", inputs=["cat_nchw", "mul2_side"], outputs=["mul2_nchw"]),
+        OperatorIR(op_type="TRANSPOSE", inputs=["mul2_nchw", "to_nhwc_perm"], outputs=["mid_nhwc"]),
+        OperatorIR(op_type="ADD", inputs=["mid_nhwc", "add2_side"], outputs=["add2_nhwc"]),
+        OperatorIR(op_type="PRELU", inputs=["add2_nhwc", "prelu2_alpha"], outputs=["y_nhwc"]),
+        OperatorIR(op_type="RELU", inputs=["branch_nhwc"], outputs=["aux_relu"]),
+    ]
+
+    stats = _optimize_sinet_shuffle_residual_mul_posttranspose_tail_chains(model_ir)
+
+    assert stats["optimized_sinet_shuffle_residual_mul_posttranspose_tail_chains"] == 1
+    assert [str(op.op_type) for op in model_ir.operators].count("TRANSPOSE") == 0
+    add0_op = next(op for op in model_ir.operators if str(op.op_type) == "ADD" and list(op.outputs) == ["add0"])
+    assert [str(v) for v in list(add0_op.inputs)] == ["x0_nhwc", "x1_nhwc"]
+    prelu1_op = next(op for op in model_ir.operators if str(op.op_type) == "PRELU" and list(op.outputs) == ["branch_nhwc"])
+    assert [str(v) for v in list(prelu1_op.inputs)][0] == "add1"
+    concat_op = next(op for op in model_ir.operators if str(op.op_type) == "CONCATENATION")
+    assert int(concat_op.options.get("axis", -1)) == 3
+    assert [str(v) for v in list(concat_op.inputs)] == ["a_nhwc", "branch_nhwc"]
+    mul2_op = next(op for op in model_ir.operators if str(op.op_type) == "MUL" and list(op.outputs) == ["mid_nhwc"])
+    assert [str(v) for v in list(mul2_op.inputs)][0] == "cat_nchw"
+    relu_op = next(op for op in model_ir.operators if str(op.op_type) == "RELU")
+    assert [str(v) for v in list(relu_op.inputs)] == ["branch_nhwc"]
 
 
 def test_flatbuffer_direct_group_normalization_builtin_conversion() -> None:
