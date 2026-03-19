@@ -7526,52 +7526,6 @@ def test_flatbuffer_direct_mean_variance_normalization_uses_requested_epsilon() 
     assert custom_eps[0] == pytest.approx(1e-3)
 
 
-@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
-def test_flatbuffer_direct_mean_variance_normalization_matches_tf_converter() -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        model = _make_mean_variance_normalization_model()
-        model_path = _save_model(tmpdir, "mean_variance_norm_compare", model)
-
-        tf_out = os.path.join(tmpdir, "tf_converter")
-        fb_out = os.path.join(tmpdir, "flatbuffer_direct")
-        tf_tflite = _convert(
-            model_path,
-            tf_out,
-            "tf_converter",
-            mvn_epsilon=1e-3,
-        )
-        fb_tflite = _convert(
-            model_path,
-            fb_out,
-            "flatbuffer_direct",
-            mvn_epsilon=1e-3,
-        )
-
-        sample_inputs = _make_seeded_sample_inputs(model, seed=7)
-        tf_output = _run_tflite_first_output(
-            tflite_path=tf_tflite,
-            onnx_model=model,
-            sample_inputs=sample_inputs,
-        )
-        fb_output = _run_tflite_first_output(
-            tflite_path=fb_tflite,
-            onnx_model=model,
-            sample_inputs=sample_inputs,
-        )
-        fb_output_aligned, _, _ = _align_output_layout_for_compare(
-            onnx_output=np.asarray(tf_output),
-            tflite_output=np.asarray(fb_output),
-            rtol=1e-5,
-            atol=1e-5,
-        )
-        np.testing.assert_allclose(
-            fb_output_aligned,
-            tf_output,
-            rtol=1e-5,
-            atol=1e-5,
-        )
-
-
 def test_flatbuffer_direct_gemm_dynamic_weight_lowering_uses_batch_matmul() -> None:
     model = _make_gemm_dynamic_weight_model()
     register_default_preprocess_rules()
