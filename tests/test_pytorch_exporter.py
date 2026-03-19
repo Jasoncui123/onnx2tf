@@ -1049,6 +1049,42 @@ def test_apply_fast_precanonicalize_repairs_propagates_cf_aliases_to_softmax_and
     assert "out_public_layout_bridge = torch.cat([box_out_cf, obj_out_cf, cls_scores], dim=1)" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_fix_pool_lrn_conv_cf_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_pool_lrn_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, p13_x3_s2_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 56, 56, 64], is_max_pool=True, channel_last=False)",
+                "        p1_norm1_out_nhwc = F.local_response_norm(p13_x3_s2_out, size=5, alpha=2e-5, beta=0.75, k=1.0)",
+                "        cv23_x3_in_cf = self.conv_block_1(p1_norm1_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        return cv23_x3_in_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf, filter_height=3, filter_width=3, "
+        "stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 64, 56, 56], "
+        "is_max_pool=True, channel_last=False)"
+        in rewritten
+    )
+    assert "cv23_x3_in_cf = self.conv_block_1(p1_norm1_out_nhwc)" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_does_not_inject_humanseg_resize_aliases_without_markers(
     tmp_path,
 ) -> None:
@@ -2125,6 +2161,41 @@ def test_canonicalize_generated_model_source_rewrites_direct_torch_cat_after_cf_
         in rewritten
     )
     assert "out = torch.cat([other_cf, resize_out_nhwc], dim=1)" in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_channel_last_pool_before_lrn(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pool_before_lrn_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, p13_x3_s2_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 56, 56, 64], is_max_pool=True, channel_last=True)",
+                "        p1_norm1_out_nhwc = F.local_response_norm(p13_x3_s2_out, size=5, alpha=2e-5, beta=0.75, k=1.0)",
+                "        cv23_x3_in_cf = self.conv_block_1(p1_norm1_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        return cv23_x3_in_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf, filter_height=3, filter_width=3, "
+        "stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 56, 56, 64], "
+        "is_max_pool=True, channel_last=True)"
+        in rewritten
+    )
+    assert "channel_last=False" not in rewritten
 
 
 def test_canonicalize_generated_model_source_restores_rank3_reshape_materialize_for_channel_last_rank4_source(
@@ -12510,6 +12581,52 @@ def test_sanitize_dynamo_exported_onnx_metadata_preserves_transpose_rank3_output
         for dim in sanitized_model.graph.output[0].type.tensor_type.shape.dim
     ]
     assert output_dims == [1, 8400, 85]
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_restores_missing_output_shape_from_package_metadata(tmp_path) -> None:
+    x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1024])
+    y = helper.make_tensor_value_info("loss3/loss3_Y", TensorProto.FLOAT, None)
+    graph = helper.make_graph(
+        [
+            helper.make_node("Softmax", ["input"], ["loss3/loss3_Y"], name="SoftmaxNode", axis=1),
+        ],
+        "softmax_missing_output_shape_graph",
+        [x],
+        [y],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 17)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "age_googlenet_dynamo.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "outputs": ["loss3/loss3_Y"],
+                "tensors": {
+                    "loss3/loss3_Y": {
+                        "dtype": "FLOAT32",
+                        "shape": [1, 8],
+                        "shape_signature": [1, 8],
+                        "is_variable": False,
+                        "has_data": False,
+                        "logical_layout": "UNKNOWN",
+                    },
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    output_dims = [
+        int(dim.dim_value)
+        for dim in sanitized_model.graph.output[0].type.tensor_type.shape.dim
+    ]
+    assert output_dims == [1, 8]
 
 
 def test_sanitize_dynamo_exported_onnx_metadata_folds_relu_between_inverse_transposes(tmp_path) -> None:

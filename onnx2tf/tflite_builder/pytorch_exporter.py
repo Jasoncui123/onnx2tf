@@ -14661,6 +14661,53 @@ def _suppress_torch_onnx_optional_registration_warnings() -> None:
         pass
 
 
+def _restore_missing_onnx_output_shapes_from_package_metadata(
+    model: onnx.ModelProto,
+    *,
+    package_dir: Path,
+) -> None:
+    metadata_path = package_dir / "metadata.json"
+    if not metadata_path.exists():
+        return
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except Exception:
+        return
+    tensor_meta_map = metadata.get("tensors", {})
+    if not isinstance(tensor_meta_map, dict):
+        return
+    for output in model.graph.output:
+        tensor_type = getattr(output.type, "tensor_type", None)
+        if tensor_type is None:
+            continue
+        shape = getattr(tensor_type, "shape", None)
+        if shape is None or len(list(shape.dim)) != 0:
+            continue
+        tensor_meta = tensor_meta_map.get(str(output.name), {})
+        if not isinstance(tensor_meta, dict):
+            continue
+        shape_values = tensor_meta.get("shape_signature", tensor_meta.get("shape", []))
+        if not isinstance(shape_values, list):
+            shape_values = tensor_meta.get("shape", [])
+        if not isinstance(shape_values, list) or len(shape_values) == 0:
+            continue
+        for dim_index, raw_dim_value in enumerate(shape_values):
+            output_dim = shape.dim.add()
+            try:
+                dim_value = int(raw_dim_value)
+            except Exception:
+                output_dim.dim_param = str(raw_dim_value)
+                continue
+            if dim_value > 0:
+                output_dim.dim_value = dim_value
+            else:
+                sanitized_output_name = re.sub(r"[^0-9A-Za-z_]", "_", str(output.name)).strip("_")
+                if sanitized_output_name == "":
+                    sanitized_output_name = "output"
+                output_dim.dim_param = f"{sanitized_output_name}_dim_{dim_index}"
+
+
 def _sanitize_dynamo_exported_onnx_metadata(onnx_path: Path) -> None:
     external_data_sidecar_path = onnx_path.with_name(f"{onnx_path.name}.data")
     original_uses_external_data = _inspect_onnx_uses_external_data(onnx_path)
@@ -14675,6 +14722,7 @@ def _sanitize_dynamo_exported_onnx_metadata(onnx_path: Path) -> None:
     import onnx2tf.gs as gs
     model = gs.export_onnx(gs.import_onnx(model).cleanup().toposort())
     _onnx_repair_inferred_shapes_in_place(model)
+    _restore_missing_onnx_output_shapes_from_package_metadata(model, package_dir=onnx_path.parent)
     del model.metadata_props[:]
     _clear_onnx_graph_and_node_metadata_in_place(model.graph)
     onnx.checker.check_model(model)
@@ -19513,6 +19561,9 @@ def _canonicalize_generated_model_source_for_raw_export(
     apply_pool2d_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<shape>[0-9, ]+)\], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
+    local_response_norm_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.local_response_norm\((?P<input>[A-Za-z0-9_]+), size=(?P<size>\d+), alpha=(?P<alpha>[-+0-9.eE]+), beta=(?P<beta>[-+0-9.eE]+), k=(?P<k>[-+0-9.eE]+)\)$"
+    )
     cf_nhwc_materialize_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
@@ -19846,6 +19897,16 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and str(reshape_match.group("input")) == name
             ):
                 return True
+        return False
+
+    def _has_nearby_local_response_norm_consumer(name: str, line_index: int) -> bool:
+        function_end = _function_end_index(line_index)
+        for future_index in range(line_index + 1, min(function_end, line_index + 4)):
+            future_line = lines[future_index]
+            if future_line.strip() == "":
+                continue
+            lrn_match = local_response_norm_re.match(future_line)
+            return lrn_match is not None and str(lrn_match.group("input")) == name
         return False
 
     def _find_stage_boundary_cat_consumer(name: str, line_index: int) -> Optional[re.Match[str]]:
@@ -20578,8 +20639,11 @@ def _canonicalize_generated_model_source_for_raw_export(
         generic_pool2d_match = apply_pool2d_re.match(lines[index])
         if generic_pool2d_match is not None:
             input_name = str(generic_pool2d_match.group("input"))
+            lhs = str(generic_pool2d_match.group("lhs"))
             if (
                 str(generic_pool2d_match.group("channel_last")) == "True"
+                and not _declares_channel_last_name(lhs)
+                and not _has_nearby_local_response_norm_consumer(lhs, index)
                 and (
                     (
                         _is_known_cf_name(input_name, singleton_cf_seeds)
@@ -20589,7 +20653,6 @@ def _canonicalize_generated_model_source_for_raw_export(
                 )
             ):
                 indent = str(generic_pool2d_match.group("indent"))
-                lhs = str(generic_pool2d_match.group("lhs"))
                 rest = str(generic_pool2d_match.group("rest"))
                 shape_values = [
                     int(value.strip())
@@ -23749,8 +23812,16 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     changed = False
     cf_like_names: set[str] = set()
     const_channel_counts: Dict[str, int] = {}
+    conv_block_out_channels: Dict[str, int] = {}
+    module_output_producers: Dict[str, str] = {}
+    pending_conv_block_name: str | None = None
     register_buffer_re = re.compile(
         r"^\s*self\.register_buffer\('(?P<name>[A-Za-z0-9_]+)', torch\.zeros\(\[(?P<shape>[0-9, ]+)\], dtype=torch\.[A-Za-z0-9_]+\), persistent=(?:True|False)\)$"
+    )
+    conv_block_decl_re = re.compile(r"^\s*self\.(?P<module>conv_block_[0-9]+) = _Conv2dBlock\($")
+    out_channels_re = re.compile(r"^\s*out_channels=(?P<channels>\d+),$")
+    module_output_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\("
     )
     singleton_reshape_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
@@ -23797,8 +23868,14 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     apply_resize_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
+    apply_pool2d_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+    )
     apply_softmax_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+    )
+    local_response_norm_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.local_response_norm\((?P<input>[A-Za-z0-9_]+), size=(?P<size>\d+), alpha=(?P<alpha>[-+0-9.eE]+), beta=(?P<beta>[-+0-9.eE]+), k=(?P<k>[-+0-9.eE]+)\)$"
     )
     reduce_max_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _reduce_max\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
@@ -23813,6 +23890,22 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>const_tensor786_expand_x80_x2_af49), \[1, 2, 80, 80\]\)$"
     )
     for line in lines:
+        conv_block_decl_match = conv_block_decl_re.match(line)
+        if conv_block_decl_match is not None:
+            pending_conv_block_name = str(conv_block_decl_match.group("module"))
+            continue
+        out_channels_match = out_channels_re.match(line)
+        if out_channels_match is not None:
+            if pending_conv_block_name is not None:
+                conv_block_out_channels[pending_conv_block_name] = int(out_channels_match.group("channels"))
+                pending_conv_block_name = None
+            continue
+        module_output_assign_match = module_output_assign_re.match(line)
+        if module_output_assign_match is not None:
+            module_output_producers[str(module_output_assign_match.group("lhs"))] = str(
+                module_output_assign_match.group("module")
+            )
+        pending_conv_block_name = None
         register_buffer_match = register_buffer_re.match(line)
         if register_buffer_match is None:
             continue
@@ -23936,6 +24029,60 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 )
                 cf_like_names.add(str(apply_resize_match.group("lhs")))
                 changed = True
+        apply_pool2d_match = apply_pool2d_re.match(line)
+        if apply_pool2d_match is not None:
+            input_name = str(apply_pool2d_match.group("input"))
+            next_nonempty_line = ""
+            for lookahead in range(index + 1, min(len(lines), index + 4)):
+                if lines[lookahead].strip() == "":
+                    continue
+                next_nonempty_line = str(lines[lookahead])
+                break
+            next_lrn_match = local_response_norm_re.match(next_nonempty_line)
+            if (
+                str(apply_pool2d_match.group("channel_last")) == "False"
+                and (
+                    input_name in cf_like_names
+                    or input_name.endswith("_cf")
+                    or input_name.endswith("_out_cf")
+                )
+                and next_lrn_match is not None
+                and str(next_lrn_match.group("input")) == str(apply_pool2d_match.group("lhs"))
+            ):
+                input_channel_count = conv_block_out_channels.get(
+                    module_output_producers.get(input_name, ""),
+                    None,
+                )
+                channel_count = (
+                    int(input_channel_count)
+                    if input_channel_count is not None
+                    else max(
+                        int(apply_pool2d_match.group("h")),
+                        int(apply_pool2d_match.group("w")),
+                        int(apply_pool2d_match.group("c")),
+                    )
+                )
+                spatial_dims = [
+                    int(apply_pool2d_match.group("h")),
+                    int(apply_pool2d_match.group("w")),
+                    int(apply_pool2d_match.group("c")),
+                ]
+                if channel_count in spatial_dims:
+                    spatial_dims.remove(channel_count)
+                if len(spatial_dims) != 2:
+                    spatial_dims = [
+                        int(apply_pool2d_match.group("h")),
+                        int(apply_pool2d_match.group("w")),
+                    ]
+                lines[index] = (
+                    f"{apply_pool2d_match.group('indent')}{apply_pool2d_match.group('lhs')} = _apply_pool2d("
+                    f"{input_name}, {apply_pool2d_match.group('rest')}, "
+                    f"target_shape=[{apply_pool2d_match.group('n')}, {channel_count}, "
+                    f"{spatial_dims[0]}, {spatial_dims[1]}], "
+                    f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=False)"
+                )
+                cf_like_names.add(str(apply_pool2d_match.group("lhs")))
+                changed = True
         apply_concat_match = apply_concat_re.match(line)
         if apply_concat_match is not None:
             concat_inputs = [
@@ -24005,6 +24152,15 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 )
                 cf_like_names.add(str(aligned_bn_const_match.group("lhs")))
                 changed = True
+        local_response_norm_match = local_response_norm_re.match(line)
+        if local_response_norm_match is not None:
+            input_name = str(local_response_norm_match.group("input"))
+            if (
+                input_name in cf_like_names
+                or input_name.endswith("_cf")
+                or input_name.endswith("_out_cf")
+            ):
+                cf_like_names.add(str(local_response_norm_match.group("lhs")))
         softmax_match = apply_softmax_re.match(line)
         if softmax_match is not None:
             input_name = str(softmax_match.group("input"))
