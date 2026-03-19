@@ -62,6 +62,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _rewrite_generated_model_source_for_exported_program,
     _rewrite_channel_last_binary_bridge_chains,
     _rewrite_channel_last_gap_means_to_reduce_mean,
+    _onnx_repair_inferred_shapes_in_place,
     _sanitize_dynamo_exported_onnx_metadata,
     _should_avoid_model_ir_in_raw_canonicalize_for_native_package,
     _should_skip_expensive_raw_canonicalize_for_native_package,
@@ -926,6 +927,150 @@ def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis(
         in rewritten
     )
     assert "depth_to_in_reordered = upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_stage(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alike_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_1(self, scores_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:",
+                "        wadkd_flatten4_out0 = torch.reshape(scores_map, [61440, 64])",
+                "        wadkd_or_out0 = scores_map",
+                "        return (scores_map, wadkd_flatten4_out0, wadkd_or_out0)",
+                "    def _forward_stage_7(self, wadkd_mul29_out0: torch.Tensor, wadkd_add2_out0: torch.Tensor, wadkd_add7_out0: torch.Tensor, wadkd_add4_out0: torch.Tensor, wadkd_add10_out0: torch.Tensor, wadkd_div3_out0: torch.Tensor, wadkd_tr1_out0: torch.Tensor, wadkd_tr3_out0: torch.Tensor, wadkd_tr2_out0: torch.Tensor, wadkd_tr4_out0: torch.Tensor, wadkd_cast5_out0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        descriptors = _torch_permute(wadkd_div3_out0, [1, 0])",
+                "        wadkd_equal_out0 = _align_tensor_to_target_shape(torch.eq(wadkd_max_p_in, wadkd_max_p_out), [1, 192, 320, 1])",
+                "        wadkd_equal_out0_nchw = torch.reshape(wadkd_equal_out0.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_max_p1_out0 = torch.reshape(wadkd_max_p1_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_max_p2_out0 = torch.reshape(wadkd_max_p2_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_max_p3_out0 = torch.reshape(wadkd_max_p3_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_max_p4_out0 = torch.reshape(wadkd_max_p4_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])",
+                "        wadkd_less_out0 = torch.reshape(torch.lt(wadkd_split1_out0, 0.0), [1, 1, 1, 1])",
+                "        wadkd_add_out0 = torch.reshape(torch.add(wadkd_floor_out0, 1.0), [1, 1, 1, 1])",
+                "        wadkd_and2_out0 = torch.reshape(torch.logical_and(wadkd_not2_out0, wadkd_not3_out0), [1, 1, 1, 1])",
+                "        wadkd_mul21_out0 = torch.reshape(torch.mul(wadkd_floor_out0, wadkd_cast5_out0), [1, 1, 1, 1])",
+                "        wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.float32)",
+                "        wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320.0), [1])",
+                "        wadkd_mul16_out0 = _align_tensor_to_target_shape(torch.mul(wadkd_cast4_out0, self.const_inline_literal_0), [1, 2])",
+                "        wadkd_reduce_l2_out0_reduce_l2_squared = _align_tensor_to_target_shape(torch.mul(wadkd_tr17_out0, wadkd_tr17_out0), [64, 1])",
+                "        _binary_rhs_191, _binary_lhs_191 = _align_binary_inputs_to_anchor(wadkd_expand23_out0_expand_ones, wadkd_clip_out0, [1, 1])",
+                "        wadkd_expand23_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_191, _binary_rhs_191), [1, 1])",
+                "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs_to_anchor(wadkd_tr17_out0, wadkd_expand23_out0, [64, 1])",
+                "        wadkd_div3_out0 = _align_tensor_to_target_shape(torch.div(_binary_lhs_196, _binary_rhs_196), [64, 1])",
+                "        wadkd_shape13_out0 = _shape_tensor(wadkd_add3_out0, dtype=torch.int32, device=wadkd_add3_out0.device)",
+                "        wadkd_shape17_out0 = _shape_tensor(wadkd_add8_out0, dtype=torch.int32, device=wadkd_add8_out0.device)",
+                "        wadkd_shape15_out0 = _shape_tensor(wadkd_add5_out0, dtype=torch.int32, device=wadkd_add5_out0.device)",
+                "        wadkd_shape19_out0 = _shape_tensor(wadkd_add11_out0, dtype=torch.int32, device=wadkd_add11_out0.device)",
+                "        wadkd_rs13_out0 = torch.reshape(wadkd_gather7_out0, _resolve_reshape_shape([-1, 1], wadkd_gather7_out0, allow_zero=False))",
+                "        wadkd_concat17_out0 = _apply_concat([self.const_inline_literal_5, wadkd_shape13_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs17_out0 = torch.reshape(wadkd_gather15_out0, _resolve_reshape_shape([-1, 1], wadkd_gather15_out0, allow_zero=False))",
+                "        wadkd_concat21_out0 = _apply_concat([self.const_inline_literal_5, wadkd_shape17_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs15_out0 = torch.reshape(wadkd_gather11_out0, _resolve_reshape_shape([-1, 1], wadkd_gather11_out0, allow_zero=False))",
+                "        wadkd_concat19_out0 = _apply_concat([self.const_inline_literal_5, wadkd_shape15_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs19_out0 = torch.reshape(wadkd_gather19_out0, _resolve_reshape_shape([-1, 1], wadkd_gather19_out0, allow_zero=False))",
+                "        wadkd_concat23_out0 = _apply_concat([self.const_inline_literal_5, wadkd_shape19_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_tr7_out0 = _torch_permute(wadkd_rs13_out0, [1, 0])",
+                "        wadkd_tr11_out0 = _torch_permute(wadkd_rs17_out0, [1, 0])",
+                "        wadkd_tr9_out0 = _torch_permute(wadkd_rs15_out0, [1, 0])",
+                "        wadkd_tr13_out0 = _torch_permute(wadkd_rs19_out0, [1, 0])",
+                "        wadkd_rs14_out0_rs_shape_dim0 = wadkd_concat17_out0.reshape(-1)[:1]",
+                "        wadkd_rs14_out0_rs_in_shape = _shape_tensor(wadkd_tr7_out0, dtype=torch.int32, device=wadkd_tr7_out0.device)",
+                "        wadkd_rs14_out0_rs_in_dim0 = wadkd_rs14_out0_rs_in_shape.reshape(-1)[:1]",
+                "        wadkd_rs14_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs14_out0_rs_shape_dim0, 0), [1])",
+                "        wadkd_rs14_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs14_out0_rs_shape_dim0_is_zero, wadkd_rs14_out0_rs_in_dim0, wadkd_rs14_out0_rs_shape_dim0)",
+                "        wadkd_rs14_out0_rs_shape_tail = wadkd_concat17_out0.reshape(-1)[1:]",
+                "        wadkd_rs14_out0_rs_shape_fixed = _apply_concat([wadkd_rs14_out0_rs_shape_dim0_fixed, wadkd_rs14_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs14_out0 = torch.reshape(wadkd_tr7_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs14_out0_rs_shape_fixed, wadkd_tr7_out0, allow_zero=False)))",
+                "        wadkd_rs18_out0_rs_shape_dim0 = wadkd_concat21_out0.reshape(-1)[:1]",
+                "        wadkd_rs18_out0_rs_in_shape = _shape_tensor(wadkd_tr11_out0, dtype=torch.int32, device=wadkd_tr11_out0.device)",
+                "        wadkd_rs18_out0_rs_in_dim0 = wadkd_rs18_out0_rs_in_shape.reshape(-1)[:1]",
+                "        wadkd_rs18_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs18_out0_rs_shape_dim0, 0), [1])",
+                "        wadkd_rs18_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs18_out0_rs_shape_dim0_is_zero, wadkd_rs18_out0_rs_in_dim0, wadkd_rs18_out0_rs_shape_dim0)",
+                "        wadkd_rs18_out0_rs_shape_tail = wadkd_concat21_out0.reshape(-1)[1:]",
+                "        wadkd_rs18_out0_rs_shape_fixed = _apply_concat([wadkd_rs18_out0_rs_shape_dim0_fixed, wadkd_rs18_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs18_out0 = torch.reshape(wadkd_tr11_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs18_out0_rs_shape_fixed, wadkd_tr11_out0, allow_zero=False)))",
+                "        wadkd_rs16_out0_rs_shape_dim0 = wadkd_concat19_out0.reshape(-1)[:1]",
+                "        wadkd_rs16_out0_rs_in_shape = _shape_tensor(wadkd_tr9_out0, dtype=torch.int32, device=wadkd_tr9_out0.device)",
+                "        wadkd_rs16_out0_rs_in_dim0 = wadkd_rs16_out0_rs_in_shape.reshape(-1)[:1]",
+                "        wadkd_rs16_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs16_out0_rs_shape_dim0, 0), [1])",
+                "        wadkd_rs16_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs16_out0_rs_shape_dim0_is_zero, wadkd_rs16_out0_rs_in_dim0, wadkd_rs16_out0_rs_shape_dim0)",
+                "        wadkd_rs16_out0_rs_shape_tail = wadkd_concat19_out0.reshape(-1)[1:]",
+                "        wadkd_rs16_out0_rs_shape_fixed = _apply_concat([wadkd_rs16_out0_rs_shape_dim0_fixed, wadkd_rs16_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs16_out0 = torch.reshape(wadkd_tr9_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs16_out0_rs_shape_fixed, wadkd_tr9_out0, allow_zero=False)))",
+                "        wadkd_rs20_out0_rs_shape_dim0 = wadkd_concat23_out0.reshape(-1)[:1]",
+                "        wadkd_rs20_out0_rs_in_shape = _shape_tensor(wadkd_tr13_out0, dtype=torch.int32, device=wadkd_tr13_out0.device)",
+                "        wadkd_rs20_out0_rs_in_dim0 = wadkd_rs20_out0_rs_in_shape.reshape(-1)[:1]",
+                "        wadkd_rs20_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs20_out0_rs_shape_dim0, 0), [1])",
+                "        wadkd_rs20_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs20_out0_rs_shape_dim0_is_zero, wadkd_rs20_out0_rs_in_dim0, wadkd_rs20_out0_rs_shape_dim0)",
+                "        wadkd_rs20_out0_rs_shape_tail = wadkd_concat23_out0.reshape(-1)[1:]",
+                "        wadkd_rs20_out0_rs_shape_fixed = _apply_concat([wadkd_rs20_out0_rs_shape_dim0_fixed, wadkd_rs20_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        wadkd_rs20_out0 = torch.reshape(wadkd_tr13_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs20_out0_rs_shape_fixed, wadkd_tr13_out0, allow_zero=False)))",
+                "        _binary_lhs_266, _binary_rhs_266 = _align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])",
+                "        wadkd_mul30_out0 = torch.mul(_binary_lhs_266, _binary_rhs_266)",
+                "        _binary_lhs_267, _binary_rhs_267 = _align_binary_inputs_to_anchor(wadkd_rs18_out0, wadkd_tr3_out0, [1, 1, 1, 1])",
+                "        wadkd_mul38_out0 = torch.mul(_binary_lhs_267, _binary_rhs_267)",
+                "        _binary_lhs_268, _binary_rhs_268 = _align_binary_inputs_to_anchor(wadkd_rs16_out0, wadkd_tr2_out0, [1, 1, 1, 1])",
+                "        wadkd_mul34_out0 = torch.mul(_binary_lhs_268, _binary_rhs_268)",
+                "        _binary_lhs_269, _binary_rhs_269 = _align_binary_inputs_to_anchor(wadkd_rs20_out0, wadkd_tr4_out0, [1, 1, 1, 1])",
+                "        wadkd_mul42_out0 = torch.mul(_binary_lhs_269, _binary_rhs_269)",
+                "        wadkd_add6_out0 = torch.add(wadkd_mul30_out0, wadkd_mul34_out0)",
+                "        wadkd_add9_out0 = torch.add(wadkd_add6_out0, wadkd_mul38_out0)",
+                "        wadkd_add12_out0 = torch.add(wadkd_add9_out0, wadkd_mul42_out0)",
+                "        wadkd_tr14_out0 = _torch_permute(wadkd_add12_out0, [1, 0, 2, 3])",
+                "        _binary_lhs_274, _binary_rhs_274 = _align_binary_inputs_to_anchor(wadkd_tr14_out0, wadkd_cast5_out0, [1, 1, 1, 1])",
+                "        wadkd_mul44_out0 = torch.mul(_binary_lhs_274, _binary_rhs_274)",
+                "        wa_squeeze_out0 = torch.squeeze(wadkd_mul44_out0)",
+                "        scores = torch.reshape(wa_squeeze_out0, (([1]) + ([1])))",
+                "        return (descriptors, scores)",
+                "    def forward(self, scores_map: torch.Tensor, wadkd_mul29_out0: torch.Tensor, wadkd_add2_out0: torch.Tensor, wadkd_add7_out0: torch.Tensor, wadkd_add4_out0: torch.Tensor, wadkd_add10_out0: torch.Tensor, wadkd_div3_out0: torch.Tensor, wadkd_tr1_out0: torch.Tensor, wadkd_tr3_out0: torch.Tensor, wadkd_tr2_out0: torch.Tensor, wadkd_tr4_out0: torch.Tensor, wadkd_cast5_out0: torch.Tensor):",
+                "        scores_map, wadkd_flatten4_out0, wadkd_or_out0 = self._forward_stage_1(scores_map)",
+                "        descriptors, scores = self._forward_stage_7(wadkd_mul29_out0, wadkd_add2_out0, wadkd_add7_out0, wadkd_add4_out0, wadkd_add10_out0, wadkd_div3_out0, wadkd_tr1_out0, wadkd_tr3_out0, wadkd_tr2_out0, wadkd_tr4_out0, wadkd_cast5_out0)",
+                "        return descriptors, scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "wadkd_cast5_out0: torch.Tensor, scores_map: torch.Tensor)" in rewritten
+    assert "wadkd_cast5_out0, scores_map)" in rewritten
+    assert "wadkd_equal_out0 = torch.eq(wadkd_max_p_in, wadkd_max_p_out)" in rewritten
+    assert "wadkd_equal_out0_nchw = torch.reshape(wadkd_equal_out0, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_max_p1_out0 = torch.reshape(wadkd_max_p1_out, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_max_p2_out0 = torch.reshape(wadkd_max_p2_out, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_max_p3_out0 = torch.reshape(wadkd_max_p3_out, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_max_p4_out0 = torch.reshape(wadkd_max_p4_out, [1, 1, 192, 320])" in rewritten
+    assert "wadkd_less_out0 = torch.lt(wadkd_split1_out0, 0.0)" in rewritten
+    assert "wadkd_add_out0 = torch.add(wadkd_floor_out0, 1.0)" in rewritten
+    assert "wadkd_and2_out0 = torch.logical_and(wadkd_not2_out0, wadkd_not3_out0)" in rewritten
+    assert "wadkd_mul21_out0 = torch.mul(wadkd_floor_out0, wadkd_cast5_out0)" in rewritten
+    assert "wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.int64)" in rewritten
+    assert "wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320, rounding_mode='floor'), [1])" in rewritten
+    assert "wadkd_mul16_out0 = torch.div(wadkd_cast4_out0, self.const_inline_literal_1)" in rewritten
+    assert "wadkd_reduce_l2_out0_reduce_l2_squared = torch.mul(wadkd_tr17_out0, wadkd_tr17_out0)" in rewritten
+    assert "_binary_rhs_191, _binary_lhs_191 = wadkd_clip_out0, wadkd_expand23_out0_expand_ones" in rewritten
+    assert "wadkd_expand23_out0 = torch.mul(_binary_lhs_191, _binary_rhs_191)" in rewritten
+    assert "_binary_lhs_196, _binary_rhs_196 = wadkd_tr17_out0, wadkd_expand23_out0" in rewritten
+    assert "wadkd_div3_out0 = torch.div(_binary_lhs_196, _binary_rhs_196)" in rewritten
+    assert "wadkd_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
+    assert "wadkd_shape_prefix_out0 = torch.ones([1], dtype=torch.int32, device=wadkd_shape13_out0.device)" in rewritten
+    assert "self.const_inline_literal_5" not in rewritten
+    assert "wadkd_gather7_out0 = _reshape_gather_output(torch.index_select(wadkd_flatten_out0, 0, wadkd_gather7_out0_indices.to(dtype=torch.int64).reshape(-1)), wadkd_flatten_out0, _shape_tensor(wadkd_gather7_out0_indices, dtype=torch.int64, device=wadkd_gather7_out0_indices.device), axis=0)" in rewritten
+    assert "wadkd_mul30_out0 = torch.mul(wadkd_rs14_out0, wadkd_tr1_out0)" in rewritten
+    assert "wadkd_tr14_out0 = _torch_permute(wadkd_add12_out0, [0, 1, 3, 2])" in rewritten
+    assert "_align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])" not in rewritten
+    assert "scores = torch.reshape(wa_squeeze_out0, _resolve_reshape_shape([-1, 1], wa_squeeze_out0, allow_zero=False))" in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain(
@@ -12531,6 +12676,137 @@ def test_sanitize_dynamo_exported_onnx_metadata_folds_transpose_pad_transpose_br
     assert list(sanitized_model.graph.node[1].input) == ["x_pad"]
 
 
+def test_sanitize_dynamo_exported_onnx_metadata_folds_constant_scatternd(tmp_path) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 2, 3])
+    scatter_data = numpy_helper.from_array(
+        np.zeros((6,), dtype=np.float32),
+        name="scatter_data",
+    )
+    scatter_indices = numpy_helper.from_array(
+        np.asarray([[1], [5]], dtype=np.int64),
+        name="scatter_indices",
+    )
+    scatter_updates = numpy_helper.from_array(
+        np.asarray([3.0, 7.0], dtype=np.float32),
+        name="scatter_updates",
+    )
+    reshape_shape = numpy_helper.from_array(
+        np.asarray([1, 1, 2, 3], dtype=np.int64),
+        name="reshape_shape",
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "ScatterND",
+                ["scatter_data", "scatter_indices", "scatter_updates"],
+                ["scatter_flat"],
+                name="ConstantScatter",
+            ),
+            helper.make_node(
+                "Reshape",
+                ["scatter_flat", "reshape_shape"],
+                ["scatter_map"],
+                name="ScatterReshape",
+            ),
+            helper.make_node(
+                "Add",
+                ["x", "scatter_map"],
+                ["y"],
+                name="AddScatterMap",
+            ),
+        ],
+        "constant_scatternd_fold_graph",
+        [x],
+        [y],
+        initializer=[scatter_data, scatter_indices, scatter_updates, reshape_shape],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 18)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "constant_scatternd_fold.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    assert all(str(node.op_type) != "ScatterND" for node in sanitized_model.graph.node)
+    folded_initializer = next(
+        initializer
+        for initializer in sanitized_model.graph.initializer
+        if str(initializer.name) in {"scatter_flat", "scatter_map"}
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(folded_initializer),
+        np.asarray([[[[0.0, 3.0, 0.0], [0.0, 0.0, 7.0]]]], dtype=np.float32)
+        if str(folded_initializer.name) == "scatter_map"
+        else np.asarray([0.0, 3.0, 0.0, 0.0, 0.0, 7.0], dtype=np.float32),
+    )
+
+
+def test_sanitize_dynamo_exported_onnx_metadata_folds_constant_reshape_sub_chain(tmp_path) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 2, 3])
+    ones_flat = numpy_helper.from_array(
+        np.ones((6,), dtype=np.float32),
+        name="ones_flat",
+    )
+    zeros_flat = numpy_helper.from_array(
+        np.zeros((6,), dtype=np.float32),
+        name="zeros_flat",
+    )
+    scalar_one = numpy_helper.from_array(
+        np.asarray(1.0, dtype=np.float32),
+        name="scalar_one",
+    )
+    target_shape = numpy_helper.from_array(
+        np.asarray([1, 1, 2, 3], dtype=np.int64),
+        name="target_shape",
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Reshape", ["ones_flat", "target_shape"], ["view_23"], name="node_view_23"),
+            helper.make_node("Sub", ["scalar_one", "view_23"], ["sub"], name="node_sub"),
+            helper.make_node("Reshape", ["zeros_flat", "target_shape"], ["view_27"], name="node_view_27"),
+            helper.make_node("Add", ["x", "sub"], ["tmp"], name="AddSub"),
+            helper.make_node("Add", ["tmp", "view_27"], ["y"], name="AddView27"),
+        ],
+        "constant_reshape_sub_chain_fold_graph",
+        [x],
+        [y],
+        initializer=[ones_flat, zeros_flat, scalar_one, target_shape],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 18)])
+    model.ir_version = 10
+    onnx_path = tmp_path / "constant_reshape_sub_chain_fold.onnx"
+    onnx.save_model(model, str(onnx_path), save_as_external_data=False)
+
+    _sanitize_dynamo_exported_onnx_metadata(onnx_path)
+
+    sanitized_model = onnx.load(str(onnx_path))
+    remaining_node_names = {str(node.name) for node in sanitized_model.graph.node}
+    assert "node_view_23" not in remaining_node_names
+    assert "node_sub" not in remaining_node_names
+    assert "node_view_27" not in remaining_node_names
+    sub_initializer = next(
+        initializer
+        for initializer in sanitized_model.graph.initializer
+        if str(initializer.name) == "sub"
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(sub_initializer),
+        np.zeros((1, 1, 2, 3), dtype=np.float32),
+    )
+    view_27_initializer = next(
+        initializer
+        for initializer in sanitized_model.graph.initializer
+        if str(initializer.name) == "view_27"
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(view_27_initializer),
+        np.zeros((1, 1, 2, 3), dtype=np.float32),
+    )
+
+
 def test_sanitize_dynamo_exported_onnx_metadata_preserves_atan_rank4_output_shape(tmp_path) -> None:
     x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 224, 224])
     y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 224, 224])
@@ -12627,6 +12903,84 @@ def test_sanitize_dynamo_exported_onnx_metadata_restores_missing_output_shape_fr
         for dim in sanitized_model.graph.output[0].type.tensor_type.shape.dim
     ]
     assert output_dims == [1, 8]
+
+
+def test_onnx_repair_inferred_shapes_in_place_restores_missing_internal_pad_value_info(monkeypatch) -> None:
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 192, 320])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 196, 324])
+    reshape_shape = numpy_helper.from_array(
+        np.asarray([1, 1, 192, 320], dtype=np.int64),
+        name="reshape_shape",
+    )
+    pads = numpy_helper.from_array(
+        np.asarray([0, 0, 2, 2, 0, 0, 2, 2], dtype=np.int64),
+        name="pads",
+    )
+    constant_value = numpy_helper.from_array(
+        np.asarray(-np.inf, dtype=np.float32),
+        name="constant_value",
+    )
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "Reshape",
+                    ["x", "reshape_shape"],
+                    ["scores_map"],
+                    name="node_view_1",
+                ),
+                helper.make_node(
+                    "Pad",
+                    ["scores_map", "pads", "constant_value"],
+                    ["pad_8"],
+                    name="node_pad_8",
+                    mode="constant",
+                ),
+                helper.make_node(
+                    "Relu",
+                    ["pad_8"],
+                    ["y"],
+                    name="relu_after_pad",
+                ),
+            ],
+            "restore_internal_pad_value_info",
+            [x],
+            [y],
+            value_info=[
+                helper.make_tensor_value_info("scores_map", TensorProto.FLOAT, [1, 1, 192, 320]),
+            ],
+            initializer=[reshape_shape, pads, constant_value],
+        ),
+        opset_imports=[helper.make_operatorsetid("", 18)],
+    )
+
+    monkeypatch.setattr(
+        onnx.shape_inference,
+        "infer_shapes",
+        lambda *args, **kwargs: args[0],
+    )
+
+    _onnx_repair_inferred_shapes_in_place(model)
+
+    restored_value_info = next(
+        value_info
+        for value_info in list(model.graph.value_info)
+        if str(value_info.name) == "pad_8"
+    )
+    restored_shape = [
+        int(dim.dim_value)
+        for dim in restored_value_info.type.tensor_type.shape.dim
+    ]
+    assert restored_shape == [1, 1, 196, 324]
+    preserved_scores_map = next(
+        value_info
+        for value_info in list(model.graph.value_info)
+        if str(value_info.name) == "scores_map"
+    )
+    assert [
+        int(dim.dim_value)
+        for dim in preserved_scores_map.type.tensor_type.shape.dim
+    ] == [1, 1, 192, 320]
 
 
 def test_sanitize_dynamo_exported_onnx_metadata_folds_relu_between_inverse_transposes(tmp_path) -> None:

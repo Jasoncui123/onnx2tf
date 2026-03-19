@@ -11,6 +11,8 @@ from onnx2tf.tflite_builder.ir import (
     prune_identity_cast_operators,
 )
 from onnx2tf.tflite_builder.lower_from_onnx2tf import (
+    _optimize_constant_binary_elementwise_chains,
+    _optimize_constant_input_scatter_nd_chains,
     build_op_coverage_report,
     build_tensor_correspondence_report,
     lower_onnx_to_ir,
@@ -796,9 +798,12 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
         float32_path = os.path.join(output_folder_path, f"{output_file_name}_float32.tflite")
         saved_model_path = None
         float32_write_timing: Dict[str, Any] = {}
+        model_ir_fp32_tflite = clone_model_ir_with_float32(model_ir_fp32)
+        _optimize_constant_input_scatter_nd_chains(model_ir_fp32_tflite)
+        _optimize_constant_binary_elementwise_chains(model_ir_fp32_tflite)
         write_model_file(
             schema_tflite=schema_tflite,
-            model_ir=model_ir_fp32,
+            model_ir=model_ir_fp32_tflite,
             output_tflite_path=float32_path,
             timing=float32_write_timing,
         )
@@ -943,9 +948,12 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
         )
         float16_path = os.path.join(output_folder_path, f"{output_file_name}_float16.tflite")
         float16_write_timing: Dict[str, Any] = {}
+        model_ir_fp16_tflite = clone_model_ir_with_float16(model_ir_fp16)
+        _optimize_constant_input_scatter_nd_chains(model_ir_fp16_tflite)
+        _optimize_constant_binary_elementwise_chains(model_ir_fp16_tflite)
         write_model_file(
             schema_tflite=schema_tflite,
-            model_ir=model_ir_fp16,
+            model_ir=model_ir_fp16_tflite,
             output_tflite_path=float16_path,
             timing=float16_write_timing,
         )

@@ -12317,6 +12317,13 @@ def _onnx_remove_nodes_by_name(
 
 
 def _onnx_repair_inferred_shapes_in_place(model: onnx.ModelProto) -> None:
+    original_internal_value_infos: Dict[str, onnx.ValueInfoProto] = {}
+    for value_info in list(model.graph.value_info):
+        value_info_name = str(getattr(value_info, "name", ""))
+        if value_info_name == "":
+            continue
+        original_internal_value_infos[value_info_name] = onnx.ValueInfoProto()
+        original_internal_value_infos[value_info_name].CopyFrom(value_info)
     del model.graph.value_info[:]
     produced_tensor_names = {
         str(output_name)
@@ -12349,12 +12356,49 @@ def _onnx_repair_inferred_shapes_in_place(model: onnx.ModelProto) -> None:
                 strict_mode=False,
             )
         except Exception:
-            return
+            inferred_model = None
     except Exception:
-        return
-    if inferred_model is None:
-        return
-    model.CopyFrom(inferred_model)
+        inferred_model = None
+    if inferred_model is not None:
+        model.CopyFrom(inferred_model)
+    if original_internal_value_infos:
+        existing_value_infos = {
+            str(value_info.name): value_info
+            for value_info in list(model.graph.value_info)
+            if str(getattr(value_info, "name", "")) != ""
+        }
+        graph_input_names = {str(value_info.name) for value_info in list(model.graph.input)}
+        graph_output_names = {str(value_info.name) for value_info in list(model.graph.output)}
+        for value_info_name, original_value_info in original_internal_value_infos.items():
+            if value_info_name in graph_input_names or value_info_name in graph_output_names:
+                continue
+            original_tensor_type = getattr(original_value_info.type, "tensor_type", None)
+            if original_tensor_type is None:
+                continue
+            original_shape = getattr(original_tensor_type, "shape", None)
+            original_shape_dims = list(original_shape.dim) if original_shape is not None else []
+            original_elem_type = int(getattr(original_tensor_type, "elem_type", 0))
+            existing_value_info = existing_value_infos.get(value_info_name)
+            if existing_value_info is None:
+                restored_value_info = model.graph.value_info.add()
+                restored_value_info.CopyFrom(original_value_info)
+                existing_value_infos[value_info_name] = restored_value_info
+                continue
+            existing_tensor_type = getattr(existing_value_info.type, "tensor_type", None)
+            if existing_tensor_type is None:
+                continue
+            if int(getattr(existing_tensor_type, "elem_type", 0)) <= 0 and original_elem_type > 0:
+                existing_tensor_type.elem_type = int(original_elem_type)
+            existing_shape = getattr(existing_tensor_type, "shape", None)
+            if existing_shape is None or len(list(existing_shape.dim)) != 0 or len(original_shape_dims) == 0:
+                continue
+            del existing_shape.dim[:]
+            for original_dim in original_shape_dims:
+                target_dim = existing_shape.dim.add()
+                if original_dim.HasField("dim_value"):
+                    target_dim.dim_value = int(original_dim.dim_value)
+                elif original_dim.HasField("dim_param"):
+                    target_dim.dim_param = str(original_dim.dim_param)
     producer_map, _ = _onnx_node_maps(model.graph)
     for output in model.graph.output:
         tensor_type = getattr(output.type, "tensor_type", None)
@@ -12375,6 +12419,7 @@ def _onnx_repair_inferred_shapes_in_place(model: onnx.ModelProto) -> None:
             continue
         for dim_value in inferred_shape:
             shape.dim.add().dim_value = int(dim_value)
+    _onnx_restore_missing_internal_pad_value_info_shapes_in_place(model.graph)
 
 
 def _onnx_get_initializer_index(graph: onnx.GraphProto, name: str) -> Optional[int]:
@@ -12432,6 +12477,130 @@ def _onnx_get_initializer_scalar(
     return float(initializer_values.reshape(()))
 
 
+def _onnx_evaluate_constant_scatter_nd(
+    *,
+    data_array: Any,
+    indices_array: Any,
+    updates_array: Any,
+    reduction: str = "none",
+) -> Optional[np.ndarray]:
+    try:
+        data = np.asarray(data_array)
+        indices = np.asarray(indices_array, dtype=np.int64)
+        updates = np.asarray(updates_array)
+    except Exception:
+        return None
+    if indices.ndim < 1:
+        return None
+    index_depth = int(indices.shape[-1])
+    if index_depth < 0 or index_depth > int(data.ndim):
+        return None
+    prefix_shape = tuple(int(v) for v in list(indices.shape[:-1]))
+    suffix_shape = tuple(int(v) for v in list(data.shape[index_depth:]))
+    if tuple(int(v) for v in list(updates.shape)) != prefix_shape + suffix_shape:
+        return None
+
+    try:
+        out = np.array(data, copy=True)
+    except Exception:
+        return None
+
+    flat_indices = indices.reshape((-1, int(index_depth)))
+    flat_updates = updates.reshape((int(flat_indices.shape[0]),) + suffix_shape)
+    normalized_reduction = str(reduction).lower()
+    if normalized_reduction == "":
+        normalized_reduction = "none"
+    if normalized_reduction not in {"none", "add"}:
+        return None
+
+    if int(index_depth) == 0:
+        try:
+            if normalized_reduction == "add":
+                np.add(out, np.sum(flat_updates, axis=0), out=out)
+            else:
+                if int(flat_updates.shape[0]) != 1:
+                    return None
+                out[...] = flat_updates[0]
+        except Exception:
+            return None
+        return out
+
+    upper_bounds = np.asarray(data.shape[:index_depth], dtype=np.int64)
+    if upper_bounds.size != int(index_depth):
+        return None
+    if np.any(flat_indices < 0) or np.any(flat_indices >= upper_bounds.reshape((1, -1))):
+        return None
+    if normalized_reduction == "none":
+        seen_indices = {
+            tuple(int(v) for v in list(index_row.tolist()))
+            for index_row in flat_indices
+        }
+        if len(seen_indices) != int(flat_indices.shape[0]):
+            return None
+
+    try:
+        for update_idx, target_index in enumerate(flat_indices):
+            target_key = tuple(int(v) for v in list(target_index.tolist()))
+            if normalized_reduction == "add":
+                out[target_key] += flat_updates[int(update_idx)]
+            else:
+                out[target_key] = flat_updates[int(update_idx)]
+    except Exception:
+        return None
+    return out
+
+
+def _onnx_evaluate_constant_reshape(
+    *,
+    data_array: Any,
+    shape_array: Any,
+) -> Optional[np.ndarray]:
+    try:
+        data = np.asarray(data_array)
+        shape_values = np.asarray(shape_array, dtype=np.int64).reshape(-1)
+    except Exception:
+        return None
+    if shape_values.ndim != 1 or int(shape_values.size) == 0:
+        return None
+    if np.sum(shape_values == -1) > 1:
+        return None
+    if np.any(shape_values < -1):
+        return None
+    try:
+        return np.reshape(data, tuple(int(v) for v in list(shape_values.tolist())))
+    except Exception:
+        return None
+
+
+def _onnx_evaluate_constant_binary_elementwise(
+    *,
+    lhs_array: Any,
+    rhs_array: Any,
+    op_type: str,
+) -> Optional[np.ndarray]:
+    try:
+        lhs = np.asarray(lhs_array)
+        rhs = np.asarray(rhs_array)
+    except Exception:
+        return None
+    try:
+        if str(op_type) == "Add":
+            out = np.add(lhs, rhs)
+        elif str(op_type) == "Sub":
+            out = np.subtract(lhs, rhs)
+        elif str(op_type) == "Mul":
+            out = np.multiply(lhs, rhs)
+        elif str(op_type) == "Div":
+            out = np.divide(lhs, rhs)
+        else:
+            return None
+    except Exception:
+        return None
+    if np.issubdtype(out.dtype, np.floating) and not np.all(np.isfinite(out)):
+        return None
+    return np.asarray(out)
+
+
 def _onnx_get_value_info_shape(
     graph: onnx.GraphProto,
     name: str,
@@ -12450,6 +12619,26 @@ def _onnx_get_value_info_shape(
                 return None
         return shape
     return None
+
+
+def _onnx_get_tensor_elem_type(
+    graph: onnx.GraphProto,
+    name: str,
+) -> Optional[int]:
+    target_name = str(name)
+    for value_info in list(graph.value_info) + list(graph.input) + list(graph.output):
+        if str(value_info.name) != target_name:
+            continue
+        tensor_type = getattr(value_info.type, "tensor_type", None)
+        if tensor_type is None:
+            return None
+        elem_type = int(getattr(tensor_type, "elem_type", 0))
+        return elem_type if elem_type > 0 else None
+    initializer_index = _onnx_get_initializer_index(graph, target_name)
+    if initializer_index is None:
+        return None
+    elem_type = int(getattr(graph.initializer[int(initializer_index)], "data_type", 0))
+    return elem_type if elem_type > 0 else None
 
 
 _ONNX_STATIC_SHAPE_PASSTHROUGH_OP_TYPES = {
@@ -12587,7 +12776,160 @@ def _onnx_resolve_static_shape(
         if input_shape is None or len(perm) != len(input_shape):
             return None
         return [int(input_shape[index]) for index in perm]
+    if op_type == "Pad" and len(producer_node.input) >= 2:
+        input_shape = _onnx_resolve_static_shape(
+            graph,
+            str(producer_node.input[0]),
+            producer_map=producer_map,
+            depth=depth + 1,
+        )
+        pads_array = _onnx_get_initializer_array(graph, str(producer_node.input[1]))
+        if input_shape is None or pads_array is None:
+            return None
+        pads_values = np.asarray(pads_array, dtype=np.int64).reshape(-1)
+        rank = int(len(input_shape))
+        if int(pads_values.size) != int(rank) * 2:
+            return None
+        head_pads = pads_values[:rank]
+        tail_pads = pads_values[rank:]
+        try:
+            return [
+                int(int(dim) + int(head_pad) + int(tail_pad))
+                for dim, head_pad, tail_pad in zip(input_shape, head_pads, tail_pads)
+            ]
+        except Exception:
+            return None
     return None
+
+
+def _onnx_restore_missing_internal_pad_value_info_shapes_in_place(
+    graph: onnx.GraphProto,
+) -> None:
+    producer_map, _ = _onnx_node_maps(graph)
+    graph_input_names = {str(value_info.name) for value_info in list(graph.input)}
+    graph_output_names = {str(value_info.name) for value_info in list(graph.output)}
+
+    def _find_value_info(name: str) -> Optional[onnx.ValueInfoProto]:
+        for value_info in list(graph.value_info):
+            if str(value_info.name) == str(name):
+                return value_info
+        return None
+
+    for node in list(graph.node):
+        if str(node.op_type) != "Pad" or len(list(node.output)) != 1 or len(list(node.input)) < 1:
+            continue
+        output_name = str(node.output[0])
+        if output_name == "":
+            continue
+        if _onnx_get_value_info_shape(graph, output_name) is not None:
+            continue
+        resolved_shape = _onnx_resolve_static_shape(
+            graph,
+            output_name,
+            producer_map=producer_map,
+        )
+        if resolved_shape is None:
+            continue
+        elem_type = _onnx_get_tensor_elem_type(graph, str(node.input[0]))
+        if elem_type is None:
+            continue
+        target_value_info = _find_value_info(output_name)
+        if target_value_info is None:
+            if output_name in graph_input_names or output_name in graph_output_names:
+                continue
+            target_value_info = graph.value_info.add()
+            target_value_info.name = output_name
+        tensor_type = target_value_info.type.tensor_type
+        tensor_type.elem_type = int(elem_type)
+        del tensor_type.shape.dim[:]
+        for dim_value in resolved_shape:
+            tensor_type.shape.dim.add().dim_value = int(dim_value)
+
+
+def _onnx_fold_constant_scatter_nd_in_place(graph: onnx.GraphProto) -> None:
+    while True:
+        changed = False
+        for node_index, node in enumerate(list(graph.node)):
+            if str(node.op_type) != "ScatterND" or len(list(node.input)) != 3 or len(list(node.output)) != 1:
+                continue
+            output_name = str(node.output[0])
+            if output_name == "":
+                continue
+            data_array = _onnx_get_initializer_array(graph, str(node.input[0]))
+            indices_array = _onnx_get_initializer_array(graph, str(node.input[1]))
+            updates_array = _onnx_get_initializer_array(graph, str(node.input[2]))
+            if data_array is None or indices_array is None or updates_array is None:
+                continue
+            folded = _onnx_evaluate_constant_scatter_nd(
+                data_array=data_array,
+                indices_array=indices_array,
+                updates_array=updates_array,
+                reduction=str(_onnx_node_attr(node, "reduction") or "none"),
+            )
+            if folded is None:
+                continue
+            _onnx_set_initializer_array(graph, name=output_name, array=np.asarray(folded))
+            del graph.node[node_index]
+            changed = True
+            break
+        if not changed:
+            break
+
+
+def _onnx_fold_constant_reshape_in_place(graph: onnx.GraphProto) -> None:
+    while True:
+        changed = False
+        for node_index, node in enumerate(list(graph.node)):
+            if str(node.op_type) != "Reshape" or len(list(node.input)) != 2 or len(list(node.output)) != 1:
+                continue
+            output_name = str(node.output[0])
+            if output_name == "":
+                continue
+            data_array = _onnx_get_initializer_array(graph, str(node.input[0]))
+            shape_array = _onnx_get_initializer_array(graph, str(node.input[1]))
+            if data_array is None or shape_array is None:
+                continue
+            folded = _onnx_evaluate_constant_reshape(
+                data_array=data_array,
+                shape_array=shape_array,
+            )
+            if folded is None:
+                continue
+            _onnx_set_initializer_array(graph, name=output_name, array=np.asarray(folded))
+            del graph.node[node_index]
+            changed = True
+            break
+        if not changed:
+            break
+
+
+def _onnx_fold_constant_binary_elementwise_in_place(graph: onnx.GraphProto) -> None:
+    supported_op_types = {"Add", "Sub", "Mul", "Div"}
+    while True:
+        changed = False
+        for node_index, node in enumerate(list(graph.node)):
+            if str(node.op_type) not in supported_op_types or len(list(node.input)) != 2 or len(list(node.output)) != 1:
+                continue
+            output_name = str(node.output[0])
+            if output_name == "":
+                continue
+            lhs_array = _onnx_get_initializer_array(graph, str(node.input[0]))
+            rhs_array = _onnx_get_initializer_array(graph, str(node.input[1]))
+            if lhs_array is None or rhs_array is None:
+                continue
+            folded = _onnx_evaluate_constant_binary_elementwise(
+                lhs_array=lhs_array,
+                rhs_array=rhs_array,
+                op_type=str(node.op_type),
+            )
+            if folded is None:
+                continue
+            _onnx_set_initializer_array(graph, name=output_name, array=np.asarray(folded))
+            del graph.node[node_index]
+            changed = True
+            break
+        if not changed:
+            break
 
 
 def _onnx_resolve_rank4_shape(
@@ -14615,6 +14957,9 @@ def _optimize_dynamo_exported_onnx_in_place(model: onnx.ModelProto) -> None:
     for _ in range(4):
         before_signature = _graph_signature(model.graph)
         _onnx_remove_passthrough_identity_nodes_in_place(model.graph)
+        _onnx_fold_constant_scatter_nd_in_place(model.graph)
+        _onnx_fold_constant_reshape_in_place(model.graph)
+        _onnx_fold_constant_binary_elementwise_in_place(model.graph)
         _onnx_fold_relu_layout_bridges_in_place(model.graph)
         _onnx_fold_mul_reducesum_sigmoid_layout_bridges_in_place(model.graph)
         _onnx_fold_reducesum_sigmoid_layout_bridges_in_place(model.graph)
@@ -24313,6 +24658,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
 
     _apply_pidnet_fast_precanonicalize_repairs(model_path)
     _apply_humanseg_fast_precanonicalize_repairs(model_path)
+    _apply_alike_fast_precanonicalize_repairs(model_path)
 
 
 def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
@@ -24596,6 +24942,221 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
         elif stripped.startswith("cv72_in_cf = self.conv_block_71(_torch_permute("):
             lines[index] = f"{indent}cv72_in_cf = self.conv_block_71(cv71_in)"
             changed = True
+
+    if changed:
+        model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
+    if not model_path.exists():
+        return
+    model_source = model_path.read_text(encoding="utf-8")
+    exact_replacements = {
+        "        wadkd_equal_out0 = _align_tensor_to_target_shape(torch.eq(wadkd_max_p_in, wadkd_max_p_out), [1, 192, 320, 1])":
+            "        wadkd_equal_out0 = torch.eq(wadkd_max_p_in, wadkd_max_p_out)",
+        "        wadkd_equal_out0_nchw = torch.reshape(wadkd_equal_out0.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
+            "        wadkd_equal_out0_nchw = torch.reshape(wadkd_equal_out0, [1, 1, 192, 320])",
+        "        wadkd_max_p1_out0 = torch.reshape(wadkd_max_p1_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
+            "        wadkd_max_p1_out0 = torch.reshape(wadkd_max_p1_out, [1, 1, 192, 320])",
+        "        wadkd_max_p2_out0 = torch.reshape(wadkd_max_p2_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
+            "        wadkd_max_p2_out0 = torch.reshape(wadkd_max_p2_out, [1, 1, 192, 320])",
+        "        wadkd_max_p3_out0 = torch.reshape(wadkd_max_p3_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
+            "        wadkd_max_p3_out0 = torch.reshape(wadkd_max_p3_out, [1, 1, 192, 320])",
+        "        wadkd_max_p4_out0 = torch.reshape(wadkd_max_p4_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
+            "        wadkd_max_p4_out0 = torch.reshape(wadkd_max_p4_out, [1, 1, 192, 320])",
+        "        wadkd_less_out0 = torch.reshape(torch.lt(wadkd_split1_out0, 0.0), [1, 1, 1, 1])":
+            "        wadkd_less_out0 = torch.lt(wadkd_split1_out0, 0.0)",
+        "        wadkd_less1_out0 = torch.reshape(torch.lt(wadkd_split1_out1, 0.0), [1, 1, 1, 1])":
+            "        wadkd_less1_out0 = torch.lt(wadkd_split1_out1, 0.0)",
+        "        wadkd_less2_out0 = torch.reshape(torch.lt(wadkd_split1_out0, 319.0), [1, 1, 1, 1])":
+            "        wadkd_less2_out0 = torch.lt(wadkd_split1_out0, 319.0)",
+        "        wadkd_less3_out0 = torch.reshape(torch.lt(wadkd_split1_out1, 191.0), [1, 1, 1, 1])":
+            "        wadkd_less3_out0 = torch.lt(wadkd_split1_out1, 191.0)",
+        "        wadkd_add_out0 = torch.reshape(torch.add(wadkd_floor_out0, 1.0), [1, 1, 1, 1])":
+            "        wadkd_add_out0 = torch.add(wadkd_floor_out0, 1.0)",
+        "        wadkd_sub4_out0 = torch.reshape(torch.sub(wadkd_split1_out0, wadkd_floor_out0), [1, 1, 1, 1])":
+            "        wadkd_sub4_out0 = torch.sub(wadkd_split1_out0, wadkd_floor_out0)",
+        "        wadkd_add1_out0 = torch.reshape(torch.add(wadkd_floor1_out0, 1.0), [1, 1, 1, 1])":
+            "        wadkd_add1_out0 = torch.add(wadkd_floor1_out0, 1.0)",
+        "        wadkd_sub3_out0 = torch.reshape(torch.sub(wadkd_split1_out1, wadkd_floor1_out0), [1, 1, 1, 1])":
+            "        wadkd_sub3_out0 = torch.sub(wadkd_split1_out1, wadkd_floor1_out0)",
+        "        wadkd_and2_out0 = torch.reshape(torch.logical_and(wadkd_not2_out0, wadkd_not3_out0), [1, 1, 1, 1])":
+            "        wadkd_and2_out0 = torch.logical_and(wadkd_not2_out0, wadkd_not3_out0)",
+        "        wadkd_and3_out0 = torch.reshape(torch.logical_and(wadkd_and2_out0, wadkd_less2_out0), [1, 1, 1, 1])":
+            "        wadkd_and3_out0 = torch.logical_and(wadkd_and2_out0, wadkd_less2_out0)",
+        "        wadkd_and4_out0 = torch.reshape(torch.logical_and(wadkd_and3_out0, wadkd_less3_out0), [1, 1, 1, 1])":
+            "        wadkd_and4_out0 = torch.logical_and(wadkd_and3_out0, wadkd_less3_out0)",
+        "        wadkd_mul21_out0 = torch.reshape(torch.mul(wadkd_floor_out0, wadkd_cast5_out0), [1, 1, 1, 1])":
+            "        wadkd_mul21_out0 = torch.mul(wadkd_floor_out0, wadkd_cast5_out0)",
+        "        wadkd_mul22_out0 = torch.reshape(torch.mul(wadkd_floor1_out0, wadkd_cast5_out0), [1, 1, 1, 1])":
+            "        wadkd_mul22_out0 = torch.mul(wadkd_floor1_out0, wadkd_cast5_out0)",
+        "        wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.float32)":
+            "        wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.int64)",
+        "        wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320.0), [1])":
+            "        wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320, rounding_mode='floor'), [1])",
+        "        wadkd_mul16_out0 = _align_tensor_to_target_shape(torch.mul(wadkd_cast4_out0, self.const_inline_literal_0), [1, 2])":
+            "        wadkd_mul16_out0 = torch.div(wadkd_cast4_out0, self.const_inline_literal_1)",
+        "        wadkd_reduce_l2_out0_reduce_l2_squared = _align_tensor_to_target_shape(torch.mul(wadkd_tr17_out0, wadkd_tr17_out0), [64, 1])":
+            "        wadkd_reduce_l2_out0_reduce_l2_squared = torch.mul(wadkd_tr17_out0, wadkd_tr17_out0)",
+        "        _binary_rhs_191, _binary_lhs_191 = _align_binary_inputs_to_anchor(wadkd_expand23_out0_expand_ones, wadkd_clip_out0, [1, 1])":
+            "        _binary_rhs_191, _binary_lhs_191 = wadkd_clip_out0, wadkd_expand23_out0_expand_ones",
+        "        wadkd_expand23_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_191, _binary_rhs_191), [1, 1])":
+            "        wadkd_expand23_out0 = torch.mul(_binary_lhs_191, _binary_rhs_191)",
+        "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs_to_anchor(wadkd_tr17_out0, wadkd_expand23_out0, [64, 1])":
+            "        _binary_lhs_196, _binary_rhs_196 = wadkd_tr17_out0, wadkd_expand23_out0",
+        "        wadkd_div3_out0 = _align_tensor_to_target_shape(torch.div(_binary_lhs_196, _binary_rhs_196), [64, 1])":
+            "        wadkd_div3_out0 = torch.div(_binary_lhs_196, _binary_rhs_196)",
+    }
+    changed = False
+    for old_text, new_text in exact_replacements.items():
+        if old_text in model_source:
+            model_source = model_source.replace(old_text, new_text)
+            changed = True
+
+    lines = model_source.splitlines()
+    required_markers = (
+        "def _forward_stage_7(self, wadkd_mul29_out0: torch.Tensor",
+        "wadkd_rs13_out0 = torch.reshape(wadkd_gather7_out0, _resolve_reshape_shape([-1, 1], wadkd_gather7_out0, allow_zero=False))",
+        "_binary_lhs_266, _binary_rhs_266 = _align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])",
+        "descriptors, scores = self._forward_stage_7(",
+    )
+    if not all(marker in model_source for marker in required_markers):
+        if changed:
+            model_path.write_text(model_source + ("\n" if not model_source.endswith("\n") else ""), encoding="utf-8")
+        return
+
+    stage7_def_index = next(
+        (index for index, line in enumerate(lines) if line.startswith("    def _forward_stage_7(")),
+        None,
+    )
+    forward_call_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if "descriptors, scores = self._forward_stage_7(" in line
+        ),
+        None,
+    )
+    block_start_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == "wadkd_shape13_out0 = _shape_tensor(wadkd_add3_out0, dtype=torch.int32, device=wadkd_add3_out0.device)"
+        ),
+        None,
+    )
+    block_end_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == "scores = torch.reshape(wa_squeeze_out0, (([1]) + ([1])))"
+        ),
+        None,
+    )
+    if (
+        stage7_def_index is None
+        or forward_call_index is None
+        or block_start_index is None
+        or block_end_index is None
+        or block_end_index < block_start_index
+    ):
+        return
+
+    if "scores_map: torch.Tensor" not in lines[stage7_def_index]:
+        lines[stage7_def_index] = lines[stage7_def_index].replace(
+            "wadkd_cast5_out0: torch.Tensor)",
+            "wadkd_cast5_out0: torch.Tensor, scores_map: torch.Tensor)",
+        )
+        changed = True
+    if "scores_map)" not in lines[forward_call_index]:
+        lines[forward_call_index] = lines[forward_call_index].replace(
+            "wadkd_cast5_out0)",
+            "wadkd_cast5_out0, scores_map)",
+        )
+        changed = True
+
+    indent = "        "
+    replacement_block = [
+        f"{indent}wadkd_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))",
+        f"{indent}wadkd_shape13_out0 = _shape_tensor(wadkd_add3_out0, dtype=torch.int32, device=wadkd_add3_out0.device)",
+        f"{indent}wadkd_shape17_out0 = _shape_tensor(wadkd_add8_out0, dtype=torch.int32, device=wadkd_add8_out0.device)",
+        f"{indent}wadkd_shape15_out0 = _shape_tensor(wadkd_add5_out0, dtype=torch.int32, device=wadkd_add5_out0.device)",
+        f"{indent}wadkd_shape19_out0 = _shape_tensor(wadkd_add11_out0, dtype=torch.int32, device=wadkd_add11_out0.device)",
+        f"{indent}wadkd_shape_prefix_out0 = torch.ones([1], dtype=torch.int32, device=wadkd_shape13_out0.device)",
+        f"{indent}wadkd_gather7_out0_is_negative = _align_tensor_to_target_shape(torch.lt(wadkd_add3_out0, 0), _tensor_shape_list(wadkd_add3_out0))",
+        f"{indent}wadkd_gather7_out0_wrapped_runtime = _align_tensor_to_target_shape(torch.add(wadkd_add3_out0, 61440), _tensor_shape_list(wadkd_add3_out0))",
+        f"{indent}wadkd_gather7_out0_indices = torch.where(wadkd_gather7_out0_is_negative, wadkd_gather7_out0_wrapped_runtime, wadkd_add3_out0)",
+        f"{indent}wadkd_gather7_out0 = _reshape_gather_output(torch.index_select(wadkd_flatten_out0, 0, wadkd_gather7_out0_indices.to(dtype=torch.int64).reshape(-1)), wadkd_flatten_out0, _shape_tensor(wadkd_gather7_out0_indices, dtype=torch.int64, device=wadkd_gather7_out0_indices.device), axis=0)",
+        f"{indent}wadkd_rs13_out0 = torch.reshape(wadkd_gather7_out0, _resolve_reshape_shape([-1, 1], wadkd_gather7_out0, allow_zero=False))",
+        f"{indent}wadkd_concat17_out0 = _apply_concat([wadkd_shape_prefix_out0, wadkd_shape13_out0], axis=0, target_shape=[4], fused='NONE')",
+        f"{indent}wadkd_gather15_out0_is_negative = _align_tensor_to_target_shape(torch.lt(wadkd_add8_out0, 0), _tensor_shape_list(wadkd_add8_out0))",
+        f"{indent}wadkd_gather15_out0_wrapped_runtime = _align_tensor_to_target_shape(torch.add(wadkd_add8_out0, 61440), _tensor_shape_list(wadkd_add8_out0))",
+        f"{indent}wadkd_gather15_out0_indices = torch.where(wadkd_gather15_out0_is_negative, wadkd_gather15_out0_wrapped_runtime, wadkd_add8_out0)",
+        f"{indent}wadkd_gather15_out0 = _reshape_gather_output(torch.index_select(wadkd_flatten_out0, 0, wadkd_gather15_out0_indices.to(dtype=torch.int64).reshape(-1)), wadkd_flatten_out0, _shape_tensor(wadkd_gather15_out0_indices, dtype=torch.int64, device=wadkd_gather15_out0_indices.device), axis=0)",
+        f"{indent}wadkd_rs17_out0 = torch.reshape(wadkd_gather15_out0, _resolve_reshape_shape([-1, 1], wadkd_gather15_out0, allow_zero=False))",
+        f"{indent}wadkd_concat21_out0 = _apply_concat([wadkd_shape_prefix_out0, wadkd_shape17_out0], axis=0, target_shape=[4], fused='NONE')",
+        f"{indent}wadkd_gather11_out0_is_negative = _align_tensor_to_target_shape(torch.lt(wadkd_add5_out0, 0), _tensor_shape_list(wadkd_add5_out0))",
+        f"{indent}wadkd_gather11_out0_wrapped_runtime = _align_tensor_to_target_shape(torch.add(wadkd_add5_out0, 61440), _tensor_shape_list(wadkd_add5_out0))",
+        f"{indent}wadkd_gather11_out0_indices = torch.where(wadkd_gather11_out0_is_negative, wadkd_gather11_out0_wrapped_runtime, wadkd_add5_out0)",
+        f"{indent}wadkd_gather11_out0 = _reshape_gather_output(torch.index_select(wadkd_flatten_out0, 0, wadkd_gather11_out0_indices.to(dtype=torch.int64).reshape(-1)), wadkd_flatten_out0, _shape_tensor(wadkd_gather11_out0_indices, dtype=torch.int64, device=wadkd_gather11_out0_indices.device), axis=0)",
+        f"{indent}wadkd_rs15_out0 = torch.reshape(wadkd_gather11_out0, _resolve_reshape_shape([-1, 1], wadkd_gather11_out0, allow_zero=False))",
+        f"{indent}wadkd_concat19_out0 = _apply_concat([wadkd_shape_prefix_out0, wadkd_shape15_out0], axis=0, target_shape=[4], fused='NONE')",
+        f"{indent}wadkd_gather19_out0_is_negative = _align_tensor_to_target_shape(torch.lt(wadkd_add11_out0, 0), _tensor_shape_list(wadkd_add11_out0))",
+        f"{indent}wadkd_gather19_out0_wrapped_runtime = _align_tensor_to_target_shape(torch.add(wadkd_add11_out0, 61440), _tensor_shape_list(wadkd_add11_out0))",
+        f"{indent}wadkd_gather19_out0_indices = torch.where(wadkd_gather19_out0_is_negative, wadkd_gather19_out0_wrapped_runtime, wadkd_add11_out0)",
+        f"{indent}wadkd_gather19_out0 = _reshape_gather_output(torch.index_select(wadkd_flatten_out0, 0, wadkd_gather19_out0_indices.to(dtype=torch.int64).reshape(-1)), wadkd_flatten_out0, _shape_tensor(wadkd_gather19_out0_indices, dtype=torch.int64, device=wadkd_gather19_out0_indices.device), axis=0)",
+        f"{indent}wadkd_rs19_out0 = torch.reshape(wadkd_gather19_out0, _resolve_reshape_shape([-1, 1], wadkd_gather19_out0, allow_zero=False))",
+        f"{indent}wadkd_concat23_out0 = _apply_concat([wadkd_shape_prefix_out0, wadkd_shape19_out0], axis=0, target_shape=[4], fused='NONE')",
+        f"{indent}wadkd_tr7_out0 = _torch_permute(wadkd_rs13_out0, [1, 0])",
+        f"{indent}wadkd_tr11_out0 = _torch_permute(wadkd_rs17_out0, [1, 0])",
+        f"{indent}wadkd_tr9_out0 = _torch_permute(wadkd_rs15_out0, [1, 0])",
+        f"{indent}wadkd_tr13_out0 = _torch_permute(wadkd_rs19_out0, [1, 0])",
+        f"{indent}wadkd_rs14_out0_rs_shape_dim0 = wadkd_concat17_out0.reshape(-1)[:1]",
+        f"{indent}wadkd_rs14_out0_rs_in_shape = _shape_tensor(wadkd_tr7_out0, dtype=torch.int32, device=wadkd_tr7_out0.device)",
+        f"{indent}wadkd_rs14_out0_rs_in_dim0 = wadkd_rs14_out0_rs_in_shape.reshape(-1)[:1]",
+        f"{indent}wadkd_rs14_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs14_out0_rs_shape_dim0, 0), [1])",
+        f"{indent}wadkd_rs14_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs14_out0_rs_shape_dim0_is_zero, wadkd_rs14_out0_rs_in_dim0, wadkd_rs14_out0_rs_shape_dim0)",
+        f"{indent}wadkd_rs14_out0_rs_shape_tail = wadkd_concat17_out0.reshape(-1)[1:]",
+        f"{indent}wadkd_rs14_out0_rs_shape_fixed = _apply_concat([wadkd_rs14_out0_rs_shape_dim0_fixed, wadkd_rs14_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+        f"{indent}wadkd_rs14_out0 = torch.reshape(wadkd_tr7_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs14_out0_rs_shape_fixed, wadkd_tr7_out0, allow_zero=False)))",
+        f"{indent}wadkd_rs18_out0_rs_shape_dim0 = wadkd_concat21_out0.reshape(-1)[:1]",
+        f"{indent}wadkd_rs18_out0_rs_in_shape = _shape_tensor(wadkd_tr11_out0, dtype=torch.int32, device=wadkd_tr11_out0.device)",
+        f"{indent}wadkd_rs18_out0_rs_in_dim0 = wadkd_rs18_out0_rs_in_shape.reshape(-1)[:1]",
+        f"{indent}wadkd_rs18_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs18_out0_rs_shape_dim0, 0), [1])",
+        f"{indent}wadkd_rs18_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs18_out0_rs_shape_dim0_is_zero, wadkd_rs18_out0_rs_in_dim0, wadkd_rs18_out0_rs_shape_dim0)",
+        f"{indent}wadkd_rs18_out0_rs_shape_tail = wadkd_concat21_out0.reshape(-1)[1:]",
+        f"{indent}wadkd_rs18_out0_rs_shape_fixed = _apply_concat([wadkd_rs18_out0_rs_shape_dim0_fixed, wadkd_rs18_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+        f"{indent}wadkd_rs18_out0 = torch.reshape(wadkd_tr11_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs18_out0_rs_shape_fixed, wadkd_tr11_out0, allow_zero=False)))",
+        f"{indent}wadkd_rs16_out0_rs_shape_dim0 = wadkd_concat19_out0.reshape(-1)[:1]",
+        f"{indent}wadkd_rs16_out0_rs_in_shape = _shape_tensor(wadkd_tr9_out0, dtype=torch.int32, device=wadkd_tr9_out0.device)",
+        f"{indent}wadkd_rs16_out0_rs_in_dim0 = wadkd_rs16_out0_rs_in_shape.reshape(-1)[:1]",
+        f"{indent}wadkd_rs16_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs16_out0_rs_shape_dim0, 0), [1])",
+        f"{indent}wadkd_rs16_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs16_out0_rs_shape_dim0_is_zero, wadkd_rs16_out0_rs_in_dim0, wadkd_rs16_out0_rs_shape_dim0)",
+        f"{indent}wadkd_rs16_out0_rs_shape_tail = wadkd_concat19_out0.reshape(-1)[1:]",
+        f"{indent}wadkd_rs16_out0_rs_shape_fixed = _apply_concat([wadkd_rs16_out0_rs_shape_dim0_fixed, wadkd_rs16_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+        f"{indent}wadkd_rs16_out0 = torch.reshape(wadkd_tr9_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs16_out0_rs_shape_fixed, wadkd_tr9_out0, allow_zero=False)))",
+        f"{indent}wadkd_rs20_out0_rs_shape_dim0 = wadkd_concat23_out0.reshape(-1)[:1]",
+        f"{indent}wadkd_rs20_out0_rs_in_shape = _shape_tensor(wadkd_tr13_out0, dtype=torch.int32, device=wadkd_tr13_out0.device)",
+        f"{indent}wadkd_rs20_out0_rs_in_dim0 = wadkd_rs20_out0_rs_in_shape.reshape(-1)[:1]",
+        f"{indent}wadkd_rs20_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(wadkd_rs20_out0_rs_shape_dim0, 0), [1])",
+        f"{indent}wadkd_rs20_out0_rs_shape_dim0_fixed = torch.where(wadkd_rs20_out0_rs_shape_dim0_is_zero, wadkd_rs20_out0_rs_in_dim0, wadkd_rs20_out0_rs_shape_dim0)",
+        f"{indent}wadkd_rs20_out0_rs_shape_tail = wadkd_concat23_out0.reshape(-1)[1:]",
+        f"{indent}wadkd_rs20_out0_rs_shape_fixed = _apply_concat([wadkd_rs20_out0_rs_shape_dim0_fixed, wadkd_rs20_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+        f"{indent}wadkd_rs20_out0 = torch.reshape(wadkd_tr13_out0, _shape_list(_resolve_reshape_shape_tensor(wadkd_rs20_out0_rs_shape_fixed, wadkd_tr13_out0, allow_zero=False)))",
+        f"{indent}wadkd_mul30_out0 = torch.mul(wadkd_rs14_out0, wadkd_tr1_out0)",
+        f"{indent}wadkd_mul38_out0 = torch.mul(wadkd_rs18_out0, wadkd_tr3_out0)",
+        f"{indent}wadkd_mul34_out0 = torch.mul(wadkd_rs16_out0, wadkd_tr2_out0)",
+        f"{indent}wadkd_mul42_out0 = torch.mul(wadkd_rs20_out0, wadkd_tr4_out0)",
+        f"{indent}wadkd_add6_out0 = torch.add(wadkd_mul30_out0, wadkd_mul34_out0)",
+        f"{indent}wadkd_add9_out0 = torch.add(wadkd_add6_out0, wadkd_mul38_out0)",
+        f"{indent}wadkd_add12_out0 = torch.add(wadkd_add9_out0, wadkd_mul42_out0)",
+        f"{indent}wadkd_tr14_out0 = _torch_permute(wadkd_add12_out0, [0, 1, 3, 2])",
+        f"{indent}wadkd_mul44_out0 = torch.mul(wadkd_tr14_out0, wadkd_cast5_out0)",
+        f"{indent}wa_squeeze_out0 = torch.squeeze(wadkd_mul44_out0)",
+        f"{indent}scores = torch.reshape(wa_squeeze_out0, _resolve_reshape_shape([-1, 1], wa_squeeze_out0, allow_zero=False))",
+    ]
+    lines[block_start_index : block_end_index + 1] = replacement_block
+    changed = True
 
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -59,6 +59,8 @@ from onnx2tf.tflite_builder.lower_from_onnx2tf import (
     _optimize_center_size_offset_terminal_transpose_chains,
     _optimize_constant_input_pad_chains,
     _optimize_constant_input_pool_chains,
+    _optimize_constant_input_scatter_nd_chains,
+    _optimize_constant_binary_elementwise_chains,
     _optimize_duplicate_reshape_fanout,
     _optimize_duplicate_transpose_fanout,
     _optimize_fuse_conv_activation_chains,
@@ -1322,6 +1324,33 @@ def _make_scatternd_after_int64_add_model() -> onnx.ModelProto:
         [x, updates],
         [out],
         initializer=[bias, indices],
+    )
+    return helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 16)])
+
+
+def _make_scatternd_const_updates_model() -> onnx.ModelProto:
+    data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [1, 4])
+    out = helper.make_tensor_value_info("out", TensorProto.FLOAT, [1, 4])
+    indices = numpy_helper.from_array(
+        np.asarray([[0, 1], [0, 3]], dtype=np.int64),
+        name="indices",
+    )
+    updates = numpy_helper.from_array(
+        np.asarray([10.0, -20.0], dtype=np.float32),
+        name="updates",
+    )
+    node = helper.make_node(
+        "ScatterND",
+        ["data", "indices", "updates"],
+        ["out"],
+        name="ScatterNDConstUpdatesNode",
+    )
+    graph = helper.make_graph(
+        [node],
+        "scatternd_const_updates_graph",
+        [data],
+        [out],
+        initializer=[indices, updates],
     )
     return helper.make_model(graph, opset_imports=[helper.make_operatorsetid("", 16)])
 
@@ -31273,7 +31302,7 @@ def test_flatbuffer_direct_integer_div_const_keeps_exact_division_path() -> None
     )
 
 
-def test_flatbuffer_direct_float_div_const_with_integer_cast_descendant_uses_mul_reciprocal() -> None:
+def test_flatbuffer_direct_float_div_const_with_integer_cast_descendant_keeps_exact_division_path() -> None:
     x = helper.make_tensor_value_info("x", TensorProto.INT32, [1, 2])
     y = helper.make_tensor_value_info("y", TensorProto.INT32, [1, 2])
     div_const = numpy_helper.from_array(np.asarray([319.0, 191.0], dtype=np.float32), name="float_div_const")
@@ -31300,15 +31329,15 @@ def test_flatbuffer_direct_float_div_const_with_integer_cast_descendant_uses_mul
     )
 
     op_types = [str(op.op_type) for op in model_ir.operators]
-    assert op_types.count("DIV") == 0
-    assert op_types.count("MUL") >= 1
+    assert op_types.count("DIV") == 1
+    assert op_types.count("MUL") == 0
 
     reciprocal_tensor_names = {
         str(name)
         for name in model_ir.tensors.keys()
         if "div_reciprocal" in str(name)
     }
-    assert len(reciprocal_tensor_names) == 1
+    assert len(reciprocal_tensor_names) == 0
 
 
 def test_flatbuffer_direct_consecutive_variable_const_mul_chain_is_folded_after_div_rewrite() -> None:
@@ -36311,6 +36340,57 @@ def test_flatbuffer_direct_scatternd_after_int64_add_lowers_to_builtin() -> None
         and str(op.outputs[0]) == "out"
     ]
     assert len(final_cast_ops) == 1
+
+
+def test_flatbuffer_direct_scatternd_const_updates_folds_constant_mask_and_updates() -> None:
+    model_ir = lower_onnx_to_ir(
+        _make_scatternd_const_updates_model(),
+        output_file_name="scatternd_const_updates_ir_test",
+    )
+    model_ir = clone_model_ir_with_float32(model_ir)
+    prune_identity_cast_operators(
+        model_ir,
+        preserve_model_outputs=True,
+    )
+    optimize_redundant_transpose_operators(
+        model_ir,
+        preserve_model_outputs=True,
+    )
+    _optimize_constant_input_scatter_nd_chains(model_ir)
+    _optimize_constant_binary_elementwise_chains(model_ir)
+
+    op_types = [str(op.op_type) for op in model_ir.operators]
+    assert "SCATTER_ND" not in op_types
+    assert "SUB" not in op_types
+    assert op_types.count("MUL") == 1
+    assert op_types.count("ADD") == 1
+
+    mul_op = next(op for op in model_ir.operators if str(op.op_type) == "MUL")
+    add_op = next(op for op in model_ir.operators if str(op.op_type) == "ADD")
+
+    mul_const_name = next(
+        str(input_name)
+        for input_name in mul_op.inputs
+        if model_ir.tensors[str(input_name)].data is not None
+    )
+    add_const_name = next(
+        str(input_name)
+        for input_name in add_op.inputs
+        if model_ir.tensors[str(input_name)].data is not None
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(model_ir.tensors[mul_const_name].data, dtype=np.float32),
+        np.asarray([[1.0, 0.0, 1.0, 0.0]], dtype=np.float32),
+        rtol=0.0,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        np.asarray(model_ir.tensors[add_const_name].data, dtype=np.float32),
+        np.asarray([[0.0, 10.0, 0.0, -20.0]], dtype=np.float32),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_flatbuffer_direct_abs_after_int64_add_preserves_unary_runtime_dtype_match() -> None:
