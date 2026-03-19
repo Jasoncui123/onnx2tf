@@ -12,7 +12,7 @@ license = "MIT"
 authors = [
     { name = "Katsuya Hyodo", email = "rmsdh122@yahoo.co.jp" }
 ]
-keywords = ["onnx", "tensorflow", "tflite", "keras", "deep-learning", "machine-learning"]
+keywords = ["onnx", "tensorflow", "tflite", "litert", "keras", "pytorch", "deep-learning", "machine-learning"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
