@@ -27766,7 +27766,7 @@ def _collect_shadowformer_fast_repair_facts(
 
 
 def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int, int, int, int]]:
-    axis_re = re.compile(r"(?:^|[,(])\s*axis\s*=\s*3(?:$|[,)])")
+    axis_re = re.compile(r"(?:^|[,(])\s*axis\s*=\s*(?:3|-1)(?:$|[,)])")
     target_shape_re = re.compile(
         r"target_shape=(?:\[|\()\s*(?P<batches>\d+)\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\s*(?:\]|\))"
     )

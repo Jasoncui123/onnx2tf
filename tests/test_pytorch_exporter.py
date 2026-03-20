@@ -3601,6 +3601,31 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_sig
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_signature_with_axis_negative_one(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_semantic_axis_negative_one_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pooled_cf, enc_attn, dec_attn):",
+                "        pooled_out = _apply_pool2d(pooled_cf, channel_last=False, is_max_pool=True, target_shape=[1, 40, 60, 1], padding='VALID', stride_w=2, stride_h=2, filter_width=2, filter_height=2)",
+                "        encoder_softmax = _apply_softmax(enc_attn, target_shape=[24, 6, 48, 64], axis=-1, beta=1.0)",
+                "        decoder_softmax = _apply_softmax(dec_attn, beta=1.0, axis=-1, target_shape=[24, 6, 48, 64])",
+                "        return pooled_out, encoder_softmax, decoder_softmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_infer_shadowformer_shape_from_dims_prefers_structural_order() -> None:
     known_shapes = {
         (6, 48, 64),
