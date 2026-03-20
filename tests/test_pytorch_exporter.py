@@ -1917,6 +1917,59 @@ def test_should_skip_expensive_raw_canonicalize_for_humanseg_generic_cat_signatu
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_skip_expensive_raw_canonicalize_for_version_rfb_semantic_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_semantic_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, a, b, c0, c1, c2, c3, b0, b1):",
+                "        merge_features = _align_tensor_to_target_shape(torch.add(a, b), [1, 60, 80, 64])",
+                "        head_out = self.conv_block_25(merge_features.permute(0, 3, 1, 2).contiguous())",
+                "        scores = _apply_concat([c0, c1, c2, c3], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
+                "        boxes = _apply_concat([b0, b1], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
+                "        return scores, boxes, head_out",
+                "",
+            ]
+        ),
+        encoding='utf-8',
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_iat_llie_semantic_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_semantic_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_in, tail_in, a, b, c, d, out_public_layout_bridge):",
+                "        cv25_in_cf = self.conv_block_0(stem_in.permute(0, 3, 1, 2).contiguous())",
+                "        mix64 = _align_tensor_to_target_shape(torch.add(a, b), [1, 45, 80, 64])",
+                "        cv108_out_cf = self.conv_block_16(tail_in.permute(0, 3, 1, 2).contiguous())",
+                "        img_high = _align_tensor_to_target_shape(torch.add(c, d), [1, 180, 320, 3])",
+                "        out = _torch_permute(out_public_layout_bridge, [0, 3, 1, 2])",
+                "        return cv25_in_cf, mix64, cv108_out_cf, img_high, out",
+                "",
+            ]
+        ),
+        encoding='utf-8',
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_l1_package(
     tmp_path,
 ) -> None:

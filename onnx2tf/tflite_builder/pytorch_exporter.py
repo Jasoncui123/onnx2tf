@@ -26893,6 +26893,79 @@ def _has_humanseg_skip_signature(lines: Sequence[str]) -> bool:
     return False
 
 
+def _has_version_rfb_skip_signature(lines: Sequence[str]) -> bool:
+    align_add_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+    permuted_conv25_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = self\.conv_block_25\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+    )
+    axis1_concat_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[[A-Za-z0-9_, ]+\], axis=1, target_shape=\[1, \d+, 2\], fused='NONE'\)$"
+    )
+    axis2_boxes_concat_re = re.compile(
+        r"^\s*boxes = _apply_concat\(\[[A-Za-z0-9_, ]+\], axis=2, target_shape=\[1, \d+, 4\], fused='NONE'\)$"
+    )
+
+    align_add_lhs: Set[str] = set()
+    for line in lines:
+        match = align_add_re.match(str(line))
+        if match is None:
+            continue
+        if int(match.group("d3")) == 64:
+            align_add_lhs.add(str(match.group("lhs")))
+    if not align_add_lhs:
+        return False
+    if not _any_line_matches(lines, axis1_concat_re.pattern):
+        return False
+    if not _any_line_matches(lines, axis2_boxes_concat_re.pattern):
+        return False
+    for line in lines:
+        match = permuted_conv25_re.match(str(line))
+        if match is not None and str(match.group("src")) in align_add_lhs:
+            return True
+    return False
+
+
+def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
+    permuted_conv_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = self\.conv_block_(?P<module>0|16)\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+    )
+    align_add_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+    output_bridge_re = re.compile(
+        r"^\s*out = _torch_permute\([A-Za-z0-9_]+, \[0, 3, 1, 2\]\)$"
+    )
+
+    seen_conv0 = False
+    seen_conv16 = False
+    seen_rank4_rgb = False
+    seen_rank4_channel64 = False
+    for line in lines:
+        current_line = str(line)
+        conv_match = permuted_conv_re.match(current_line)
+        if conv_match is not None:
+            if str(conv_match.group("module")) == "0":
+                seen_conv0 = True
+            elif str(conv_match.group("module")) == "16":
+                seen_conv16 = True
+            continue
+        align_match = align_add_re.match(current_line)
+        if align_match is not None:
+            if int(align_match.group("d3")) == 64:
+                seen_rank4_channel64 = True
+            if int(align_match.group("d3")) == 3:
+                seen_rank4_rgb = True
+    return (
+        seen_conv0
+        and seen_conv16
+        and seen_rank4_channel64
+        and seen_rank4_rgb
+        and _any_line_matches(lines, output_bridge_re.pattern)
+    )
+
+
 def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     register_buffer_count = _count_lines_matching(
         lines,
@@ -26938,22 +27011,9 @@ def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Pat
         return True
     if _has_humanseg_skip_signature(model_lines):
         return True
-    version_rfb_markers = (
-        "sng_cv45_in = _align_tensor_to_target_shape(torch.add(sng_cv42_out_cf, sng_cv29_out_cf), [1, 60, 80, 64])",
-        "sng_cv51_in_cf = self.conv_block_25(sng_cv45_in.permute(0, 3, 1, 2).contiguous())",
-        "t_459 = _apply_concat([t_328, t_374, t_414, t_446], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
-        "boxes = _apply_concat([t_480, t_485], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
-    )
-    if all(marker in model_source for marker in version_rfb_markers):
+    if _has_version_rfb_skip_signature(model_lines):
         return True
-    iat_llie_markers = (
-        "cv25_in_cf = self.conv_block_0(in_public_layout_bridge.permute(0, 3, 1, 2).contiguous())",
-        "onnx_shape1019 = _align_tensor_to_target_shape(torch.add(_binary_lhs_19, _binary_rhs_19), [1, 45, 80, 64])",
-        "cv108_out_cf = self.conv_block_16(cv108_in.permute(0, 3, 1, 2).contiguous())",
-        "img_high = _align_tensor_to_target_shape(torch.add(onnx_add1004_nhwc_bridge, onnx_add1003_cf), [1, 180, 320, 3])",
-        "out = _torch_permute(out_public_layout_bridge, [0, 3, 1, 2])",
-    )
-    if all(marker in model_source for marker in iat_llie_markers):
+    if _has_iat_llie_skip_signature(model_lines):
         return True
     if _has_bread_fast_skip_signature(model_lines):
         return True
