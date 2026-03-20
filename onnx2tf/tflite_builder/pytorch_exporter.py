@@ -22002,14 +22002,6 @@ def _canonicalize_generated_model_source_for_raw_export(
         if resize_bad_target_match is not None:
             input_name = str(resize_bad_target_match.group("input"))
             lhs = str(resize_bad_target_match.group("lhs"))
-            if lhs in {
-                "resize_out_nhwc_cf",
-                "pag3_resize_out_nhwc_cf",
-                "resize1_out_nhwc_cf",
-                "pag4_resize_out_nhwc_cf",
-            }:
-                index += 1
-                continue
             function_end = _function_end_index(index)
             alias_match = (
                 re.fullmatch(

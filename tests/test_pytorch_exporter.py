@@ -3794,6 +3794,46 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_resize_with_generic
     )
 
 
+def test_canonicalize_generated_model_source_normalizes_malformed_cf_resize_with_binary_consumer_without_name_gate(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_cf_bad_resize_binary_no_name_gate_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    original_line = (
+        "        generic_resize_bridge_cf = _apply_resize(generic_input_nhwc_cf, [24, 40], "
+        "method='bilinear', target_shape=[1, 24, 40, 32], align_corners=False, "
+        "half_pixel_centers=True, channel_last=False)"
+    )
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_input_nhwc_cf: torch.Tensor, gate_cf: torch.Tensor) -> torch.Tensor:",
+                original_line,
+                "        generic_resize_alias = generic_resize_bridge_cf",
+                "        gate_lhs, gate_rhs = _align_binary_inputs(gate_cf, generic_resize_alias, [1, 24, 40, 32])",
+                "        gated = _align_tensor_to_target_shape(torch.mul(gate_lhs, gate_rhs), [1, 24, 40, 32])",
+                "        return gated",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "generic_resize_bridge_cf = _apply_resize(generic_input_nhwc_cf, [24, 40], method='bilinear', "
+        "target_shape=[_tensor_shape_list(generic_input_nhwc_cf)[0], _tensor_shape_list(generic_input_nhwc_cf)[1], 24, 40], "
+        "align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_cf_add_conv_bridge_with_generic_names(
     tmp_path,
 ) -> None:
