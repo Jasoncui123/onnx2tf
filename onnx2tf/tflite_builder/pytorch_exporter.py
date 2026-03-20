@@ -26637,7 +26637,7 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         r"^\s*def _forward_stage_7\(self, .+\) -> tuple\[torch\.Tensor, torch\.Tensor\]:$"
     )
     forward_call_re = re.compile(
-        r"^\s*descriptors, scores = self\._forward_stage_7\(.+\)$"
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = self\._forward_stage_7\(.+\)$"
     )
     gather_reshape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, _resolve_reshape_shape\(\[-1, 1\], [A-Za-z0-9_]+, allow_zero=False\)\)$"
@@ -26645,15 +26645,15 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     singleton_anchor_re = re.compile(
         r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\([A-Za-z0-9_]+, [A-Za-z0-9_]+, \[1, 1, 1, 1\]\)$"
     )
-    score_tail_re = re.compile(
-        r"^\s*scores = torch\.reshape\([A-Za-z0-9_]+, .+\)$"
+    stage7_return_re = re.compile(
+        r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
     )
 
     has_stage7_def = False
     has_forward_call = False
     gather_reshape_count = 0
     singleton_anchor_count = 0
-    has_score_tail = False
+    has_stage7_return = False
     for line in lines:
         current_line = str(line)
         if stage7_def_re.match(current_line) is not None:
@@ -26668,14 +26668,14 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         if singleton_anchor_re.match(current_line) is not None:
             singleton_anchor_count += 1
             continue
-        if score_tail_re.match(current_line) is not None:
-            has_score_tail = True
+        if stage7_return_re.match(current_line) is not None:
+            has_stage7_return = True
     return (
         has_stage7_def
         and has_forward_call
         and gather_reshape_count >= 1
         and singleton_anchor_count >= 1
-        and has_score_tail
+        and has_stage7_return
     )
 
 
@@ -26720,8 +26720,8 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     cast_float_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\.to\(dtype=torch\.float32\)$"
     )
-    score_tail_re = re.compile(
-        r"^\s*scores = torch\.reshape\([A-Za-z0-9_]+, .+\)$"
+    stage7_return_re = re.compile(
+        r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
     )
     stage7_shape_tensor_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _shape_tensor\((?P<input>[A-Za-z0-9_]+), dtype=torch\.int32, device=(?P=input)\.device\)$"
@@ -26850,7 +26850,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         (
             index
             for index, line in enumerate(lines)
-            if "descriptors, scores = self._forward_stage_7(" in line
+            if re.match(r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = self\._forward_stage_7\(.+\)$", line)
         ),
         None,
     )
@@ -26860,6 +26860,8 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     ) if stage7_def_index is not None else len(lines)
     stage7_shape_matches: list[tuple[int, re.Match[str]]] = []
     stage7_singleton_anchor_matches: list[tuple[int, re.Match[str]]] = []
+    stage7_return_match: re.Match[str] | None = None
+    stage7_return_index: int | None = None
     block_end_index = None
     if stage7_def_index is not None:
         for scan_index in range(stage7_def_index + 1, stage7_end_index):
@@ -26869,8 +26871,18 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             singleton_anchor_match = stage7_singleton_anchor_re.match(lines[scan_index])
             if singleton_anchor_match is not None:
                 stage7_singleton_anchor_matches.append((scan_index, singleton_anchor_match))
-            if block_end_index is None and score_tail_re.match(lines[scan_index]) is not None:
+            return_match = stage7_return_re.match(lines[scan_index])
+            if return_match is not None:
+                stage7_return_match = return_match
+                stage7_return_index = scan_index
+    if stage7_return_match is not None and stage7_return_index is not None:
+        score_tail_re = re.compile(
+            rf"^\s*{re.escape(str(stage7_return_match.group('score')))} = torch\.reshape\([A-Za-z0-9_]+, .+\)$"
+        )
+        for scan_index in range(stage7_return_index - 1, stage7_def_index, -1):
+            if score_tail_re.match(lines[scan_index]) is not None:
                 block_end_index = scan_index
+                break
     branch_count = min(len(stage7_shape_matches), len(stage7_singleton_anchor_matches))
     block_start_index = stage7_shape_matches[0][0] if branch_count >= 1 else None
     if (
@@ -26878,6 +26890,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         or forward_call_index is None
         or block_start_index is None
         or block_end_index is None
+        or stage7_return_match is None
         or block_end_index < block_start_index
         or branch_count < 1
     ):
@@ -26906,8 +26919,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     score_cast_name = stage7_param_names[-1] if stage7_param_names else "wadkd_cast5_out0"
     if score_cast_name == "scores_map" and len(stage7_param_names) >= 2:
         score_cast_name = stage7_param_names[-2]
-    score_tail_match = score_tail_re.match(lines[block_end_index])
-    score_lhs = str(score_tail_match.group(0).strip().split(" = ", 1)[0]) if score_tail_match is not None else "scores"
+    score_lhs = str(stage7_return_match.group("score"))
     add_names = [str(match.group("input")) for _, match in stage7_shape_matches[:branch_count]]
     tr_names = [str(match.group("tr")) for _, match in stage7_singleton_anchor_matches[:branch_count]]
     temp_prefix = re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_]+", "_", score_lhs)).strip("_")
