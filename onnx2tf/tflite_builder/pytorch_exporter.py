@@ -27090,7 +27090,7 @@ _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
 _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
     r"^\s*self\.register_buffer\((?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote),\s*"
     r"torch\.zeros\((?:size=)?(?:\[|\()\s*1\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)\s*(?:\]|\))"
-    r"(?:,\s*dtype=torch\.(?P<dtype>[A-Za-z0-9_]+))?\)"
+    r"(?P<zeros_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)"
     r"(?:,\s*persistent=(?P<persistent>True|False))?\)$"
 )
 
@@ -27158,8 +27158,9 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             if shape not in known_shadowformer_shapes:
                 continue
             zeros_expr = f"torch.zeros([1, {shape[0]}, {shape[1]}, {shape[2]}]"
-            if register_match.group("dtype") is not None:
-                zeros_expr += f", dtype=torch.{register_match.group('dtype')}"
+            zeros_kwargs = str(register_match.group("zeros_kwargs") or "")
+            if zeros_kwargs:
+                zeros_expr += zeros_kwargs
             zeros_expr += ")"
             quote = register_match.group("quote")
             rewritten = f"        self.register_buffer({quote}{register_match.group('buffer')}{quote}, {zeros_expr}"
