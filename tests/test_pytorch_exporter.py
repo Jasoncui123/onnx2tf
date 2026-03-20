@@ -3517,6 +3517,34 @@ def test_apply_fast_precanonicalize_repairs_does_not_apply_shadowformer_repair_w
     assert repaired == original
 
 
+def test_apply_fast_precanonicalize_repairs_does_not_apply_shadowformer_repair_with_register_and_copy_only(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_register_copy_only_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    original = "\n".join(
+        [
+            "import torch",
+            "class Model(torch.nn.Module):",
+            "    def __init__(self):",
+            "        super().__init__()",
+            "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+            "    def _refresh_constant_buffer_aliases(self):",
+            "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+            "    def forward(self, x):",
+            "        return x",
+            "",
+        ]
+    )
+    model_path.write_text(original, encoding="utf-8")
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert repaired == original
+
+
 def test_should_skip_expensive_raw_canonicalize_for_bread_after_fast_canonical_form(
     tmp_path,
 ) -> None:
