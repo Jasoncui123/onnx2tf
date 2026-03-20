@@ -26078,22 +26078,6 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
 
     exact_line_rewrites = {
-        "        wa_resize_out_nhwc_cf = _apply_resize(wadiff3_diff30_cv_out_nhwc_cf, [24, 40], method='bilinear', target_shape=[1, 24, 40, 32], align_corners=False, half_pixel_centers=True, channel_last=False)":
-            "        wa_resize_out_nhwc_cf = _apply_resize(wadiff3_diff30_cv_out_nhwc_cf, [24, 40], method='bilinear', target_shape=[1, 32, 24, 40], align_corners=False, half_pixel_centers=True, channel_last=False)",
-        "        wa_resize_out_nhwc = _align_tensor_to_target_shape(wa_resize_out_nhwc_cf.permute(0, 2, 3, 1).contiguous(), [1, 24, 40, 32])":
-            "        wa_resize_out_nhwc = wa_resize_out_nhwc_cf",
-        "        wa_resize1_out_nhwc_cf = _apply_resize(wadiff4_diff40_cv_out_nhwc_cf, [24, 40], method='bilinear', target_shape=[1, 24, 40, 64], align_corners=False, half_pixel_centers=True, channel_last=False)":
-            "        wa_resize1_out_nhwc_cf = _apply_resize(wadiff4_diff40_cv_out_nhwc_cf, [24, 40], method='bilinear', target_shape=[1, 64, 24, 40], align_corners=False, half_pixel_centers=True, channel_last=False)",
-        "        wa_resize1_out_nhwc = _align_tensor_to_target_shape(wa_resize1_out_nhwc_cf.permute(0, 2, 3, 1).contiguous(), [1, 24, 40, 64])":
-            "        wa_resize1_out_nhwc = wa_resize1_out_nhwc_cf",
-        "        waspp_resize_out_nhwc_cf = _apply_resize(wasppscale1_scale13_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 5, 96, 3], align_corners=False, half_pixel_centers=True, channel_last=False)":
-            "        waspp_resize_out_nhwc_cf = _apply_resize(wasppscale1_scale13_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 96, 3, 5], align_corners=False, half_pixel_centers=True, channel_last=False)",
-        "        waspp_resize1_out_nhwc_cf = _apply_resize(wasppscale2_scale23_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 5, 96, 3], align_corners=False, half_pixel_centers=True, channel_last=False)":
-            "        waspp_resize1_out_nhwc_cf = _apply_resize(wasppscale2_scale23_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 96, 3, 5], align_corners=False, half_pixel_centers=True, channel_last=False)",
-        "        waspp_resize2_out_nhwc_cf = _apply_resize(wasppscale3_scale33_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 5, 96, 3], align_corners=False, half_pixel_centers=True, channel_last=False)":
-            "        waspp_resize2_out_nhwc_cf = _apply_resize(wasppscale3_scale33_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 96, 3, 5], align_corners=False, half_pixel_centers=True, channel_last=False)",
-        "        waspp_resize3_out_nhwc_cf = _apply_resize(wasppscale4_scale43_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 5, 96, 3], align_corners=False, half_pixel_centers=True, channel_last=False)":
-            "        waspp_resize3_out_nhwc_cf = _apply_resize(wasppscale4_scale43_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 96, 3, 5], align_corners=False, half_pixel_centers=True, channel_last=False)",
     }
 
     for index, line in enumerate(lines):

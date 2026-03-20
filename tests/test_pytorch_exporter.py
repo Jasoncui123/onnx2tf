@@ -3326,6 +3326,37 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_pad_pool_
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_resize_tail_with_generic_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_resize_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_branch_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_resize_tail_cf = _apply_resize(spp_branch_cf, [3, 5], method='bilinear', target_shape=[1, 5, 96, 3], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        return spp_resize_tail_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_resize_tail_cf = _apply_resize(spp_branch_cf, [3, 5], method='bilinear', "
+        "target_shape=[1, 96, 3, 5], align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_resize_alias_binary_bridge_to_channel_first(tmp_path) -> None:
     package_dir = tmp_path / "resize_alias_binary_bridge_pkg"
     package_dir.mkdir()
