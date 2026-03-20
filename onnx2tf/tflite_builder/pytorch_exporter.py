@@ -27627,6 +27627,21 @@ def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
 def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
     pool_channel_last_re = re.compile(r"(?:^|[,(])\s*channel_last\s*=\s*False(?:$|[,)])")
 
+    (
+        registered_shapes,
+        _buffer_shapes,
+        _copied_buffers,
+        copied_shapes,
+        aligned_shapes,
+        _buffer_aligned_buffers,
+        buffer_aligned_shapes,
+    ) = _collect_shadowformer_fast_repair_facts(lines)
+    supported_shapes = _collect_shadowformer_supported_shapes(
+        registered_shapes,
+        copied_shapes,
+        aligned_shapes,
+        buffer_aligned_shapes,
+    )
     has_cf_pool = False
     for line in lines:
         current_line = str(line)
@@ -27636,7 +27651,9 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
     if not has_cf_pool:
         return False
     repeated_windows: Dict[Tuple[int, int], int] = {}
-    for _, _, height, width in softmax_shapes:
+    for _, heads, height, width in softmax_shapes:
+        if supported_shapes and (heads, height, width) not in supported_shapes:
+            continue
         repeated_windows[(height, width)] = repeated_windows.get((height, width), 0) + 1
     return any(count >= 2 for count in repeated_windows.values())
 

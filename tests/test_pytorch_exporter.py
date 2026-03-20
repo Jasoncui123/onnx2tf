@@ -3462,6 +3462,38 @@ def test_should_not_avoid_model_ir_in_raw_canonicalize_for_shadowformer_without_
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is False
 
 
+def test_should_not_avoid_model_ir_in_raw_canonicalize_for_shadowformer_with_mismatched_supported_buffer_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_semantic_mismatched_supported_shape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, pooled_cf, enc_attn, dec_attn, dec0_rhs):",
+                "        pooled_out = _apply_pool2d(pooled_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=False)",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_1, _binary_rhs_1), [12, 48, 6, 64])",
+                "        encoder_softmax = _apply_softmax(enc_attn, axis=3, beta=1.0, target_shape=[24, 9, 32, 32])",
+                "        decoder_softmax = _apply_softmax(dec_attn, axis=3, beta=1.0, target_shape=[24, 9, 32, 32])",
+                "        return pooled_out, dec0_mul, encoder_softmax, decoder_softmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is False
+
+
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes(
     tmp_path,
 ) -> None:
