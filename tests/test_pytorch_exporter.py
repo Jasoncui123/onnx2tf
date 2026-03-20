@@ -1825,12 +1825,12 @@ def test_should_skip_expensive_raw_canonicalize_for_sinet_fast_repaired_package(
             [
                 "import torch",
                 "class Model(torch.nn.Module):",
-                "    def forward(self, t_469, cv73_out_cf, t_771):",
-                "        t_471 = torch.reshape(t_469, [1, 64, 1, 1])",
+                "    def forward(self, bn_scale, cv73_out_cf, t_772):",
+                "        self.const_mask = torch.zeros([1, 80, 80, 2], dtype=torch.float32)",
+                "        t_471 = torch.reshape(bn_scale, [1, 64, 1, 1])",
                 "        cv79_in = cv73_out_cf[:, [0, 24, 1, 25], :, :]",
-                "        t_772 = t_771",
-                "        x = self.const_tensor786_expand_x80_x2_af49",
-                "        return x",
+                "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs(t_772, self.const_mask.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])",
+                "        return cv79_in, t_471, _binary_lhs_196, _binary_rhs_196",
                 "",
             ]
         ),
@@ -1838,6 +1838,56 @@ def test_should_skip_expensive_raw_canonicalize_for_sinet_fast_repaired_package(
     )
 
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_sinet_semantic_signature_without_fixed_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "sinet_semantic_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scale_cf, stage_cf, gate_cf):",
+                "        bn_bias_cf = torch.reshape(scale_cf, [1, 96, 1, 1])",
+                "        gathered = stage_cf[:, [3, 19, 4, 20, 5, 21], :, :]",
+                "        gate_lhs, gate_rhs = _align_binary_inputs(gate_cf, self.const_mask_tensor.permute(0, 3, 1, 2).contiguous(), [1, 2, 64, 64])",
+                "        return bn_bias_cf, gathered, gate_lhs, gate_rhs",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_not_skip_expensive_raw_canonicalize_for_incomplete_sinet_like_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "sinet_incomplete_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scale_cf, stage_cf, gate_cf):",
+                "        bn_bias_cf = torch.reshape(scale_cf, [1, 64, 1, 1])",
+                "        gathered = stage_cf[:, [0, 24, 1, 25], :, :]",
+                "        gate_lhs, gate_rhs = _align_binary_inputs(gate_cf, self.const_mask_tensor.permute(0, 3, 1, 2).contiguous(), [1, 3, 64, 64])",
+                "        return bn_bias_cf, gathered, gate_lhs, gate_rhs",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
 
 
 def test_should_not_skip_expensive_raw_canonicalize_for_generic_package(
@@ -2542,6 +2592,63 @@ def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes
     assert "[24, 100, 4, 100]" not in repaired
     assert "[24, 100, 8, 100]" not in repaired
     assert "[24, 100, 100, 4]" not in repaired
+    assert "[6, 100, 16, 100]" not in repaired
+    assert "[24, 4, 100, 100]" in repaired
+    assert "[24, 8, 100, 100]" in repaired
+    assert "[6, 16, 100, 100]" in repaired
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_without_fixed_buffer_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_generic_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_b', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_c', torch.zeros([1, 100, 8, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_d', torch.zeros([1, 100, 8, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_e', torch.zeros([1, 100, 16, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_f', torch.zeros([1, 100, 16, 100], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_b.copy_(self.attn_src_b.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_c.copy_(self.attn_src_c.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_d.copy_(self.attn_src_d.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_e.copy_(self.attn_src_e.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_f.copy_(self.attn_src_f.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, enc0_lhs, enc0_rhs, enc1_lhs, enc1_rhs, dec0_lhs, dec0_rhs, dec1_lhs, dec1_rhs):",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs(enc0_lhs, enc0_rhs, [24, 100, 4, 100])",
+                "        enc0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [24, 100, 4, 100])",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(enc1_lhs, enc1_rhs, [24, 100, 8, 100])",
+                "        enc1_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_1, _binary_rhs_1), [24, 100, 8, 100])",
+                "        _binary_lhs_2, _binary_rhs_2 = _align_binary_inputs(dec0_lhs, dec0_rhs, [6, 100, 16, 100])",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_2, _binary_rhs_2), [6, 100, 16, 100])",
+                "        _binary_lhs_3, _binary_rhs_3 = _align_binary_inputs(dec1_lhs, dec1_rhs, [24, 100, 8, 100])",
+                "        dec1_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_3, _binary_rhs_3), [24, 100, 8, 100])",
+                "        return enc0_mul, enc1_mul, dec0_mul, dec1_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "torch.zeros([1, 4, 100, 100]" in repaired
+    assert "torch.zeros([1, 8, 100, 100]" in repaired
+    assert "torch.zeros([1, 16, 100, 100]" in repaired
+    assert ".permute(*(0, 2, 1, 3)).contiguous()" not in repaired
+    assert "[24, 100, 4, 100]" not in repaired
+    assert "[24, 100, 8, 100]" not in repaired
     assert "[6, 100, 16, 100]" not in repaired
     assert "[24, 4, 100, 100]" in repaired
     assert "[24, 8, 100, 100]" in repaired

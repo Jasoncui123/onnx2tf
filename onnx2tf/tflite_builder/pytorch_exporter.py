@@ -26594,90 +26594,73 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     if not _has_shadowformer_fast_repair_signature(model_source.splitlines()):
         return
 
-    exact_replacements = {
-        "        self.register_buffer('const_wa_encoderlayer2_x4_x100_6c60', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)":
-            "        self.register_buffer('const_wa_encoderlayer2_x4_x100_6c60', torch.zeros([1, 4, 100, 100], dtype=torch.float32), persistent=False)",
-        "        self.register_buffer('const_wa_encoderlayer2_x4_x100_9073', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)":
-            "        self.register_buffer('const_wa_encoderlayer2_x4_x100_9073', torch.zeros([1, 4, 100, 100], dtype=torch.float32), persistent=False)",
-        "        self.register_buffer('const_wa_cv_x16_x100_4732', torch.zeros([1, 100, 16, 100], dtype=torch.float32), persistent=False)":
-            "        self.register_buffer('const_wa_cv_x16_x100_4732', torch.zeros([1, 16, 100, 100], dtype=torch.float32), persistent=False)",
-        "        self.register_buffer('const_wa_cv_x16_x100_dd74', torch.zeros([1, 100, 16, 100], dtype=torch.float32), persistent=False)":
-            "        self.register_buffer('const_wa_cv_x16_x100_dd74', torch.zeros([1, 16, 100, 100], dtype=torch.float32), persistent=False)",
-        "        self.register_buffer('const_wa_decoderlayer0_x8_x100_99f9', torch.zeros([1, 100, 8, 100], dtype=torch.float32), persistent=False)":
-            "        self.register_buffer('const_wa_decoderlayer0_x8_x100_99f9', torch.zeros([1, 8, 100, 100], dtype=torch.float32), persistent=False)",
-        "        self.register_buffer('const_wa_decoderlayer0_x8_x100_02d0', torch.zeros([1, 100, 8, 100], dtype=torch.float32), persistent=False)":
-            "        self.register_buffer('const_wa_decoderlayer0_x8_x100_02d0', torch.zeros([1, 8, 100, 100], dtype=torch.float32), persistent=False)",
-        "            self.const_wa_encoderlayer2_x4_x100_6c60.copy_(self.const_wa_encoderlayer_2_blocks_0_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())":
-            "            self.const_wa_encoderlayer2_x4_x100_6c60.copy_(self.const_wa_encoderlayer_2_blocks_0_attn_Unsqueeze_1_output_0)",
-        "            self.const_wa_encoderlayer2_x4_x100_9073.copy_(self.const_wa_encoderlayer_2_blocks_1_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())":
-            "            self.const_wa_encoderlayer2_x4_x100_9073.copy_(self.const_wa_encoderlayer_2_blocks_1_attn_Unsqueeze_1_output_0)",
-        "            self.const_wa_cv_x16_x100_4732.copy_(self.const_wa_conv_blocks_0_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())":
-            "            self.const_wa_cv_x16_x100_4732.copy_(self.const_wa_conv_blocks_0_attn_Unsqueeze_1_output_0)",
-        "            self.const_wa_cv_x16_x100_dd74.copy_(self.const_wa_conv_blocks_1_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())":
-            "            self.const_wa_cv_x16_x100_dd74.copy_(self.const_wa_conv_blocks_1_attn_Unsqueeze_1_output_0)",
-        "            self.const_wa_decoderlayer0_x8_x100_99f9.copy_(self.const_wa_decoderlayer_0_blocks_0_attn_Unsqueeze_output_0.permute(*(0, 2, 1, 3)).contiguous())":
-            "            self.const_wa_decoderlayer0_x8_x100_99f9.copy_(self.const_wa_decoderlayer_0_blocks_0_attn_Unsqueeze_output_0)",
-        "            self.const_wa_decoderlayer0_x8_x100_02d0.copy_(self.const_wa_decoderlayer_0_blocks_1_attn_Unsqueeze_output_0.permute(*(0, 2, 1, 3)).contiguous())":
-            "            self.const_wa_decoderlayer0_x8_x100_02d0.copy_(self.const_wa_decoderlayer_0_blocks_1_attn_Unsqueeze_output_0)",
-        "        _binary_lhs_255, _binary_rhs_255 = _align_binary_inputs(waencoderlay_blocks0_attn_mul1_out0_de05, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 4, 100, 100])":
-            "        _binary_lhs_255, _binary_rhs_255 = _align_binary_inputs(waencoderlay_blocks0_attn_mul1_out0_de05, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 4, 100, 100])",
-        "        waencoderlayer2_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_255, _binary_rhs_255), [24, 100, 4, 100])":
-            "        waencoderlayer2_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_255, _binary_rhs_255), [24, 4, 100, 100])",
-        "        _binary_lhs_256, _binary_rhs_256 = _align_binary_inputs(waencoderlayer2_blocks0_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_6c60, [24, 100, 100, 4])":
-            "        _binary_lhs_256, _binary_rhs_256 = _align_binary_inputs(waencoderlayer2_blocks0_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_6c60, [24, 4, 100, 100])",
-        "        _binary_lhs_330, _binary_rhs_330 = _align_binary_inputs(waencoderlay_blocks1_attn_mul1_out0_5003, waencode_blocks1_attn_unsqueez_out0_2817, [24, 4, 100, 100])":
-            "        _binary_lhs_330, _binary_rhs_330 = _align_binary_inputs(waencoderlay_blocks1_attn_mul1_out0_5003, waencode_blocks1_attn_unsqueez_out0_2817, [24, 4, 100, 100])",
-        "        waencoderlayer2_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_330, _binary_rhs_330), [24, 100, 4, 100])":
-            "        waencoderlayer2_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_330, _binary_rhs_330), [24, 4, 100, 100])",
-        "        _binary_lhs_331, _binary_rhs_331 = _align_binary_inputs(waencoderlayer2_blocks1_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_9073, [24, 100, 100, 4])":
-            "        _binary_lhs_331, _binary_rhs_331 = _align_binary_inputs(waencoderlayer2_blocks1_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_9073, [24, 4, 100, 100])",
-        "        _binary_lhs_414, _binary_rhs_414 = _align_binary_inputs(waconvblocks0_attn_mat_mul1_out0, waconvblocks0_attn_unsqueeze_out0, [6, 100, 16, 100])":
-            "        _binary_lhs_414, _binary_rhs_414 = _align_binary_inputs(waconvblocks0_attn_mat_mul1_out0, waconvblocks0_attn_unsqueeze_out0, [6, 16, 100, 100])",
-        "        waconvblocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_414, _binary_rhs_414), [6, 100, 16, 100])":
-            "        waconvblocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_414, _binary_rhs_414), [6, 16, 100, 100])",
-        "        _binary_lhs_489, _binary_rhs_489 = _align_binary_inputs(waconvblocks1_attn_mat_mul1_out0, waconvblocks1_attn_unsqueeze_out0, [6, 100, 16, 100])":
-            "        _binary_lhs_489, _binary_rhs_489 = _align_binary_inputs(waconvblocks1_attn_mat_mul1_out0, waconvblocks1_attn_unsqueeze_out0, [6, 16, 100, 100])",
-        "        waconvblocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_489, _binary_rhs_489), [6, 100, 16, 100])":
-            "        waconvblocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_489, _binary_rhs_489), [6, 16, 100, 100])",
-        "        _binary_lhs_574, _binary_rhs_574 = _align_binary_inputs(wadecoderlaye_blocks0_attn_mul_out0_2453, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 100, 8, 100])":
-            "        _binary_lhs_574, _binary_rhs_574 = _align_binary_inputs(wadecoderlaye_blocks0_attn_mul_out0_2453, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 8, 100, 100])",
-        "        wadecoderlayer0_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_574, _binary_rhs_574), [24, 100, 8, 100])":
-            "        wadecoderlayer0_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_574, _binary_rhs_574), [24, 8, 100, 100])",
-        "        _binary_lhs_649, _binary_rhs_649 = _align_binary_inputs(wadecoderlaye_blocks1_attn_mul_out0_3eec, waencode_blocks1_attn_unsqueez_out0_2817, [24, 100, 8, 100])":
-            "        _binary_lhs_649, _binary_rhs_649 = _align_binary_inputs(wadecoderlaye_blocks1_attn_mul_out0_3eec, waencode_blocks1_attn_unsqueez_out0_2817, [24, 8, 100, 100])",
-        "        wadecoderlayer0_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_649, _binary_rhs_649), [24, 100, 8, 100])":
-            "        wadecoderlayer0_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_649, _binary_rhs_649), [24, 8, 100, 100])",
-    }
-
     changed = False
-    for old_text, new_text in exact_replacements.items():
-        if old_text in model_source:
-            model_source = model_source.replace(old_text, new_text)
-            changed = True
-
     lines = model_source.splitlines()
-    copy_alias_replacements = {
-        "self.const_wa_encoderlayer2_x4_x100_6c60.copy_(":
-            "self.const_wa_encoderlayer2_x4_x100_6c60.copy_(self.const_wa_encoderlayer_2_blocks_0_attn_Unsqueeze_1_output_0)",
-        "self.const_wa_encoderlayer2_x4_x100_9073.copy_(":
-            "self.const_wa_encoderlayer2_x4_x100_9073.copy_(self.const_wa_encoderlayer_2_blocks_1_attn_Unsqueeze_1_output_0)",
-        "self.const_wa_cv_x16_x100_4732.copy_(":
-            "self.const_wa_cv_x16_x100_4732.copy_(self.const_wa_conv_blocks_0_attn_Unsqueeze_1_output_0)",
-        "self.const_wa_cv_x16_x100_dd74.copy_(":
-            "self.const_wa_cv_x16_x100_dd74.copy_(self.const_wa_conv_blocks_1_attn_Unsqueeze_1_output_0)",
-        "self.const_wa_decoderlayer0_x8_x100_99f9.copy_(":
-            "self.const_wa_decoderlayer0_x8_x100_99f9.copy_(self.const_wa_decoderlayer_0_blocks_0_attn_Unsqueeze_output_0)",
-        "self.const_wa_decoderlayer0_x8_x100_02d0.copy_(":
-            "self.const_wa_decoderlayer0_x8_x100_02d0.copy_(self.const_wa_decoderlayer_0_blocks_1_attn_Unsqueeze_output_0)",
-    }
+    register_buffer_re = re.compile(
+        r"torch\.zeros\(\[1, 100, (?P<heads>4|8|16), 100\], dtype=torch\.float32\)"
+    )
+    copy_permute_re = re.compile(
+        r"^(?P<indent>\s*self\.[A-Za-z0-9_]+\.copy_\()(?P<src>.+)\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
+    )
+    binary_shape_re = re.compile(
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<dim1>100), (?P<heads>4|8|16), (?P<dim3>100)(?P<suffix>\]\))$"
+    )
+    binary_const_shape_re = re.compile(
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<dim1>100), (?P<dim2>100), (?P<heads>4|8|16)(?P<suffix>\]\))$"
+    )
+    mul_align_shape_re = re.compile(
+        r"^(?P<indent>\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[)(?P<batch>\d+), (?P<dim1>100), (?P<heads>4|8|16), (?P<dim3>100)(?P<suffix>\]\))$"
+    )
+
     for index, line in enumerate(lines):
-        stripped = line.lstrip()
-        indent = line[: len(line) - len(stripped)]
-        for prefix, replacement in copy_alias_replacements.items():
-            if stripped.startswith(prefix) and ".permute(*(0, 2, 1, 3)).contiguous()" in stripped:
-                lines[index] = f"{indent}{replacement}"
+        current_line = str(line)
+        register_match = register_buffer_re.search(current_line)
+        if register_match is not None:
+            rewritten = register_buffer_re.sub(
+                f"torch.zeros([1, {register_match.group('heads')}, 100, 100], dtype=torch.float32)",
+                current_line,
+            )
+            if rewritten != current_line:
+                lines[index] = rewritten
                 changed = True
-                break
+            continue
+        copy_match = copy_permute_re.match(current_line)
+        if copy_match is not None:
+            rewritten = f"{copy_match.group('indent')}{copy_match.group('src')})"
+            if rewritten != current_line:
+                lines[index] = rewritten
+                changed = True
+            continue
+        binary_match = binary_shape_re.match(current_line)
+        if binary_match is not None:
+            rewritten = (
+                f"{binary_match.group('indent')}{binary_match.group('batch')}, "
+                f"{binary_match.group('heads')}, 100, 100{binary_match.group('suffix')}"
+            )
+            if rewritten != current_line:
+                lines[index] = rewritten
+                changed = True
+            continue
+        binary_const_match = binary_const_shape_re.match(current_line)
+        if binary_const_match is not None:
+            rewritten = (
+                f"{binary_const_match.group('indent')}{binary_const_match.group('batch')}, "
+                f"{binary_const_match.group('heads')}, 100, 100{binary_const_match.group('suffix')}"
+            )
+            if rewritten != current_line:
+                lines[index] = rewritten
+                changed = True
+            continue
+        mul_match = mul_align_shape_re.match(current_line)
+        if mul_match is not None:
+            rewritten = (
+                f"{mul_match.group('indent')}{mul_match.group('batch')}, "
+                f"{mul_match.group('heads')}, 100, 100{mul_match.group('suffix')}"
+            )
+            if rewritten != current_line:
+                lines[index] = rewritten
+                changed = True
+            continue
     model_source = "\n".join(lines)
 
     if changed:
@@ -27009,14 +26992,70 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
     return bool(padded_inputs & mean_inputs) and has_scale4_mul and has_scale4_add and has_pag_mul
 
 
+def _is_interleaved_channel_pair_indices(indices: Sequence[int]) -> bool:
+    if len(indices) < 4 or len(indices) % 2 != 0:
+        return False
+    expected_base = int(indices[0])
+    pair_offset: int | None = None
+    for index in range(0, len(indices), 2):
+        base_index = int(indices[index])
+        paired_index = int(indices[index + 1])
+        if base_index != expected_base:
+            return False
+        current_offset = paired_index - base_index
+        if current_offset <= 1:
+            return False
+        if pair_offset is None:
+            pair_offset = current_offset
+        elif current_offset != pair_offset:
+            return False
+        expected_base += 1
+    return True
+
+
+def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
+    gather_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = [A-Za-z0-9_]+\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
+    )
+    reshape_bn_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, \[1, (?P<channels>\d+), 1, 1\]\)$"
+    )
+    mask_align_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, self\.[A-Za-z0-9_]+\.permute\(0, 3, 1, 2\)\.contiguous\(\), \[1, 2, (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+
+    has_interleaved_cf_gather = False
+    has_bn_reshape = False
+    has_mask_align = False
+    for line in lines:
+        current_line = str(line)
+        gather_match = gather_re.match(current_line)
+        if gather_match is not None:
+            raw_indices = [
+                int(raw_index.strip())
+                for raw_index in str(gather_match.group("indices")).split(",")
+                if raw_index.strip()
+            ]
+            if _is_interleaved_channel_pair_indices(raw_indices):
+                has_interleaved_cf_gather = True
+                continue
+        reshape_match = reshape_bn_re.match(current_line)
+        if reshape_match is not None and int(reshape_match.group("channels")) >= 32:
+            has_bn_reshape = True
+            continue
+        if mask_align_re.match(current_line) is not None:
+            has_mask_align = True
+    return has_interleaved_cf_gather and has_bn_reshape and has_mask_align
+
+
 def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     register_buffer_count = _count_lines_matching(
         lines,
-        r"^\s*self\.register_buffer\('const_wa_[A-Za-z0-9_]+_x(?:4|8|16)_x100_[A-Za-z0-9_]+', torch\.zeros\(\[1, 100, (?:4|8|16), 100\], dtype=torch\.float32\), persistent=False\)$",
+        r"^\s*self\.register_buffer\('[A-Za-z0-9_]+', torch\.zeros\(\[1, 100, (?:4|8|16), 100\], dtype=torch\.float32\), persistent=False\)$",
     )
     copy_permute_count = _count_lines_matching(
         lines,
-        r"^\s*self\.const_wa_[A-Za-z0-9_]+_x(?:4|8|16)_x100_[A-Za-z0-9_]+\.copy_\(.+\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$",
+        r"^\s*self\.[A-Za-z0-9_]+\.copy_\(.+\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$",
     )
     attn_binary_count = _count_lines_matching(
         lines,
@@ -27059,13 +27098,7 @@ def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Pat
     model_lines = _model_source_lines(model_source)
     # SiNet's generated package is already repaired by the fast pre-canonicalize
     # pass, while the generic raw canonicalizer can take minutes on this pattern.
-    sinet_markers = (
-        "const_tensor786_expand_x80_x2_af49",
-        "cv73_out_cf[:, [0, 24, 1, 25",
-        "t_471 = torch.reshape(t_469, [1, 64, 1, 1])",
-        "t_772 = t_771",
-    )
-    if all(marker in model_source for marker in sinet_markers):
+    if _has_sinet_skip_signature(model_lines):
         return True
     if _has_pidnet_skip_signature(model_lines):
         return True
