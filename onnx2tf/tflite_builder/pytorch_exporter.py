@@ -27072,16 +27072,16 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     changed = False
     lines = model_source.splitlines()
     register_buffer_re = re.compile(
-        r"torch\.zeros\(\[1, (?P<window>\d+), (?P<heads>4|8|16), (?P=window)\], dtype=torch\.float32\)"
+        r"torch\.zeros\(\[1, (?P<window>\d+), (?P<heads>\d+), (?P=window)\], dtype=torch\.float32\)"
     )
     copy_permute_re = re.compile(
         r"^(?P<indent>\s*self\.[A-Za-z0-9_]+\.copy_\()(?P<src>.+)\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
     )
     binary_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P<heads>4|8|16), (?P=window)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P<heads>\d+), (?P=window)(?P<suffix>\]\))$"
     )
     binary_const_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P=window), (?P<heads>4|8|16)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P=window), (?P<heads>\d+)(?P<suffix>\]\))$"
     )
     mul_align_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[)"
@@ -27134,12 +27134,17 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
                 int(mul_match.group("d2")),
                 int(mul_match.group("d3")),
             ]
-            head_dims = [dim for dim in dims if dim in {4, 8, 16}]
-            non_head_dims = [dim for dim in dims if dim not in {4, 8, 16}]
-            if len(head_dims) == 1 and len(non_head_dims) == 2 and non_head_dims[0] == non_head_dims[1]:
+            repeated_dims = [
+                dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 2
+            ]
+            repeated_dims = list(dict.fromkeys(repeated_dims))
+            head_dims = [
+                dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 1
+            ]
+            if len(repeated_dims) == 1 and len(head_dims) == 1:
                 rewritten = (
                     f"{mul_match.group('indent')}{mul_match.group('batch')}, "
-                    f"{head_dims[0]}, {non_head_dims[0]}, {non_head_dims[1]}{mul_match.group('suffix')}"
+                    f"{head_dims[0]}, {repeated_dims[0]}, {repeated_dims[0]}{mul_match.group('suffix')}"
                 )
                 if rewritten != current_line:
                     lines[index] = rewritten
@@ -27535,7 +27540,7 @@ def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
 def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     register_buffer_count = _count_lines_matching(
         lines,
-        r"^\s*self\.register_buffer\('[A-Za-z0-9_]+', torch\.zeros\(\[1, \d+, (?:4|8|16), \d+\], dtype=torch\.float32\), persistent=False\)$",
+        r"^\s*self\.register_buffer\('[A-Za-z0-9_]+', torch\.zeros\(\[1, \d+, \d+, \d+\], dtype=torch\.float32\), persistent=False\)$",
     )
     copy_permute_count = _count_lines_matching(
         lines,
@@ -27543,7 +27548,7 @@ def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     )
     attn_binary_count = _count_lines_matching(
         lines,
-        r"^\s*_[A-Za-z0-9_]+, _[A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_]+, \[(?:24|6), \d+, (?:4|8|16), \d+\]\)$",
+        r"^\s*_[A-Za-z0-9_]+, _[A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_]+, \[\d+, \d+, \d+, \d+\]\)$",
     )
     return register_buffer_count >= 6 and copy_permute_count >= 6 and attn_binary_count >= 4
 
@@ -27553,7 +27558,7 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
         r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\([A-Za-z0-9_]+, .*channel_last=False\)$"
     )
     softmax_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>4|8|16), (?P<window>\d+), (?P=window)\]\)$"
+        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>\d+), (?P<window>\d+), (?P=window)\]\)$"
     )
 
     has_cf_pool = False
