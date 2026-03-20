@@ -20549,6 +20549,22 @@ def _canonicalize_generated_model_source_for_raw_export(
     transposed_const_alias_specs: Dict[str, Tuple[str, List[int], str]] = {}
     inline_const_buffer_specs: Dict[str, Tuple[str, str]] = {}
     inline_const_buffer_cache: Dict[Tuple[str, str], str] = {}
+
+    def _buffer_channel_count(const_attr: str) -> int | None:
+        buffer_spec = buffer_specs.get(str(const_attr), None)
+        if buffer_spec is None:
+            return None
+        _, shape_values, _, _ = buffer_spec
+        non_singleton_dims = [int(value) for value in shape_values if int(value) != 1]
+        if len(non_singleton_dims) == 1:
+            return int(non_singleton_dims[0])
+        if len(shape_values) == 4:
+            if int(shape_values[1]) != 1 and int(shape_values[3]) == 1:
+                return int(shape_values[1])
+            if int(shape_values[3]) != 1 and int(shape_values[1]) == 1:
+                return int(shape_values[3])
+        return None
+
     inside_nms_method = False
     for index, line in enumerate(lines):
         stripped_line = line.strip()
@@ -20694,6 +20710,10 @@ def _canonicalize_generated_model_source_for_raw_export(
                 recent_shape = _find_recent_rank4_shape(str(pidnet_spp_scale4_mul_match.group("input")), index)
                 if recent_shape is not None and len(recent_shape) == 4:
                     preferred_channels = int(recent_shape[1])
+            if preferred_channels is None:
+                preferred_channels = _buffer_channel_count(
+                    str(pidnet_spp_scale4_mul_match.group("const_attr"))
+                )
             channel_count = (
                 int(preferred_channels)
                 if preferred_channels is not None

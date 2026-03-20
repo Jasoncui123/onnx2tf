@@ -473,6 +473,41 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_direct_mul_w
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_direct_mul_from_buffer_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_direct_mul_buffer_shape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_demo_scale4_scale4_1_BatchNormalization_bn_mul', torch.zeros([1, 1, 1, 192], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, spp_global_unknown: torch.Tensor) -> torch.Tensor:",
+                "        spp_bn_mul_out = torch.mul(spp_global_unknown, self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul)",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = torch.mul(spp_global_unknown, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 192, 1, 1]))"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_generic_channels(
     tmp_path,
 ) -> None:
