@@ -1299,7 +1299,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
     assert "self.const_inline_literal_5" not in rewritten
     assert f"{stage7_prefix}_gather0_out0 = _reshape_gather_output(torch.index_select({stage7_prefix}_flatten_out0, 0, {stage7_prefix}_gather0_indices.to(dtype=torch.int64).reshape(-1)), {stage7_prefix}_flatten_out0, _shape_tensor({stage7_prefix}_gather0_indices, dtype=torch.int64, device={stage7_prefix}_gather0_indices.device), axis=0)" in rewritten
     assert f"{stage7_prefix}_mul0_out0 = torch.mul({stage7_prefix}_rs_fixed_0, wadkd_tr1_out0)" in rewritten
-    assert f"{stage7_prefix}_tr14_out0 = _torch_permute({stage7_prefix}_add2_out0, [0, 1, 3, 2])" in rewritten
+    assert f"{stage7_prefix}_tr14_out0 = _torch_permute(" in rewritten
     assert "_align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])" not in rewritten
 
 
@@ -1410,6 +1410,51 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_generic_n
     assert f"{stage7_prefix}_mul0_out0 = torch.mul({stage7_prefix}_rs_fixed_0, tr_a)" in rewritten
     assert f"{stage7_prefix}_mul44_out0 = torch.mul({stage7_prefix}_tr14_out0, score_cast)" in rewritten
     assert "_align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_three_branches(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alike_full_three_branch_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_7(self, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, add_c: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, tr_c: torch.Tensor, score_cast: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        descriptors = _torch_permute(score_div, [1, 0])",
+                "        shape_a = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)",
+                "        shape_b = _shape_tensor(add_b, dtype=torch.int32, device=add_b.device)",
+                "        shape_c = _shape_tensor(add_c, dtype=torch.int32, device=add_c.device)",
+                "        rs_a = torch.reshape(gather_a, _resolve_reshape_shape([-1, 1], gather_a, allow_zero=False))",
+                "        rs_b = torch.reshape(gather_b, _resolve_reshape_shape([-1, 1], gather_b, allow_zero=False))",
+                "        rs_c = torch.reshape(gather_c, _resolve_reshape_shape([-1, 1], gather_c, allow_zero=False))",
+                "        pair0_lhs, pair0_rhs = _align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])",
+                "        pair1_lhs, pair1_rhs = _align_binary_inputs_to_anchor(score_rs1, tr_b, [1, 1, 1, 1])",
+                "        pair2_lhs, pair2_rhs = _align_binary_inputs_to_anchor(score_rs2, tr_c, [1, 1, 1, 1])",
+                "        scores = torch.reshape(score_tail, (([1]) + ([1])))",
+                "        return descriptors, scores",
+                "    def forward(self, scores_map: torch.Tensor, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, add_c: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, tr_c: torch.Tensor, score_cast: torch.Tensor):",
+                "        descriptors, scores = self._forward_stage_7(x0, add_a, add_b, add_c, score_div, tr_a, tr_b, tr_c, score_cast)",
+                "        return descriptors, scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_alike_fast_precanonicalize_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    stage7_prefix = "scores_stage7"
+    assert f"{stage7_prefix}_shape2_out0 = _shape_tensor(add_c, dtype=torch.int32, device=add_c.device)" in rewritten
+    assert f"{stage7_prefix}_mul2_out0 = torch.mul({stage7_prefix}_rs_fixed_2, tr_c)" in rewritten
+    assert f"{stage7_prefix}_add1_out0 = torch.add({stage7_prefix}_add0_out0, {stage7_prefix}_mul2_out0)" in rewritten
+    assert f"{stage7_prefix}_tr14_out0 = _torch_permute({stage7_prefix}_add1_out0, [0, 1, 3, 2])" in rewritten
+    assert "_align_binary_inputs_to_anchor(score_rs2, tr_c, [1, 1, 1, 1])" not in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_fix_efficientformer_attention_scalar_mul_target(

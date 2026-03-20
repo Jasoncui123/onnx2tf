@@ -26583,8 +26583,8 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     return (
         has_stage7_def
         and has_forward_call
-        and gather_reshape_count >= 4
-        and singleton_anchor_count >= 4
+        and gather_reshape_count >= 1
+        and singleton_anchor_count >= 1
         and has_score_tail
     )
 
@@ -26781,15 +26781,15 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 stage7_singleton_anchor_matches.append((scan_index, singleton_anchor_match))
             if block_end_index is None and score_tail_re.match(lines[scan_index]) is not None:
                 block_end_index = scan_index
-    block_start_index = stage7_shape_matches[0][0] if len(stage7_shape_matches) >= 4 else None
+    branch_count = min(len(stage7_shape_matches), len(stage7_singleton_anchor_matches))
+    block_start_index = stage7_shape_matches[0][0] if branch_count >= 1 else None
     if (
         stage7_def_index is None
         or forward_call_index is None
         or block_start_index is None
         or block_end_index is None
         or block_end_index < block_start_index
-        or len(stage7_shape_matches) < 4
-        or len(stage7_singleton_anchor_matches) < 4
+        or branch_count < 1
     ):
         if changed:
             model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -26818,8 +26818,8 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         score_cast_name = stage7_param_names[-2]
     score_tail_match = score_tail_re.match(lines[block_end_index])
     score_lhs = str(score_tail_match.group(0).strip().split(" = ", 1)[0]) if score_tail_match is not None else "scores"
-    add_names = [str(match.group("input")) for _, match in stage7_shape_matches[:4]]
-    tr_names = [str(match.group("tr")) for _, match in stage7_singleton_anchor_matches[:4]]
+    add_names = [str(match.group("input")) for _, match in stage7_shape_matches[:branch_count]]
+    tr_names = [str(match.group("tr")) for _, match in stage7_singleton_anchor_matches[:branch_count]]
     temp_prefix = re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_]+", "_", score_lhs)).strip("_")
     if not temp_prefix:
         temp_prefix = "stage7"
@@ -26828,25 +26828,25 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     temp_prefix = f"{temp_prefix}_stage7"
 
     flatten_name = f"{temp_prefix}_flatten_out0"
-    shape_names = [f"{temp_prefix}_shape{index}_out0" for index in range(4)]
+    shape_names = [f"{temp_prefix}_shape{index}_out0" for index in range(branch_count)]
     shape_prefix_name = f"{temp_prefix}_shape_prefix_out0"
-    gather_negative_names = [f"{temp_prefix}_gather{index}_is_negative" for index in range(4)]
-    gather_wrapped_names = [f"{temp_prefix}_gather{index}_wrapped_runtime" for index in range(4)]
-    gather_index_names = [f"{temp_prefix}_gather{index}_indices" for index in range(4)]
-    gather_names = [f"{temp_prefix}_gather{index}_out0" for index in range(4)]
-    rs_names = [f"{temp_prefix}_rs{index}_out0" for index in range(4)]
-    concat_names = [f"{temp_prefix}_concat{index}_out0" for index in range(4)]
-    tr_stage_names = [f"{temp_prefix}_tr{index}_out0" for index in range(4)]
-    rs_shape_dim0_names = [f"{temp_prefix}_rs_shape_dim0_{index}" for index in range(4)]
-    rs_in_shape_names = [f"{temp_prefix}_rs_in_shape_{index}" for index in range(4)]
-    rs_in_dim0_names = [f"{temp_prefix}_rs_in_dim0_{index}" for index in range(4)]
-    rs_shape_dim0_is_zero_names = [f"{temp_prefix}_rs_shape_dim0_is_zero_{index}" for index in range(4)]
-    rs_shape_dim0_fixed_names = [f"{temp_prefix}_rs_shape_dim0_fixed_{index}" for index in range(4)]
-    rs_shape_tail_names = [f"{temp_prefix}_rs_shape_tail_{index}" for index in range(4)]
-    rs_shape_fixed_names = [f"{temp_prefix}_rs_shape_fixed_{index}" for index in range(4)]
-    rs_fixed_names = [f"{temp_prefix}_rs_fixed_{index}" for index in range(4)]
-    mul_names = [f"{temp_prefix}_mul{index}_out0" for index in range(4)]
-    add_accum_names = [f"{temp_prefix}_add{index}_out0" for index in range(3)]
+    gather_negative_names = [f"{temp_prefix}_gather{index}_is_negative" for index in range(branch_count)]
+    gather_wrapped_names = [f"{temp_prefix}_gather{index}_wrapped_runtime" for index in range(branch_count)]
+    gather_index_names = [f"{temp_prefix}_gather{index}_indices" for index in range(branch_count)]
+    gather_names = [f"{temp_prefix}_gather{index}_out0" for index in range(branch_count)]
+    rs_names = [f"{temp_prefix}_rs{index}_out0" for index in range(branch_count)]
+    concat_names = [f"{temp_prefix}_concat{index}_out0" for index in range(branch_count)]
+    tr_stage_names = [f"{temp_prefix}_tr{index}_out0" for index in range(branch_count)]
+    rs_shape_dim0_names = [f"{temp_prefix}_rs_shape_dim0_{index}" for index in range(branch_count)]
+    rs_in_shape_names = [f"{temp_prefix}_rs_in_shape_{index}" for index in range(branch_count)]
+    rs_in_dim0_names = [f"{temp_prefix}_rs_in_dim0_{index}" for index in range(branch_count)]
+    rs_shape_dim0_is_zero_names = [f"{temp_prefix}_rs_shape_dim0_is_zero_{index}" for index in range(branch_count)]
+    rs_shape_dim0_fixed_names = [f"{temp_prefix}_rs_shape_dim0_fixed_{index}" for index in range(branch_count)]
+    rs_shape_tail_names = [f"{temp_prefix}_rs_shape_tail_{index}" for index in range(branch_count)]
+    rs_shape_fixed_names = [f"{temp_prefix}_rs_shape_fixed_{index}" for index in range(branch_count)]
+    rs_fixed_names = [f"{temp_prefix}_rs_fixed_{index}" for index in range(branch_count)]
+    mul_names = [f"{temp_prefix}_mul{index}_out0" for index in range(branch_count)]
+    add_accum_names = [f"{temp_prefix}_add{index}_out0" for index in range(max(0, branch_count - 1))]
     tr14_name = f"{temp_prefix}_tr14_out0"
     mul44_name = f"{temp_prefix}_mul44_out0"
     squeeze_name = f"{temp_prefix}_squeeze_out0"
@@ -26854,83 +26854,51 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     indent = "        "
     replacement_block = [
         f"{indent}{flatten_name} = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))",
-        f"{indent}{shape_names[0]} = _shape_tensor({add_names[0]}, dtype=torch.int32, device={add_names[0]}.device)",
-        f"{indent}{shape_names[1]} = _shape_tensor({add_names[1]}, dtype=torch.int32, device={add_names[1]}.device)",
-        f"{indent}{shape_names[2]} = _shape_tensor({add_names[2]}, dtype=torch.int32, device={add_names[2]}.device)",
-        f"{indent}{shape_names[3]} = _shape_tensor({add_names[3]}, dtype=torch.int32, device={add_names[3]}.device)",
-        f"{indent}{shape_prefix_name} = torch.ones([1], dtype=torch.int32, device={shape_names[0]}.device)",
-        f"{indent}{gather_negative_names[0]} = _align_tensor_to_target_shape(torch.lt({add_names[0]}, 0), _tensor_shape_list({add_names[0]}))",
-        f"{indent}{gather_wrapped_names[0]} = _align_tensor_to_target_shape(torch.add({add_names[0]}, _tensor_shape_list({flatten_name})[0]), _tensor_shape_list({add_names[0]}))",
-        f"{indent}{gather_index_names[0]} = torch.where({gather_negative_names[0]}, {gather_wrapped_names[0]}, {add_names[0]})",
-        f"{indent}{gather_names[0]} = _reshape_gather_output(torch.index_select({flatten_name}, 0, {gather_index_names[0]}.to(dtype=torch.int64).reshape(-1)), {flatten_name}, _shape_tensor({gather_index_names[0]}, dtype=torch.int64, device={gather_index_names[0]}.device), axis=0)",
-        f"{indent}{rs_names[0]} = torch.reshape({gather_names[0]}, _resolve_reshape_shape([-1, 1], {gather_names[0]}, allow_zero=False))",
-        f"{indent}{concat_names[0]} = _apply_concat([{shape_prefix_name}, {shape_names[0]}], axis=0, target_shape=[4], fused='NONE')",
-        f"{indent}{gather_negative_names[1]} = _align_tensor_to_target_shape(torch.lt({add_names[1]}, 0), _tensor_shape_list({add_names[1]}))",
-        f"{indent}{gather_wrapped_names[1]} = _align_tensor_to_target_shape(torch.add({add_names[1]}, _tensor_shape_list({flatten_name})[0]), _tensor_shape_list({add_names[1]}))",
-        f"{indent}{gather_index_names[1]} = torch.where({gather_negative_names[1]}, {gather_wrapped_names[1]}, {add_names[1]})",
-        f"{indent}{gather_names[1]} = _reshape_gather_output(torch.index_select({flatten_name}, 0, {gather_index_names[1]}.to(dtype=torch.int64).reshape(-1)), {flatten_name}, _shape_tensor({gather_index_names[1]}, dtype=torch.int64, device={gather_index_names[1]}.device), axis=0)",
-        f"{indent}{rs_names[1]} = torch.reshape({gather_names[1]}, _resolve_reshape_shape([-1, 1], {gather_names[1]}, allow_zero=False))",
-        f"{indent}{concat_names[1]} = _apply_concat([{shape_prefix_name}, {shape_names[1]}], axis=0, target_shape=[4], fused='NONE')",
-        f"{indent}{gather_negative_names[2]} = _align_tensor_to_target_shape(torch.lt({add_names[2]}, 0), _tensor_shape_list({add_names[2]}))",
-        f"{indent}{gather_wrapped_names[2]} = _align_tensor_to_target_shape(torch.add({add_names[2]}, _tensor_shape_list({flatten_name})[0]), _tensor_shape_list({add_names[2]}))",
-        f"{indent}{gather_index_names[2]} = torch.where({gather_negative_names[2]}, {gather_wrapped_names[2]}, {add_names[2]})",
-        f"{indent}{gather_names[2]} = _reshape_gather_output(torch.index_select({flatten_name}, 0, {gather_index_names[2]}.to(dtype=torch.int64).reshape(-1)), {flatten_name}, _shape_tensor({gather_index_names[2]}, dtype=torch.int64, device={gather_index_names[2]}.device), axis=0)",
-        f"{indent}{rs_names[2]} = torch.reshape({gather_names[2]}, _resolve_reshape_shape([-1, 1], {gather_names[2]}, allow_zero=False))",
-        f"{indent}{concat_names[2]} = _apply_concat([{shape_prefix_name}, {shape_names[2]}], axis=0, target_shape=[4], fused='NONE')",
-        f"{indent}{gather_negative_names[3]} = _align_tensor_to_target_shape(torch.lt({add_names[3]}, 0), _tensor_shape_list({add_names[3]}))",
-        f"{indent}{gather_wrapped_names[3]} = _align_tensor_to_target_shape(torch.add({add_names[3]}, _tensor_shape_list({flatten_name})[0]), _tensor_shape_list({add_names[3]}))",
-        f"{indent}{gather_index_names[3]} = torch.where({gather_negative_names[3]}, {gather_wrapped_names[3]}, {add_names[3]})",
-        f"{indent}{gather_names[3]} = _reshape_gather_output(torch.index_select({flatten_name}, 0, {gather_index_names[3]}.to(dtype=torch.int64).reshape(-1)), {flatten_name}, _shape_tensor({gather_index_names[3]}, dtype=torch.int64, device={gather_index_names[3]}.device), axis=0)",
-        f"{indent}{rs_names[3]} = torch.reshape({gather_names[3]}, _resolve_reshape_shape([-1, 1], {gather_names[3]}, allow_zero=False))",
-        f"{indent}{concat_names[3]} = _apply_concat([{shape_prefix_name}, {shape_names[3]}], axis=0, target_shape=[4], fused='NONE')",
-        f"{indent}{tr_stage_names[0]} = _torch_permute({rs_names[0]}, [1, 0])",
-        f"{indent}{tr_stage_names[1]} = _torch_permute({rs_names[1]}, [1, 0])",
-        f"{indent}{tr_stage_names[2]} = _torch_permute({rs_names[2]}, [1, 0])",
-        f"{indent}{tr_stage_names[3]} = _torch_permute({rs_names[3]}, [1, 0])",
-        f"{indent}{rs_shape_dim0_names[0]} = {concat_names[0]}.reshape(-1)[:1]",
-        f"{indent}{rs_in_shape_names[0]} = _shape_tensor({tr_stage_names[0]}, dtype=torch.int32, device={tr_stage_names[0]}.device)",
-        f"{indent}{rs_in_dim0_names[0]} = {rs_in_shape_names[0]}.reshape(-1)[:1]",
-        f"{indent}{rs_shape_dim0_is_zero_names[0]} = _align_tensor_to_target_shape(torch.eq({rs_shape_dim0_names[0]}, 0), [1])",
-        f"{indent}{rs_shape_dim0_fixed_names[0]} = torch.where({rs_shape_dim0_is_zero_names[0]}, {rs_in_dim0_names[0]}, {rs_shape_dim0_names[0]})",
-        f"{indent}{rs_shape_tail_names[0]} = {concat_names[0]}.reshape(-1)[1:]",
-        f"{indent}{rs_shape_fixed_names[0]} = _apply_concat([{rs_shape_dim0_fixed_names[0]}, {rs_shape_tail_names[0]}], axis=0, target_shape=[4], fused='NONE')",
-        f"{indent}{rs_fixed_names[0]} = torch.reshape({tr_stage_names[0]}, _shape_list(_resolve_reshape_shape_tensor({rs_shape_fixed_names[0]}, {tr_stage_names[0]}, allow_zero=False)))",
-        f"{indent}{rs_shape_dim0_names[1]} = {concat_names[1]}.reshape(-1)[:1]",
-        f"{indent}{rs_in_shape_names[1]} = _shape_tensor({tr_stage_names[1]}, dtype=torch.int32, device={tr_stage_names[1]}.device)",
-        f"{indent}{rs_in_dim0_names[1]} = {rs_in_shape_names[1]}.reshape(-1)[:1]",
-        f"{indent}{rs_shape_dim0_is_zero_names[1]} = _align_tensor_to_target_shape(torch.eq({rs_shape_dim0_names[1]}, 0), [1])",
-        f"{indent}{rs_shape_dim0_fixed_names[1]} = torch.where({rs_shape_dim0_is_zero_names[1]}, {rs_in_dim0_names[1]}, {rs_shape_dim0_names[1]})",
-        f"{indent}{rs_shape_tail_names[1]} = {concat_names[1]}.reshape(-1)[1:]",
-        f"{indent}{rs_shape_fixed_names[1]} = _apply_concat([{rs_shape_dim0_fixed_names[1]}, {rs_shape_tail_names[1]}], axis=0, target_shape=[4], fused='NONE')",
-        f"{indent}{rs_fixed_names[1]} = torch.reshape({tr_stage_names[1]}, _shape_list(_resolve_reshape_shape_tensor({rs_shape_fixed_names[1]}, {tr_stage_names[1]}, allow_zero=False)))",
-        f"{indent}{rs_shape_dim0_names[2]} = {concat_names[2]}.reshape(-1)[:1]",
-        f"{indent}{rs_in_shape_names[2]} = _shape_tensor({tr_stage_names[2]}, dtype=torch.int32, device={tr_stage_names[2]}.device)",
-        f"{indent}{rs_in_dim0_names[2]} = {rs_in_shape_names[2]}.reshape(-1)[:1]",
-        f"{indent}{rs_shape_dim0_is_zero_names[2]} = _align_tensor_to_target_shape(torch.eq({rs_shape_dim0_names[2]}, 0), [1])",
-        f"{indent}{rs_shape_dim0_fixed_names[2]} = torch.where({rs_shape_dim0_is_zero_names[2]}, {rs_in_dim0_names[2]}, {rs_shape_dim0_names[2]})",
-        f"{indent}{rs_shape_tail_names[2]} = {concat_names[2]}.reshape(-1)[1:]",
-        f"{indent}{rs_shape_fixed_names[2]} = _apply_concat([{rs_shape_dim0_fixed_names[2]}, {rs_shape_tail_names[2]}], axis=0, target_shape=[4], fused='NONE')",
-        f"{indent}{rs_fixed_names[2]} = torch.reshape({tr_stage_names[2]}, _shape_list(_resolve_reshape_shape_tensor({rs_shape_fixed_names[2]}, {tr_stage_names[2]}, allow_zero=False)))",
-        f"{indent}{rs_shape_dim0_names[3]} = {concat_names[3]}.reshape(-1)[:1]",
-        f"{indent}{rs_in_shape_names[3]} = _shape_tensor({tr_stage_names[3]}, dtype=torch.int32, device={tr_stage_names[3]}.device)",
-        f"{indent}{rs_in_dim0_names[3]} = {rs_in_shape_names[3]}.reshape(-1)[:1]",
-        f"{indent}{rs_shape_dim0_is_zero_names[3]} = _align_tensor_to_target_shape(torch.eq({rs_shape_dim0_names[3]}, 0), [1])",
-        f"{indent}{rs_shape_dim0_fixed_names[3]} = torch.where({rs_shape_dim0_is_zero_names[3]}, {rs_in_dim0_names[3]}, {rs_shape_dim0_names[3]})",
-        f"{indent}{rs_shape_tail_names[3]} = {concat_names[3]}.reshape(-1)[1:]",
-        f"{indent}{rs_shape_fixed_names[3]} = _apply_concat([{rs_shape_dim0_fixed_names[3]}, {rs_shape_tail_names[3]}], axis=0, target_shape=[4], fused='NONE')",
-        f"{indent}{rs_fixed_names[3]} = torch.reshape({tr_stage_names[3]}, _shape_list(_resolve_reshape_shape_tensor({rs_shape_fixed_names[3]}, {tr_stage_names[3]}, allow_zero=False)))",
-        f"{indent}{mul_names[0]} = torch.mul({rs_fixed_names[0]}, {tr_names[0]})",
-        f"{indent}{mul_names[1]} = torch.mul({rs_fixed_names[1]}, {tr_names[1]})",
-        f"{indent}{mul_names[2]} = torch.mul({rs_fixed_names[2]}, {tr_names[2]})",
-        f"{indent}{mul_names[3]} = torch.mul({rs_fixed_names[3]}, {tr_names[3]})",
-        f"{indent}{add_accum_names[0]} = torch.add({mul_names[0]}, {mul_names[2]})",
-        f"{indent}{add_accum_names[1]} = torch.add({add_accum_names[0]}, {mul_names[1]})",
-        f"{indent}{add_accum_names[2]} = torch.add({add_accum_names[1]}, {mul_names[3]})",
-        f"{indent}{tr14_name} = _torch_permute({add_accum_names[2]}, [0, 1, 3, 2])",
-        f"{indent}{mul44_name} = torch.mul({tr14_name}, {score_cast_name})",
-        f"{indent}{squeeze_name} = torch.squeeze({mul44_name})",
-        f"{indent}{score_lhs} = torch.reshape({squeeze_name}, _resolve_reshape_shape([-1, 1], {squeeze_name}, allow_zero=False))",
     ]
+    for branch_index in range(branch_count):
+        replacement_block.extend(
+            [
+                f"{indent}{shape_names[branch_index]} = _shape_tensor({add_names[branch_index]}, dtype=torch.int32, device={add_names[branch_index]}.device)",
+            ]
+        )
+    replacement_block.append(
+        f"{indent}{shape_prefix_name} = torch.ones([1], dtype=torch.int32, device={shape_names[0]}.device)"
+    )
+    for branch_index in range(branch_count):
+        replacement_block.extend(
+            [
+                f"{indent}{gather_negative_names[branch_index]} = _align_tensor_to_target_shape(torch.lt({add_names[branch_index]}, 0), _tensor_shape_list({add_names[branch_index]}))",
+                f"{indent}{gather_wrapped_names[branch_index]} = _align_tensor_to_target_shape(torch.add({add_names[branch_index]}, _tensor_shape_list({flatten_name})[0]), _tensor_shape_list({add_names[branch_index]}))",
+                f"{indent}{gather_index_names[branch_index]} = torch.where({gather_negative_names[branch_index]}, {gather_wrapped_names[branch_index]}, {add_names[branch_index]})",
+                f"{indent}{gather_names[branch_index]} = _reshape_gather_output(torch.index_select({flatten_name}, 0, {gather_index_names[branch_index]}.to(dtype=torch.int64).reshape(-1)), {flatten_name}, _shape_tensor({gather_index_names[branch_index]}, dtype=torch.int64, device={gather_index_names[branch_index]}.device), axis=0)",
+                f"{indent}{rs_names[branch_index]} = torch.reshape({gather_names[branch_index]}, _resolve_reshape_shape([-1, 1], {gather_names[branch_index]}, allow_zero=False))",
+                f"{indent}{concat_names[branch_index]} = _apply_concat([{shape_prefix_name}, {shape_names[branch_index]}], axis=0, target_shape=[4], fused='NONE')",
+                f"{indent}{tr_stage_names[branch_index]} = _torch_permute({rs_names[branch_index]}, [1, 0])",
+                f"{indent}{rs_shape_dim0_names[branch_index]} = {concat_names[branch_index]}.reshape(-1)[:1]",
+                f"{indent}{rs_in_shape_names[branch_index]} = _shape_tensor({tr_stage_names[branch_index]}, dtype=torch.int32, device={tr_stage_names[branch_index]}.device)",
+                f"{indent}{rs_in_dim0_names[branch_index]} = {rs_in_shape_names[branch_index]}.reshape(-1)[:1]",
+                f"{indent}{rs_shape_dim0_is_zero_names[branch_index]} = _align_tensor_to_target_shape(torch.eq({rs_shape_dim0_names[branch_index]}, 0), [1])",
+                f"{indent}{rs_shape_dim0_fixed_names[branch_index]} = torch.where({rs_shape_dim0_is_zero_names[branch_index]}, {rs_in_dim0_names[branch_index]}, {rs_shape_dim0_names[branch_index]})",
+                f"{indent}{rs_shape_tail_names[branch_index]} = {concat_names[branch_index]}.reshape(-1)[1:]",
+                f"{indent}{rs_shape_fixed_names[branch_index]} = _apply_concat([{rs_shape_dim0_fixed_names[branch_index]}, {rs_shape_tail_names[branch_index]}], axis=0, target_shape=[4], fused='NONE')",
+                f"{indent}{rs_fixed_names[branch_index]} = torch.reshape({tr_stage_names[branch_index]}, _shape_list(_resolve_reshape_shape_tensor({rs_shape_fixed_names[branch_index]}, {tr_stage_names[branch_index]}, allow_zero=False)))",
+                f"{indent}{mul_names[branch_index]} = torch.mul({rs_fixed_names[branch_index]}, {tr_names[branch_index]})",
+            ]
+        )
+    aggregate_name = mul_names[0]
+    for branch_index in range(1, branch_count):
+        aggregate_name = add_accum_names[branch_index - 1]
+        replacement_block.append(
+            f"{indent}{aggregate_name} = torch.add({mul_names[0] if branch_index == 1 else add_accum_names[branch_index - 2]}, {mul_names[branch_index]})"
+        )
+    replacement_block.extend(
+        [
+            f"{indent}{tr14_name} = _torch_permute({aggregate_name}, [0, 1, 3, 2])",
+            f"{indent}{mul44_name} = torch.mul({tr14_name}, {score_cast_name})",
+            f"{indent}{squeeze_name} = torch.squeeze({mul44_name})",
+            f"{indent}{score_lhs} = torch.reshape({squeeze_name}, _resolve_reshape_shape([-1, 1], {squeeze_name}, allow_zero=False))",
+        ]
+    )
     lines[block_start_index : block_end_index + 1] = replacement_block
     changed = True
 
