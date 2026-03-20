@@ -401,6 +401,46 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_bn_mul_to_ch
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_bn_mul_to_channel_first_with_generic_channels(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_mul_generic_channels_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, wasppscale4_scale40_global_a_cf_3f9a: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        wasppscale4_scale41_batch_mul_out_bb31 = torch.reshape(torch.mul(wasppscale4_scale40_global_a_cf_3f9a, self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_mul), [1, 1, 256, 1])",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(bn_add_in, self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_add, [1, 1, 1, 256])",
+                "        return wasppscale4_scale41_batch_mul_out_bb31",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "wasppscale4_scale41_batch_mul_out_bb31 = _align_tensor_to_target_shape("
+        "torch.mul(wasppscale4_scale40_global_a_cf_3f9a, "
+        "torch.reshape(self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_mul, [1, 256, 1, 1])), "
+        "[1, 256, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor("
+        "bn_add_in, torch.reshape(self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_add, [1, 256, 1, 1]), "
+        "[1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_removes_permute_for_singleton_rank4_matmul_conv_input(
     tmp_path,
 ) -> None:
