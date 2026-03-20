@@ -27502,7 +27502,12 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
         if pool_re.match(current_line) is not None:
             has_cf_pool = True
     softmax_shapes = _collect_shadowformer_softmax_shapes(lines)
-    return has_cf_pool and len(softmax_shapes) >= 2
+    if not has_cf_pool:
+        return False
+    repeated_windows: Dict[Tuple[int, int], int] = {}
+    for _, _, height, width in softmax_shapes:
+        repeated_windows[(height, width)] = repeated_windows.get((height, width), 0) + 1
+    return any(count >= 2 for count in repeated_windows.values())
 
 
 def _collect_shadowformer_fast_repair_facts(
