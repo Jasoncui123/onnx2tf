@@ -4191,6 +4191,50 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_gene
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_generic_const_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale4_const_names_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_average_in = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_out_cf), [1, 5, 7, 256])",
+                "        spp_global_cf = torch.mean(spp_average_in, dim=[1, 2], keepdim=True)",
+                "        spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, self.const_demo_scale4_mul_any), [1, 256, 1, 1])",
+                "        _binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, self.const_demo_scale4_add_any, [1, 1, 1, 256])",
+                "        return _binary_lhs_11",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_average_in = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_out_cf), [1, 256, 5, 7])"
+        in rewritten
+    )
+    assert "spp_global_cf = torch.mean(spp_average_in, dim=[2, 3], keepdim=True)" in rewritten
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_mul_any, [1, 256, 1, 1])), [1, 256, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
+        "torch.reshape(self.const_demo_scale4_add_any, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_pad_pool_anchor_with_generic_names(
     tmp_path,
 ) -> None:
@@ -4232,6 +4276,51 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_pad_pool_
     assert (
         "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
         "torch.reshape(self.const_demo_scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused, [1, 512, 1, 1]), [1, 512, 1, 1])"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_with_generic_const_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale3_const_names_fast_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_average_in = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_out_cf), [1, 3, 5, 256])",
+                "        spp_padded = F.pad(_align_tensor_to_target_shape(spp_average_in, [1, 3, 5, 256]), [0, 0, 8, 8, 8, 8], mode='constant', value=0.0)",
+                "        spp_pool_out = _apply_pool2d(spp_padded, filter_height=17, filter_width=17, stride_h=8, stride_w=8, padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=True)",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, self.const_demo_recip_any, [1, 256, 1, 13])",
+                "        return _binary_lhs_21",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_average_in = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_out_cf), [1, 256, 3, 5])"
+        in rewritten
+    )
+    assert "spp_padded = F.pad(spp_average_in, [8, 8, 8, 8], mode='constant', value=0.0)" in rewritten
+    assert (
+        "spp_pool_out = _apply_pool2d(spp_padded, filter_height=17, filter_width=17, stride_h=8, stride_w=8, "
+        "padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=False)"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(self.const_demo_recip_any, [1, 256, 1, 1]), [1, 256, 1, 1])"
         in rewritten
     )
 

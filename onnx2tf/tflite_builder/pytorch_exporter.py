@@ -25975,12 +25975,12 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     pidnet_bn_mul_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
-        r"torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul)\), "
+        r"torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+)\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_bn_add_anchor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_add), "
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_cf_pad_re = re.compile(
@@ -25997,7 +25997,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     pidnet_scale3_anchor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+AveragePool_output_nhwc_div_reciprocal_mulfused), "
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_permute_conv_re = re.compile(
@@ -26300,8 +26300,9 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 int(pidnet_scale3_anchor_match.group("d2")),
                 int(pidnet_scale3_anchor_match.group("d3")),
             ]
-            if int(current_shape[2]) == 1 and int(current_shape[1]) == int(current_shape[3]):
-                normalized_shape = [int(current_shape[0]), int(current_shape[1]), 1, 1]
+            if int(current_shape[2]) == 1:
+                preferred_channel_count = _pidnet_rank4_preferred_channel_count(current_shape)
+                normalized_shape = [int(current_shape[0]), int(preferred_channel_count), 1, 1]
             else:
                 normalized_shape = _normalize_cf_rank4_shape(
                     current_shape,
