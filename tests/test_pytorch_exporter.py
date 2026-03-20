@@ -57,6 +57,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _export_runtime_wrapper_package_from_model_ir,
     _fold_inverse_permute_round_trips_in_exported_program_archive,
     _fold_channel_first_hardsigmoid_gate_conv_bridges,
+    _infer_shadowformer_shape_from_dims,
     _make_tensor_storage_name_map,
     _merge_reference_public_boundary_metadata,
     _preferred_reshape_target_values,
@@ -3112,6 +3113,17 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_sig
     )
 
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_infer_shadowformer_shape_from_dims_prefers_structural_order() -> None:
+    known_shapes = {
+        (6, 48, 64),
+        (12, 48, 64),
+    }
+
+    assert _infer_shadowformer_shape_from_dims([6, 48, 64], known_shapes) == (6, 48, 64)
+    assert _infer_shadowformer_shape_from_dims([48, 6, 64], known_shapes) == (6, 48, 64)
+    assert _infer_shadowformer_shape_from_dims([48, 64, 6], known_shapes) == (6, 48, 64)
 
 
 def test_should_not_avoid_model_ir_in_raw_canonicalize_for_shadowformer_without_repeated_window(

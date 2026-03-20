@@ -27634,6 +27634,16 @@ def _infer_shadowformer_shape_from_dims(
     known_shapes: Set[Tuple[int, int, int]],
 ) -> Tuple[int, int, int] | None:
     for known_shape in known_shapes:
+        if tuple(dims) == known_shape:
+            return known_shape
+    for known_shape in known_shapes:
+        heads, height, width = known_shape
+        if tuple(dims) in (
+            (height, heads, width),
+            (height, width, heads),
+        ):
+            return known_shape
+    for known_shape in known_shapes:
         if sorted(dims) == sorted(known_shape):
             return known_shape
     return None
