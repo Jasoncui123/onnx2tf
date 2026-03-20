@@ -3514,6 +3514,39 @@ def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes
     assert "[12, 6, 48, 64]" in repaired
 
 
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_preserves_buffer_metadata(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_buffer_metadata_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float16), persistent=True)",
+                "    def forward(self, dec0_rhs):",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_1, _binary_rhs_1), [12, 48, 6, 64])",
+                "        return dec0_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "torch.zeros([1, 6, 48, 64], dtype=torch.float16), persistent=True" in repaired
+    assert "[12, 48, 64, 6]" not in repaired
+    assert "[12, 48, 6, 64]" not in repaired
+    assert "[12, 6, 48, 64]" in repaired
+
+
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_without_fixed_buffer_names(
     tmp_path,
 ) -> None:
