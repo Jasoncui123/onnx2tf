@@ -27029,7 +27029,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\], dtype=torch\.(?P<dtype>[A-Za-z0-9_]+)\), persistent=(?P<persistent>True|False)\)"
     )
     copy_permute_re = re.compile(
-        r"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\((?:\*\(0, 2, 1, 3\)|0, 2, 1, 3)\)(?:\.contiguous\(\))?\)$"
+        r"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\((?:\*\(0, 2, 1, 3\)|0, 2, 1, 3|\[0, 2, 1, 3\])\)(?:\.contiguous\(\))?\)$"
     )
     binary_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_\.]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
@@ -27575,6 +27575,7 @@ def _collect_shadowformer_fast_repair_facts(
             if (
                 ".permute(*(0, 2, 1, 3))" in src_expr
                 or ".permute(0, 2, 1, 3)" in src_expr
+                or ".permute([0, 2, 1, 3])" in src_expr
             ):
                 permuted_copy_buffers.add(copy_match.group("buffer"))
             else:
