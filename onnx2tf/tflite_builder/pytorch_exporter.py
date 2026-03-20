@@ -26982,6 +26982,29 @@ def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     return register_buffer_count >= 6 and copy_permute_count >= 6 and attn_binary_count >= 4
 
 
+def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
+    pool_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\([A-Za-z0-9_]+, .*channel_last=False\)$"
+    )
+    softmax_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>4|8|16), 100, 100\]\)$"
+    )
+
+    has_cf_pool = False
+    distinct_head_counts: Set[int] = set()
+    softmax_count = 0
+    for line in lines:
+        current_line = str(line)
+        if pool_re.match(current_line) is not None:
+            has_cf_pool = True
+            continue
+        softmax_match = softmax_re.match(current_line)
+        if softmax_match is not None:
+            softmax_count += 1
+            distinct_head_counts.add(int(softmax_match.group("heads")))
+    return has_cf_pool and softmax_count >= 2 and len(distinct_head_counts) >= 2
+
+
 def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Path) -> bool:
     model_path = package_path / "model.py"
     if not model_path.exists():
@@ -27034,20 +27057,7 @@ def _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_path: 
         return True
     if _has_efficientformer_attention_signature(model_lines):
         return True
-    if (
-        _any_line_matches(
-            model_lines,
-            r"^\s*wa_max_p1_out_nhwc = _apply_pool2d\(wa_max_p_out, .*channel_last=False\)$",
-        )
-        and _any_line_matches(
-            model_lines,
-            r"^\s*waenc\w*_softmax_out0.* = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[24, 4, 100, 100\]\)$",
-        )
-        and _any_line_matches(
-            model_lines,
-            r"^\s*waconvblocks0_attnsoftmax_softmax_out0 = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[6, 16, 100, 100\]\)$",
-        )
-    ):
+    if _has_shadowformer_avoid_model_ir_signature(model_lines):
         return True
     return False
 
