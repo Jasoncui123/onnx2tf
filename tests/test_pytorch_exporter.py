@@ -3982,6 +3982,49 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_spp_scale3_with_mis
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_spp_scale3_with_generic_const_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale3_const_names_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_pool_out: torch.Tensor, spp_mul_in: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, self.const_demo_reciprocal_AveragePool_output_nhwc_div_reciprocal_mulfused, [1, 192, 1, 17])",
+                "        spp_mul_out = _align_tensor_to_target_shape(torch.mul(spp_mul_in, self.const_demo_reciprocal_AveragePool_output_nhwc_div_reciprocal_mulfused), [1, 192, 1, 29])",
+                "        _binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(bn_add_in, self.const_demo_any_BatchNormalization_bn_add, [1, 192, 1, 31])",
+                "        return spp_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(self.const_demo_reciprocal_AveragePool_output_nhwc_div_reciprocal_mulfused, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "spp_mul_out = _align_tensor_to_target_shape(torch.mul(spp_mul_in, "
+        "self.const_demo_reciprocal_AveragePool_output_nhwc_div_reciprocal_mulfused), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(self.const_demo_any_BatchNormalization_bn_add, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_resize_tail_with_generic_names(
     tmp_path,
 ) -> None:
