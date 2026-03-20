@@ -26664,8 +26664,14 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     stage7_def_re = re.compile(
         r"^\s*def _forward_stage_7\(self, .+\) -> tuple\[torch\.Tensor, torch\.Tensor\]:$"
     )
-    forward_call_re = re.compile(
+    forward_unpack_re = re.compile(
         r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
+    )
+    forward_packed_re = re.compile(
+        r"^\s*(?P<packed>[A-Za-z0-9_]+) = self\._forward_stage_7\(.+\)$"
+    )
+    forward_index_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?P<packed>[A-Za-z0-9_]+)\[(?P<index>[01])\]$"
     )
     gather_reshape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, _resolve_reshape_shape\(\[-1, 1\], [A-Za-z0-9_]+, allow_zero=False\)\)$"
@@ -26679,6 +26685,8 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
 
     has_stage7_def = False
     has_forward_call = False
+    packed_forward_names: Set[str] = set()
+    packed_forward_indices: Dict[str, Set[str]] = {}
     gather_reshape_count = 0
     singleton_anchor_count = 0
     has_stage7_return = False
@@ -26687,8 +26695,21 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         if stage7_def_re.match(current_line) is not None:
             has_stage7_def = True
             continue
-        if forward_call_re.match(current_line) is not None:
+        if forward_unpack_re.match(current_line) is not None:
             has_forward_call = True
+            continue
+        packed_match = forward_packed_re.match(current_line)
+        if packed_match is not None:
+            packed_forward_names.add(str(packed_match.group("packed")))
+            continue
+        forward_index_match = forward_index_re.match(current_line)
+        if forward_index_match is not None:
+            packed_name = str(forward_index_match.group("packed"))
+            if packed_name in packed_forward_names:
+                packed_forward_indices.setdefault(packed_name, set()).add(
+                    str(forward_index_match.group("index"))
+                )
+                has_forward_call = has_forward_call or packed_forward_indices[packed_name] == {"0", "1"}
             continue
         if gather_reshape_re.match(current_line) is not None:
             gather_reshape_count += 1
@@ -26748,8 +26769,11 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     cast_float_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\.to\(dtype=torch\.float32\)$"
     )
-    forward_call_re = re.compile(
+    forward_unpack_re = re.compile(
         r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
+    )
+    forward_packed_re = re.compile(
+        r"^\s*(?P<packed>[A-Za-z0-9_]+) = self\._forward_stage_7\(.+\)$"
     )
     stage7_return_re = re.compile(
         r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
@@ -26881,7 +26905,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         (
             index
             for index, line in enumerate(lines)
-            if forward_call_re.match(line)
+            if forward_unpack_re.match(line) or forward_packed_re.match(line)
         ),
         None,
     )
