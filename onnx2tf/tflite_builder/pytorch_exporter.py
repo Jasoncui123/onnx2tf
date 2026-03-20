@@ -27028,7 +27028,7 @@ _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
     rf"^.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\(\))?$"
 )
 _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
-    r"^\s*self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', "
+    r"^\s*self\.register_buffer\((?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote), "
     r"torch\.zeros\((?:size=)?(?:\[|\()1, (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?:\]|\))"
     r"(?:, dtype=torch\.(?P<dtype>[A-Za-z0-9_]+))?\)"
     r"(?:, persistent=(?P<persistent>True|False))?\)$"
@@ -27091,7 +27091,8 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             if register_match.group("dtype") is not None:
                 zeros_expr += f", dtype=torch.{register_match.group('dtype')}"
             zeros_expr += ")"
-            rewritten = f"        self.register_buffer('{register_match.group('buffer')}', {zeros_expr}"
+            quote = register_match.group("quote")
+            rewritten = f"        self.register_buffer({quote}{register_match.group('buffer')}{quote}, {zeros_expr}"
             if register_match.group("persistent") is not None:
                 rewritten += f", persistent={register_match.group('persistent')}"
             rewritten += ")"
