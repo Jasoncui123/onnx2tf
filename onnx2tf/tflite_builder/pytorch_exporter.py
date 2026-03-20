@@ -25945,6 +25945,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     changed = False
     pidnet_cf_add_sources: Set[str] = set()
     pidnet_cf_alias_sources: Set[str] = set()
+    pidnet_cf_binary_sources: Set[str] = set()
     pidnet_cf_mul_sources: Set[str] = set()
     pidnet_cf_reduce_sum_sources: Set[str] = set()
     pidnet_cf_mean_sources: Set[str] = set()
@@ -26044,6 +26045,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         return name in (
             pidnet_cf_add_sources
             | pidnet_cf_alias_sources
+            | pidnet_cf_binary_sources
             | pidnet_cf_mul_sources
             | pidnet_cf_reduce_sum_sources
             | pidnet_cf_mean_sources
@@ -26245,12 +26247,9 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         if pidnet_binary_anchor_match is not None:
             input_a = str(pidnet_binary_anchor_match.group("a"))
             input_b = str(pidnet_binary_anchor_match.group("b"))
-            if any(
-                input_name in pidnet_cf_alias_sources
-                or input_name.endswith("_cf")
-                or input_name.endswith("_out_cf")
-                for input_name in (input_a, input_b)
-            ):
+            lhs0_name = str(pidnet_binary_anchor_match.group("lhs0"))
+            lhs1_name = str(pidnet_binary_anchor_match.group("lhs1"))
+            if any(_pidnet_is_cf_like_name(input_name) for input_name in (input_a, input_b)):
                 current_shape = [
                     int(pidnet_binary_anchor_match.group("n")),
                     int(pidnet_binary_anchor_match.group("d1")),
@@ -26273,6 +26272,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                         f"{input_a}, {input_b}, {normalized_shape})"
                     )
                     changed = True
+                pidnet_cf_binary_sources.update({lhs0_name, lhs1_name})
                 continue
         pidnet_cf_pool_match = pidnet_cf_pool_re.match(line)
         if pidnet_cf_pool_match is not None:
@@ -26299,10 +26299,8 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             input_a = str(pidnet_mul_align_match.group("a"))
             input_b = str(pidnet_mul_align_match.group("b"))
             if (
-                input_a.startswith("_binary_")
-                or input_b.startswith("_binary_")
-                or input_a in pidnet_cf_alias_sources
-                or input_b in pidnet_cf_alias_sources
+                _pidnet_is_cf_like_name(input_a)
+                or _pidnet_is_cf_like_name(input_b)
             ):
                 current_shape = [
                     int(pidnet_mul_align_match.group("n")),

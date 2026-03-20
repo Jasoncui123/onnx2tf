@@ -5010,6 +5010,59 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_without_cf
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_without_binary_prefixes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_pag_no_binary_prefix_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, lowres_feature: torch.Tensor, skip_feature: torch.Tensor) -> torch.Tensor:",
+                "        pag_resize_out = _apply_resize(lowres_feature, [24, 40], method='bilinear', target_shape=[1, 24, 40, 32], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        pag_alias = _align_tensor_to_target_shape(pag_resize_out.permute(0, 2, 3, 1).contiguous(), [1, 24, 40, 32])",
+                "        pag_left, pag_right = _align_binary_inputs_to_anchor(pag_alias, skip_feature, [1, 24, 40, 32])",
+                "        pag_mul_out = _align_tensor_to_target_shape(torch.mul(pag_left, pag_right), [1, 24, 40, 32])",
+                "        pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([3], pag_mul_out.ndim), True)",
+                "        pag_sig_out = torch.reshape(torch.sigmoid(pag_reduce_sum_out), [1, 1, 24, 40])",
+                "        return pag_sig_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "pag_resize_out = _apply_resize(lowres_feature, [24, 40], method='bilinear', "
+        "target_shape=[1, 32, 24, 40], align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+    assert "pag_alias = pag_resize_out" in rewritten
+    assert (
+        "pag_left, pag_right = _align_binary_inputs_to_anchor(pag_alias, skip_feature, [1, 32, 24, 40])"
+        in rewritten
+    )
+    assert (
+        "pag_mul_out = _align_tensor_to_target_shape(torch.mul(pag_left, pag_right), [1, 32, 24, 40])"
+        in rewritten
+    )
+    assert (
+        "pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([1], pag_mul_out.ndim), True)"
+        in rewritten
+    )
+    assert (
+        "pag_sig_out = _align_tensor_to_target_shape(torch.sigmoid(pag_reduce_sum_out), [1, 1, 24, 40])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_generic_names(
     tmp_path,
 ) -> None:
