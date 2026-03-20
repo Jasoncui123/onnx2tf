@@ -2105,6 +2105,33 @@ def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature(
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature_with_generic_channels(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_semantic_skip_generic_channels_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_input, pag_lhs, pag_rhs, scale4_input):",
+                "        spp_average_padded = F.pad(spp_input, [4, 4, 4, 4], mode='constant', value=0.0)",
+                "        spp_global = torch.mean(spp_input, dim=[2, 3], keepdim=True)",
+                "        scale4_mul = torch.mul(scale4_input, torch.reshape(self.const_scale4_bn_mul, [1, 256, 1, 1]))",
+                "        scale4_add_lhs, scale4_add_rhs = _align_binary_inputs_to_anchor(scale4_input, torch.reshape(self.const_scale4_bn_add, [1, 256, 1, 1]), [1, 256, 1, 1])",
+                "        pag_out = _align_tensor_to_target_shape(torch.mul(pag_lhs, pag_rhs), [1, 32, 12, 20])",
+                "        return spp_average_padded, spp_global, scale4_mul, scale4_add_lhs, scale4_add_rhs, pag_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_l1_package(
     tmp_path,
 ) -> None:
@@ -3418,6 +3445,50 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_gene
     assert (
         "_binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
         "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_add, [1, 512, 1, 1]), [1, 512, 1, 1])"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_generic_channels(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale4_channels_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_average_in = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_out_cf), [1, 5, 7, 256])",
+                "        spp_global_cf = torch.mean(spp_average_in, dim=[1, 2], keepdim=True)",
+                "        spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul), [1, 256, 1, 1])",
+                "        _binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, self.const_demo_scale4_scale4_1_BatchNormalization_bn_add, [1, 1, 1, 256])",
+                "        return _binary_lhs_11",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_average_in = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_out_cf), [1, 256, 5, 7])"
+        in rewritten
+    )
+    assert "spp_global_cf = torch.mean(spp_average_in, dim=[2, 3], keepdim=True)" in rewritten
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 256, 1, 1])), [1, 256, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_add, [1, 256, 1, 1]), [1, 256, 1, 1])"
         in rewritten
     )
 
