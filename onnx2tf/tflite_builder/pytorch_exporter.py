@@ -20169,19 +20169,19 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale4_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul)\)$"
     )
     pidnet_spp_scale4_mul_reshape_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
-        r"self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\), \[1, 1, (?P<c>\d+), 1\]\)$"
+        r"self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul)\), \[1, 1, (?P<c>\d+), 1\]\)$"
     )
     pidnet_spp_scale4_mul_reshape_variant_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
-        r"torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul), \[[0-9, ]+\]\)\), "
+        r"torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul), \[[0-9, ]+\]\)\), "
         r"\[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     pidnet_spp_scale4_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_add), \[1, 1, 1, (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_add), \[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     pidnet_pag4_mul2_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
@@ -20684,7 +20684,10 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = lines[index]
         pidnet_spp_scale3_add_match = pidnet_spp_scale3_add_re.match(line)
-        if pidnet_spp_scale3_add_match is not None:
+        if (
+            pidnet_spp_scale3_add_match is not None
+            and int(pidnet_spp_scale3_add_match.group("c")) != 1
+        ):
             lines[index] = (
                 f"{pidnet_spp_scale3_add_match.group('indent')}{pidnet_spp_scale3_add_match.group('lhs0')}, "
                 f"{pidnet_spp_scale3_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
@@ -24261,11 +24264,11 @@ def _canonicalize_generated_model_source_for_raw_export(
         changed = True
     pidnet_forced_scale4_mul_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
-        r"self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_mul)\), \[1, 1, (?P<c>\d+), 1\]\)$"
+        r"self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul)\), \[1, 1, (?P<c>\d+), 1\]\)$"
     )
     pidnet_forced_scale4_add_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]*scale4_scale4_1_BatchNormalization_bn_add), \[1, 1, 1, (?P<c>\d+)\]\)$"
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_add), \[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     for index, line in enumerate(lines):
         pidnet_forced_scale4_mul_match = pidnet_forced_scale4_mul_re.match(line)

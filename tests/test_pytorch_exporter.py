@@ -540,6 +540,43 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_vari
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_with_generic_const_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_generic_const_names_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(spp_global_cf, self.const_demo_any_BatchNormalization_bn_mul), [1, 1, 192, 1])",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(bn_add_in, self.const_demo_any_BatchNormalization_bn_add, [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_any_BatchNormalization_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(self.const_demo_any_BatchNormalization_bn_add, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_removes_permute_for_singleton_rank4_matmul_conv_input(
     tmp_path,
 ) -> None:
