@@ -20717,11 +20717,9 @@ def _canonicalize_generated_model_source_for_raw_export(
                 preferred_channels = _buffer_channel_count(
                     str(pidnet_spp_scale4_mul_match.group("const_attr"))
                 )
-            channel_count = (
-                int(preferred_channels)
-                if preferred_channels is not None
-                else 512
-            )
+            if preferred_channels is None:
+                continue
+            channel_count = int(preferred_channels)
             lines[index] = (
                 f"{pidnet_spp_scale4_mul_match.group('indent')}{pidnet_spp_scale4_mul_match.group('lhs')} = "
                 f"torch.mul({pidnet_spp_scale4_mul_match.group('input')}, "

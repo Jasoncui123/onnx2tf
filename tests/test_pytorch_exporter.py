@@ -508,6 +508,36 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_direct_mul_f
     )
 
 
+def test_canonicalize_generated_model_source_leaves_pidnet_scale4_direct_mul_without_channel_evidence(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_direct_mul_no_channel_evidence_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_unknown: torch.Tensor) -> torch.Tensor:",
+                "        spp_bn_mul_out = torch.mul(spp_global_unknown, self.const_demo_any_BatchNormalization_bn_mul)",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = torch.mul(spp_global_unknown, self.const_demo_any_BatchNormalization_bn_mul)"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_generic_channels(
     tmp_path,
 ) -> None:
