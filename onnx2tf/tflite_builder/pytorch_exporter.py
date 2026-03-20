@@ -27066,16 +27066,19 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     if not model_path.exists():
         return
     model_source = model_path.read_text(encoding="utf-8")
-    if not _has_shadowformer_fast_repair_signature(model_source.splitlines()):
+    model_lines = model_source.splitlines()
+    registered_pairs, registered_buffers, _, aligned_pairs = _collect_shadowformer_fast_repair_facts(model_lines)
+    if not _has_shadowformer_fast_repair_signature(model_lines):
         return
 
     changed = False
-    lines = model_source.splitlines()
+    lines = model_lines
+    known_shadowformer_pairs = registered_pairs.intersection(aligned_pairs)
     register_buffer_re = re.compile(
-        r"torch\.zeros\(\[1, (?P<window>\d+), (?P<heads>\d+), (?P=window)\], dtype=torch\.float32\)"
+        r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<window>\d+), (?P<heads>\d+), (?P=window)\], dtype=torch\.float32\), persistent=False\)"
     )
     copy_permute_re = re.compile(
-        r"^(?P<indent>\s*self\.[A-Za-z0-9_]+\.copy_\()(?P<src>.+)\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
+        r"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
     )
     binary_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P<heads>\d+), (?P=window)(?P<suffix>\]\))$"
@@ -27092,9 +27095,12 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         current_line = str(line)
         register_match = register_buffer_re.search(current_line)
         if register_match is not None:
-            rewritten = register_buffer_re.sub(
-                f"torch.zeros([1, {register_match.group('heads')}, {register_match.group('window')}, {register_match.group('window')}], dtype=torch.float32)",
-                current_line,
+            pair = (int(register_match.group("heads")), int(register_match.group("window")))
+            if pair not in known_shadowformer_pairs:
+                continue
+            rewritten = (
+                f"        self.register_buffer('{register_match.group('buffer')}', "
+                f"torch.zeros([1, {register_match.group('heads')}, {register_match.group('window')}, {register_match.group('window')}], dtype=torch.float32), persistent=False)"
             )
             if rewritten != current_line:
                 lines[index] = rewritten
@@ -27102,6 +27108,8 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             continue
         copy_match = copy_permute_re.match(current_line)
         if copy_match is not None:
+            if copy_match.group("buffer") not in registered_buffers:
+                continue
             rewritten = f"{copy_match.group('indent')}{copy_match.group('src')})"
             if rewritten != current_line:
                 lines[index] = rewritten
@@ -27109,6 +27117,9 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             continue
         binary_match = binary_shape_re.match(current_line)
         if binary_match is not None:
+            pair = (int(binary_match.group("heads")), int(binary_match.group("window")))
+            if pair not in known_shadowformer_pairs:
+                continue
             rewritten = (
                 f"{binary_match.group('indent')}{binary_match.group('batch')}, "
                 f"{binary_match.group('heads')}, {binary_match.group('window')}, {binary_match.group('window')}{binary_match.group('suffix')}"
@@ -27119,6 +27130,9 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             continue
         binary_const_match = binary_const_shape_re.match(current_line)
         if binary_const_match is not None:
+            pair = (int(binary_const_match.group("heads")), int(binary_const_match.group("window")))
+            if pair not in known_shadowformer_pairs:
+                continue
             rewritten = (
                 f"{binary_const_match.group('indent')}{binary_const_match.group('batch')}, "
                 f"{binary_const_match.group('heads')}, {binary_const_match.group('window')}, {binary_const_match.group('window')}{binary_const_match.group('suffix')}"
@@ -27142,6 +27156,9 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
                 dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 1
             ]
             if len(repeated_dims) == 1 and len(head_dims) == 1:
+                pair = (head_dims[0], repeated_dims[0])
+                if pair not in known_shadowformer_pairs:
+                    continue
                 rewritten = (
                     f"{mul_match.group('indent')}{mul_match.group('batch')}, "
                     f"{head_dims[0]}, {repeated_dims[0]}, {repeated_dims[0]}{mul_match.group('suffix')}"
@@ -27538,19 +27555,9 @@ def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
 
 
 def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
-    register_buffer_count = _count_lines_matching(
-        lines,
-        r"^\s*self\.register_buffer\('[A-Za-z0-9_]+', torch\.zeros\(\[1, \d+, \d+, \d+\], dtype=torch\.float32\), persistent=False\)$",
-    )
-    copy_permute_count = _count_lines_matching(
-        lines,
-        r"^\s*self\.[A-Za-z0-9_]+\.copy_\(.+\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$",
-    )
-    attn_binary_count = _count_lines_matching(
-        lines,
-        r"^\s*_[A-Za-z0-9_]+, _[A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_]+, \[\d+, \d+, \d+, \d+\]\)$",
-    )
-    return register_buffer_count >= 6 and copy_permute_count >= 6 and attn_binary_count >= 4
+    registered_pairs, _, copied_pairs, aligned_pairs = _collect_shadowformer_fast_repair_facts(lines)
+    shared_pairs = registered_pairs.intersection(copied_pairs).intersection(aligned_pairs)
+    return len(shared_pairs) >= 2
 
 
 def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
@@ -27574,6 +27581,65 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
             softmax_count += 1
             distinct_head_counts.add(int(softmax_match.group("heads")))
     return has_cf_pool and softmax_count >= 2 and len(distinct_head_counts) >= 2
+
+
+def _collect_shadowformer_fast_repair_facts(
+    lines: Sequence[str],
+) -> Tuple[Set[Tuple[int, int]], Set[str], Set[Tuple[int, int]], Set[Tuple[int, int]]]:
+    register_buffer_re = re.compile(
+        r"^\s*self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<window>\d+), (?P<heads>\d+), (?P=window)\], dtype=torch\.float32\), persistent=False\)$"
+    )
+    copy_permute_re = re.compile(
+        r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\(.+\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
+    )
+    binary_shape_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[(?P<batch>\d+), (?P<window>\d+), (?P<heads>\d+), (?P=window)\]\)$"
+    )
+    binary_const_shape_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[(?P<batch>\d+), (?P<window>\d+), (?P=window), (?P<heads>\d+)\]\)$"
+    )
+    mul_align_shape_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+
+    registered_pairs: Set[Tuple[int, int]] = set()
+    registered_buffers: Set[str] = set()
+    buffer_pairs: Dict[str, Tuple[int, int]] = {}
+    copied_pairs: Set[Tuple[int, int]] = set()
+    aligned_pairs: Set[Tuple[int, int]] = set()
+
+    for line in lines:
+        current_line = str(line)
+        register_match = register_buffer_re.match(current_line)
+        if register_match is not None:
+            pair = (int(register_match.group("heads")), int(register_match.group("window")))
+            registered_pairs.add(pair)
+            registered_buffers.add(register_match.group("buffer"))
+            buffer_pairs[register_match.group("buffer")] = pair
+            continue
+        copy_match = copy_permute_re.match(current_line)
+        if copy_match is not None and copy_match.group("buffer") in buffer_pairs:
+            copied_pairs.add(buffer_pairs[copy_match.group("buffer")])
+            continue
+        binary_match = binary_shape_re.match(current_line)
+        if binary_match is not None:
+            aligned_pairs.add((int(binary_match.group("heads")), int(binary_match.group("window"))))
+            continue
+        binary_const_match = binary_const_shape_re.match(current_line)
+        if binary_const_match is not None:
+            aligned_pairs.add((int(binary_const_match.group("heads")), int(binary_const_match.group("window"))))
+            continue
+        mul_match = mul_align_shape_re.match(current_line)
+        if mul_match is not None:
+            dims = [int(mul_match.group("d1")), int(mul_match.group("d2")), int(mul_match.group("d3"))]
+            repeated_dims = list(dict.fromkeys(
+                dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 2
+            ))
+            head_dims = [dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 1]
+            if len(repeated_dims) == 1 and len(head_dims) == 1:
+                aligned_pairs.add((head_dims[0], repeated_dims[0]))
+
+    return registered_pairs, registered_buffers, copied_pairs, aligned_pairs
 
 
 def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Path) -> bool:

@@ -2848,6 +2848,49 @@ def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes
     assert "[6, 24, 64, 64]" in repaired
 
 
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_minimal_pairs(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_minimal_pairs_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 32, 6, 32], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_b', torch.zeros([1, 32, 12, 32], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_b.copy_(self.attn_src_b.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, enc0_lhs, enc0_rhs, dec0_lhs, dec0_rhs):",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs(enc0_lhs, enc0_rhs, [12, 32, 6, 32])",
+                "        enc0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [12, 32, 6, 32])",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_lhs, self.mask_buf_b, [12, 32, 32, 12])",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_1, _binary_rhs_1), [12, 32, 12, 32])",
+                "        return enc0_mul, dec0_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "torch.zeros([1, 6, 32, 32]" in repaired
+    assert "torch.zeros([1, 12, 32, 32]" in repaired
+    assert ".permute(*(0, 2, 1, 3)).contiguous()" not in repaired
+    assert "[12, 32, 6, 32]" not in repaired
+    assert "[12, 32, 32, 12]" not in repaired
+    assert "[12, 32, 12, 32]" not in repaired
+    assert "[12, 6, 32, 32]" in repaired
+    assert "[12, 12, 32, 32]" in repaired
+
+
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_without_fixed_buffer_names(
     tmp_path,
 ) -> None:
