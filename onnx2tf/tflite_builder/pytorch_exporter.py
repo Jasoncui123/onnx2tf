@@ -27083,7 +27083,7 @@ _SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN = (
     r")"
 )
 _SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
-    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?\)$"
+    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+)?)\)$"
 )
 _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
     rf"^.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?$"
@@ -27176,7 +27176,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         if copy_match is not None:
             if copy_match.group("buffer") not in supported_buffers:
                 continue
-            rewritten = f"{copy_match.group('indent')}{copy_match.group('src')})"
+            rewritten = f"{copy_match.group('indent')}{copy_match.group('src')}{copy_match.group('copy_kwargs')})"
             if rewritten != current_line:
                 lines[index] = rewritten
                 changed = True
@@ -27672,7 +27672,7 @@ def _collect_shadowformer_fast_repair_facts(
     Set[Tuple[int, int, int]],
 ]:
     copy_re = re.compile(
-        r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+)\)$"
+        r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+?)(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+)?\)$"
     )
     binary_shape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+),\s*(?P<rhs>[A-Za-z0-9_\.]+),\s*(?:\[|\()(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
