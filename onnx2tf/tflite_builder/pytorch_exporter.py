@@ -26786,6 +26786,24 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     singleton_rank4_wrapper_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<expr>torch\.(?:lt|add|sub|logical_and|mul)\(.+\)), \[1, 1, 1, 1\]\)$"
     )
+    singleton_mul_const_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), (?P<const>self\.const_inline_literal_0)\), \[1, 2\]\)$"
+    )
+    self_square_align_mul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), (?P=input)\), \[(?P<n>\d+), 1\]\)$"
+    )
+    singleton_binary_anchor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), \[1, 1\]\)$"
+    )
+    singleton_mul_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\), \[1, 1\]\)$"
+    )
+    column_binary_anchor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), \[(?P<n>\d+), 1\]\)$"
+    )
+    column_div_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.div\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\), \[(?P<n>\d+), 1\]\)$"
+    )
     div_floor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.div\((?P<input>[A-Za-z0-9_]+), (?P<divisor>\d+)\.0\), \[1\]\)$"
     )
@@ -26793,33 +26811,88 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\.to\(dtype=torch\.float32\)$"
     )
 
-    exact_replacements = {
-        "        wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.float32)":
-            "        wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.int64)",
-        "        wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320.0), [1])":
-            "        wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320, rounding_mode='floor'), [1])",
-        "        wadkd_mul16_out0 = _align_tensor_to_target_shape(torch.mul(wadkd_cast4_out0, self.const_inline_literal_0), [1, 2])":
-            "        wadkd_mul16_out0 = torch.div(wadkd_cast4_out0, self.const_inline_literal_1)",
-        "        wadkd_reduce_l2_out0_reduce_l2_squared = _align_tensor_to_target_shape(torch.mul(wadkd_tr17_out0, wadkd_tr17_out0), [64, 1])":
-            "        wadkd_reduce_l2_out0_reduce_l2_squared = torch.mul(wadkd_tr17_out0, wadkd_tr17_out0)",
-        "        _binary_rhs_191, _binary_lhs_191 = _align_binary_inputs_to_anchor(wadkd_expand23_out0_expand_ones, wadkd_clip_out0, [1, 1])":
-            "        _binary_rhs_191, _binary_lhs_191 = wadkd_clip_out0, wadkd_expand23_out0_expand_ones",
-        "        wadkd_expand23_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_191, _binary_rhs_191), [1, 1])":
-            "        wadkd_expand23_out0 = torch.mul(_binary_lhs_191, _binary_rhs_191)",
-        "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs_to_anchor(wadkd_tr17_out0, wadkd_expand23_out0, [64, 1])":
-            "        _binary_lhs_196, _binary_rhs_196 = wadkd_tr17_out0, wadkd_expand23_out0",
-        "        wadkd_div3_out0 = _align_tensor_to_target_shape(torch.div(_binary_lhs_196, _binary_rhs_196), [64, 1])":
-            "        wadkd_div3_out0 = torch.div(_binary_lhs_196, _binary_rhs_196)",
-    }
     changed = False
-    for old_text, new_text in exact_replacements.items():
-        if old_text in model_source:
-            model_source = model_source.replace(old_text, new_text)
-            changed = True
-
     lines = model_source.splitlines()
-    for index, line in enumerate(lines):
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         current_line = str(line)
+        next_line = str(lines[index + 1]) if index + 1 < len(lines) else None
+        cast_float_match = cast_float_re.match(current_line)
+        if cast_float_match is not None and next_line is not None:
+            div_floor_match = div_floor_re.match(next_line)
+            if div_floor_match is not None and div_floor_match.group("input") == cast_float_match.group("lhs"):
+                lines[index] = (
+                    f"{cast_float_match.group('indent')}{cast_float_match.group('lhs')} = "
+                    f"{cast_float_match.group('input')}.to(dtype=torch.int64)"
+                )
+                lines[index + 1] = (
+                    f"{div_floor_match.group('indent')}{div_floor_match.group('lhs')} = "
+                    f"_align_tensor_to_target_shape(torch.div({div_floor_match.group('input')}, "
+                    f"{div_floor_match.group('divisor')}, rounding_mode='floor'), [1])"
+                )
+                changed = True
+                index += 2
+                continue
+        singleton_mul_const_match = singleton_mul_const_align_re.match(current_line)
+        if singleton_mul_const_match is not None:
+            lines[index] = (
+                f"{singleton_mul_const_match.group('indent')}{singleton_mul_const_match.group('lhs')} = "
+                f"torch.div({singleton_mul_const_match.group('input')}, self.const_inline_literal_1)"
+            )
+            changed = True
+            index += 1
+            continue
+        self_square_match = self_square_align_mul_re.match(current_line)
+        if self_square_match is not None:
+            lines[index] = (
+                f"{self_square_match.group('indent')}{self_square_match.group('lhs')} = "
+                f"torch.mul({self_square_match.group('input')}, {self_square_match.group('input')})"
+            )
+            changed = True
+            index += 1
+            continue
+        singleton_binary_anchor_match = singleton_binary_anchor_re.match(current_line)
+        if singleton_binary_anchor_match is not None and next_line is not None:
+            singleton_mul_align_match = singleton_mul_align_re.match(next_line)
+            if (
+                singleton_mul_align_match is not None
+                and singleton_mul_align_match.group("input0") == singleton_binary_anchor_match.group("lhs1")
+                and singleton_mul_align_match.group("input1") == singleton_binary_anchor_match.group("lhs0")
+            ):
+                lines[index] = (
+                    f"{singleton_binary_anchor_match.group('indent')}{singleton_binary_anchor_match.group('lhs0')}, "
+                    f"{singleton_binary_anchor_match.group('lhs1')} = "
+                    f"{singleton_binary_anchor_match.group('input1')}, {singleton_binary_anchor_match.group('input0')}"
+                )
+                lines[index + 1] = (
+                    f"{singleton_mul_align_match.group('indent')}{singleton_mul_align_match.group('lhs')} = "
+                    f"torch.mul({singleton_mul_align_match.group('input0')}, {singleton_mul_align_match.group('input1')})"
+                )
+                changed = True
+                index += 2
+                continue
+        column_binary_anchor_match = column_binary_anchor_re.match(current_line)
+        if column_binary_anchor_match is not None and next_line is not None:
+            column_div_align_match = column_div_align_re.match(next_line)
+            if (
+                column_div_align_match is not None
+                and column_div_align_match.group("input0") == column_binary_anchor_match.group("lhs0")
+                and column_div_align_match.group("input1") == column_binary_anchor_match.group("lhs1")
+                and column_div_align_match.group("n") == column_binary_anchor_match.group("n")
+            ):
+                lines[index] = (
+                    f"{column_binary_anchor_match.group('indent')}{column_binary_anchor_match.group('lhs0')}, "
+                    f"{column_binary_anchor_match.group('lhs1')} = "
+                    f"{column_binary_anchor_match.group('input0')}, {column_binary_anchor_match.group('input1')}"
+                )
+                lines[index + 1] = (
+                    f"{column_div_align_match.group('indent')}{column_div_align_match.group('lhs')} = "
+                    f"torch.div({column_div_align_match.group('input0')}, {column_div_align_match.group('input1')})"
+                )
+                changed = True
+                index += 2
+                continue
         rank4_eq_align_match = rank4_eq_align_re.match(current_line)
         if rank4_eq_align_match is not None:
             lines[index] = (
@@ -26827,6 +26900,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 f"torch.eq({rank4_eq_align_match.group('a')}, {rank4_eq_align_match.group('b')})"
             )
             changed = True
+            index += 1
             continue
         nhwc_to_nchw_match = nhwc_to_nchw_singleton_reshape_re.match(current_line)
         if nhwc_to_nchw_match is not None:
@@ -26836,6 +26910,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 f"[{nhwc_to_nchw_match.group('n')}, 1, {nhwc_to_nchw_match.group('h')}, {nhwc_to_nchw_match.group('w')}])"
             )
             changed = True
+            index += 1
             continue
         singleton_wrapper_match = singleton_rank4_wrapper_re.match(current_line)
         if singleton_wrapper_match is not None:
@@ -26844,24 +26919,9 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 f"{singleton_wrapper_match.group('expr')}"
             )
             changed = True
+            index += 1
             continue
-        cast_float_match = cast_float_re.match(current_line)
-        if cast_float_match is not None and str(cast_float_match.group("lhs")) == "wadkd_div_out0_div_lhs_cast":
-            lines[index] = (
-                f"{cast_float_match.group('indent')}{cast_float_match.group('lhs')} = "
-                f"{cast_float_match.group('input')}.to(dtype=torch.int64)"
-            )
-            changed = True
-            continue
-        div_floor_match = div_floor_re.match(current_line)
-        if div_floor_match is not None and str(div_floor_match.group("lhs")) == "wadkd_div_out0_div_out":
-            lines[index] = (
-                f"{div_floor_match.group('indent')}{div_floor_match.group('lhs')} = "
-                f"_align_tensor_to_target_shape(torch.div({div_floor_match.group('input')}, "
-                f"{div_floor_match.group('divisor')}, rounding_mode='floor'), [1])"
-            )
-            changed = True
-            continue
+        index += 1
 
     stage7_def_index = next(
         (index for index, line in enumerate(lines) if line.startswith("    def _forward_stage_7(")),
@@ -26898,6 +26958,8 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         or block_end_index is None
         or block_end_index < block_start_index
     ):
+        if changed:
+            model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return
 
     if "scores_map: torch.Tensor" not in lines[stage7_def_index]:
@@ -27010,19 +27072,20 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     changed = False
     lines = model_source.splitlines()
     register_buffer_re = re.compile(
-        r"torch\.zeros\(\[1, 100, (?P<heads>4|8|16), 100\], dtype=torch\.float32\)"
+        r"torch\.zeros\(\[1, (?P<window>\d+), (?P<heads>4|8|16), (?P=window)\], dtype=torch\.float32\)"
     )
     copy_permute_re = re.compile(
         r"^(?P<indent>\s*self\.[A-Za-z0-9_]+\.copy_\()(?P<src>.+)\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
     )
     binary_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<dim1>100), (?P<heads>4|8|16), (?P<dim3>100)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P<heads>4|8|16), (?P=window)(?P<suffix>\]\))$"
     )
     binary_const_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<dim1>100), (?P<dim2>100), (?P<heads>4|8|16)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P=window), (?P<heads>4|8|16)(?P<suffix>\]\))$"
     )
     mul_align_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[)(?P<batch>\d+), (?P<dim1>100), (?P<heads>4|8|16), (?P<dim3>100)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[)"
+        r"(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
     )
 
     for index, line in enumerate(lines):
@@ -27030,7 +27093,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         register_match = register_buffer_re.search(current_line)
         if register_match is not None:
             rewritten = register_buffer_re.sub(
-                f"torch.zeros([1, {register_match.group('heads')}, 100, 100], dtype=torch.float32)",
+                f"torch.zeros([1, {register_match.group('heads')}, {register_match.group('window')}, {register_match.group('window')}], dtype=torch.float32)",
                 current_line,
             )
             if rewritten != current_line:
@@ -27048,7 +27111,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         if binary_match is not None:
             rewritten = (
                 f"{binary_match.group('indent')}{binary_match.group('batch')}, "
-                f"{binary_match.group('heads')}, 100, 100{binary_match.group('suffix')}"
+                f"{binary_match.group('heads')}, {binary_match.group('window')}, {binary_match.group('window')}{binary_match.group('suffix')}"
             )
             if rewritten != current_line:
                 lines[index] = rewritten
@@ -27058,7 +27121,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         if binary_const_match is not None:
             rewritten = (
                 f"{binary_const_match.group('indent')}{binary_const_match.group('batch')}, "
-                f"{binary_const_match.group('heads')}, 100, 100{binary_const_match.group('suffix')}"
+                f"{binary_const_match.group('heads')}, {binary_const_match.group('window')}, {binary_const_match.group('window')}{binary_const_match.group('suffix')}"
             )
             if rewritten != current_line:
                 lines[index] = rewritten
@@ -27066,14 +27129,22 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             continue
         mul_match = mul_align_shape_re.match(current_line)
         if mul_match is not None:
-            rewritten = (
-                f"{mul_match.group('indent')}{mul_match.group('batch')}, "
-                f"{mul_match.group('heads')}, 100, 100{mul_match.group('suffix')}"
-            )
-            if rewritten != current_line:
-                lines[index] = rewritten
-                changed = True
-            continue
+            dims = [
+                int(mul_match.group("d1")),
+                int(mul_match.group("d2")),
+                int(mul_match.group("d3")),
+            ]
+            head_dims = [dim for dim in dims if dim in {4, 8, 16}]
+            non_head_dims = [dim for dim in dims if dim not in {4, 8, 16}]
+            if len(head_dims) == 1 and len(non_head_dims) == 2 and non_head_dims[0] == non_head_dims[1]:
+                rewritten = (
+                    f"{mul_match.group('indent')}{mul_match.group('batch')}, "
+                    f"{head_dims[0]}, {non_head_dims[0]}, {non_head_dims[1]}{mul_match.group('suffix')}"
+                )
+                if rewritten != current_line:
+                    lines[index] = rewritten
+                    changed = True
+                continue
     model_source = "\n".join(lines)
 
     if changed:
@@ -27464,7 +27535,7 @@ def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
 def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     register_buffer_count = _count_lines_matching(
         lines,
-        r"^\s*self\.register_buffer\('[A-Za-z0-9_]+', torch\.zeros\(\[1, 100, (?:4|8|16), 100\], dtype=torch\.float32\), persistent=False\)$",
+        r"^\s*self\.register_buffer\('[A-Za-z0-9_]+', torch\.zeros\(\[1, \d+, (?:4|8|16), \d+\], dtype=torch\.float32\), persistent=False\)$",
     )
     copy_permute_count = _count_lines_matching(
         lines,
@@ -27472,7 +27543,7 @@ def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     )
     attn_binary_count = _count_lines_matching(
         lines,
-        r"^\s*_[A-Za-z0-9_]+, _[A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_]+, \[(?:24|6), 100, (?:4|8|16), 100\]\)$",
+        r"^\s*_[A-Za-z0-9_]+, _[A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_]+, \[(?:24|6), \d+, (?:4|8|16), \d+\]\)$",
     )
     return register_buffer_count >= 6 and copy_permute_count >= 6 and attn_binary_count >= 4
 
@@ -27482,7 +27553,7 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
         r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\([A-Za-z0-9_]+, .*channel_last=False\)$"
     )
     softmax_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>4|8|16), 100, 100\]\)$"
+        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>4|8|16), (?P<window>\d+), (?P=window)\]\)$"
     )
 
     has_cf_pool = False

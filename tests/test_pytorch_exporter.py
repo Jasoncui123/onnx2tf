@@ -44,6 +44,7 @@ from onnx2tf.tflite_builder.pytorch_accuracy_evaluator import (
 from onnx2tf.tflite_builder.pytorch_exporter import (
     ModelIRPyTorchExportError,
     NativePyTorchGenerationTimeoutError,
+    _apply_alike_fast_precanonicalize_repairs,
     _apply_fast_precanonicalize_repairs,
     _apply_fast_precanonicalize_repairs_until_stable,
     _build_metadata_payload,
@@ -912,7 +913,7 @@ def test_apply_fast_precanonicalize_repairs_fix_stage1_and_gather_chain(
         encoding="utf-8",
     )
 
-    _apply_fast_precanonicalize_repairs(package_dir)
+    _apply_alike_fast_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "t_471 = torch.reshape(t_469, [1, 64, 1, 1])" in rewritten
@@ -942,7 +943,7 @@ def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis(
         encoding="utf-8",
     )
 
-    _apply_fast_precanonicalize_repairs(package_dir)
+    _apply_alike_fast_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert (
@@ -1063,7 +1064,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
         encoding="utf-8",
     )
 
-    _apply_fast_precanonicalize_repairs(package_dir)
+    _apply_alike_fast_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "wadkd_cast5_out0: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -1093,7 +1094,64 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
     assert "wadkd_mul30_out0 = torch.mul(wadkd_rs14_out0, wadkd_tr1_out0)" in rewritten
     assert "wadkd_tr14_out0 = _torch_permute(wadkd_add12_out0, [0, 1, 3, 2])" in rewritten
     assert "_align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])" not in rewritten
-    assert "scores = torch.reshape(wa_squeeze_out0, _resolve_reshape_shape([-1, 1], wa_squeeze_out0, allow_zero=False))" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_stage_with_generic_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alike_generic_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_7(self, a0: torch.Tensor, a1: torch.Tensor, a2: torch.Tensor, a3: torch.Tensor, a4: torch.Tensor, score_div: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor, t3: torch.Tensor, t4: torch.Tensor, score_map_cast: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        descriptors = _torch_permute(score_div, [1, 0])",
+                "        eq0 = _align_tensor_to_target_shape(torch.eq(max_in, max_out), [1, 96, 160, 1])",
+                "        eq0_nchw = torch.reshape(eq0.permute(0, 3, 1, 2).contiguous(), [1, 1, 96, 160])",
+                "        less0 = torch.reshape(torch.lt(split0, 0.0), [1, 1, 1, 1])",
+                "        mul0 = torch.reshape(torch.mul(floor0, score_map_cast), [1, 1, 1, 1])",
+                "        div_lhs_cast = gather0.to(dtype=torch.float32)",
+                "        div_out = _align_tensor_to_target_shape(torch.div(div_lhs_cast, 160.0), [1])",
+                "        mul16 = _align_tensor_to_target_shape(torch.mul(cast4, self.const_inline_literal_0), [1, 2])",
+                "        reduce_l2_squared = _align_tensor_to_target_shape(torch.mul(tr17, tr17), [32, 1])",
+                "        _rhs_191, _lhs_191 = _align_binary_inputs_to_anchor(expand23_ones, clip0, [1, 1])",
+                "        expand23 = _align_tensor_to_target_shape(torch.mul(_lhs_191, _rhs_191), [1, 1])",
+                "        _lhs_196, _rhs_196 = _align_binary_inputs_to_anchor(tr17, expand23, [32, 1])",
+                "        div3 = _align_tensor_to_target_shape(torch.div(_lhs_196, _rhs_196), [32, 1])",
+                "        s13 = torch.reshape(gather7, _resolve_reshape_shape([-1, 1], gather7, allow_zero=False))",
+                "        s15 = torch.reshape(gather8, _resolve_reshape_shape([-1, 1], gather8, allow_zero=False))",
+                "        s17 = torch.reshape(gather9, _resolve_reshape_shape([-1, 1], gather9, allow_zero=False))",
+                "        s19 = torch.reshape(gather10, _resolve_reshape_shape([-1, 1], gather10, allow_zero=False))",
+                "        _bin0, _bin1 = _align_binary_inputs_to_anchor(rs14, tr1, [1, 1, 1, 1])",
+                "        _bin2, _bin3 = _align_binary_inputs_to_anchor(rs15, tr2, [1, 1, 1, 1])",
+                "        _bin4, _bin5 = _align_binary_inputs_to_anchor(rs16, tr3, [1, 1, 1, 1])",
+                "        _bin6, _bin7 = _align_binary_inputs_to_anchor(rs17, tr4, [1, 1, 1, 1])",
+                "        scores = torch.reshape(out_scores, (([1]) + ([1])))",
+                "        return descriptors, scores",
+                "    def forward(self, scores_map: torch.Tensor, a0: torch.Tensor, a1: torch.Tensor, a2: torch.Tensor, a3: torch.Tensor, a4: torch.Tensor, score_div: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor, t3: torch.Tensor, t4: torch.Tensor, score_map_cast: torch.Tensor):",
+                "        descriptors, scores = self._forward_stage_7(a0, a1, a2, a3, a4, score_div, t1, t2, t3, t4, score_map_cast)",
+                "        return descriptors, scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_alike_fast_precanonicalize_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "div_lhs_cast = gather0.to(dtype=torch.int64)" in rewritten
+    assert "div_out = _align_tensor_to_target_shape(torch.div(div_lhs_cast, 160, rounding_mode='floor'), [1])" in rewritten
+    assert "mul16 = torch.div(cast4, self.const_inline_literal_1)" in rewritten
+    assert "reduce_l2_squared = torch.mul(tr17, tr17)" in rewritten
+    assert "_rhs_191, _lhs_191 = clip0, expand23_ones" in rewritten
+    assert "expand23 = torch.mul(_lhs_191, _rhs_191)" in rewritten
+    assert "_lhs_196, _rhs_196 = tr17, expand23" in rewritten
+    assert "div3 = torch.div(_lhs_196, _rhs_196)" in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_fix_efficientformer_attention_scalar_mul_target(
@@ -2534,6 +2592,32 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_sig
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_signature_with_generic_window(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_semantic_window64_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pooled_cf, enc_attn, dec_attn, conv_attn):",
+                "        pooled_out = _apply_pool2d(pooled_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=False)",
+                "        encoder_softmax = _apply_softmax(enc_attn, axis=3, beta=1.0, target_shape=[24, 4, 64, 64])",
+                "        decoder_softmax = _apply_softmax(dec_attn, axis=3, beta=1.0, target_shape=[24, 8, 64, 64])",
+                "        conv_softmax = _apply_softmax(conv_attn, axis=3, beta=1.0, target_shape=[6, 16, 64, 64])",
+                "        return pooled_out, encoder_softmax, decoder_softmax, conv_softmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes(
     tmp_path,
 ) -> None:
@@ -2596,6 +2680,63 @@ def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes
     assert "[24, 4, 100, 100]" in repaired
     assert "[24, 8, 100, 100]" in repaired
     assert "[6, 16, 100, 100]" in repaired
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_generic_window(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_window64_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 64, 4, 64], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_b', torch.zeros([1, 64, 4, 64], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_c', torch.zeros([1, 64, 8, 64], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_d', torch.zeros([1, 64, 8, 64], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_e', torch.zeros([1, 64, 16, 64], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('mask_buf_f', torch.zeros([1, 64, 16, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_b.copy_(self.attn_src_b.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_c.copy_(self.attn_src_c.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_d.copy_(self.attn_src_d.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_e.copy_(self.attn_src_e.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.mask_buf_f.copy_(self.attn_src_f.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, enc0_lhs, enc0_rhs, enc1_lhs, enc1_rhs, dec0_lhs, dec0_rhs, dec1_lhs, dec1_rhs):",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs(enc0_lhs, enc0_rhs, [24, 64, 4, 64])",
+                "        enc0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [24, 64, 4, 64])",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(enc1_lhs, enc1_rhs, [24, 64, 8, 64])",
+                "        enc1_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_1, _binary_rhs_1), [24, 64, 8, 64])",
+                "        _binary_lhs_2, _binary_rhs_2 = _align_binary_inputs(dec0_lhs, dec0_rhs, [6, 64, 16, 64])",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_2, _binary_rhs_2), [6, 64, 16, 64])",
+                "        _binary_lhs_3, _binary_rhs_3 = _align_binary_inputs(dec1_lhs, dec1_rhs, [24, 64, 8, 64])",
+                "        dec1_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_3, _binary_rhs_3), [24, 64, 8, 64])",
+                "        return enc0_mul, enc1_mul, dec0_mul, dec1_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "torch.zeros([1, 4, 64, 64]" in repaired
+    assert "torch.zeros([1, 8, 64, 64]" in repaired
+    assert "torch.zeros([1, 16, 64, 64]" in repaired
+    assert ".permute(*(0, 2, 1, 3)).contiguous()" not in repaired
+    assert "[24, 64, 4, 64]" not in repaired
+    assert "[24, 64, 8, 64]" not in repaired
+    assert "[6, 64, 16, 64]" not in repaired
+    assert "[24, 4, 64, 64]" in repaired
+    assert "[24, 8, 64, 64]" in repaired
+    assert "[6, 16, 64, 64]" in repaired
 
 
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_without_fixed_buffer_names(
