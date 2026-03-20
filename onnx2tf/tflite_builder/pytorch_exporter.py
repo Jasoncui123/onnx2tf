@@ -21610,28 +21610,38 @@ def _canonicalize_generated_model_source_for_raw_export(
         cf_aliases.add(rank4_matmul_lhs)
         changed = True
         index += 8
-    pidnet_forced_resize_targets_by_suffix: tuple[tuple[str, list[int]], ...] = (
-        ("waspp_resize1_out_nhwc_cf", [1, 96, 3, 5]),
-        ("waspp_resize2_out_nhwc_cf", [1, 96, 3, 5]),
-        ("waspp_resize3_out_nhwc_cf", [1, 96, 3, 5]),
-        ("waspp_resize_out_nhwc_cf", [1, 96, 3, 5]),
-        ("spp_resize1_out_nhwc_cf", [1, 96, 3, 5]),
-        ("spp_resize2_out_nhwc_cf", [1, 96, 3, 5]),
-        ("spp_resize3_out_nhwc_cf", [1, 96, 3, 5]),
-        ("spp_resize_out_nhwc_cf", [1, 96, 3, 5]),
-        ("pag4_resize1_out_nhwc_cf", [1, 64, 24, 40]),
-        ("pag4_resize_out_nhwc_cf", [1, 32, 24, 40]),
-        ("pag3_resize_out_nhwc_cf", [1, 32, 24, 40]),
-        ("resize1_out_nhwc_cf", [1, 64, 24, 40]),
-        ("resize_out_nhwc_cf", [1, 32, 24, 40]),
-        ("resize3_out_nhwc_cf", [1, 19, 192, 320]),
-    )
-
-    def _pidnet_forced_resize_target(lhs_name: str) -> list[int] | None:
-        for suffix, target_shape in pidnet_forced_resize_targets_by_suffix:
-            if lhs_name == suffix or lhs_name.endswith(suffix):
-                return target_shape
-        return None
+    def _pidnet_forced_resize_target(
+        lhs_name: str,
+        input_name: str,
+        current_target_shape: Sequence[int],
+        out_h: int,
+        out_w: int,
+    ) -> list[int] | None:
+        if not (
+            _is_known_cf_name(input_name, singleton_cf_vars)
+            or input_name.endswith("_cf")
+            or input_name.endswith("_out_cf")
+            or lhs_name.endswith("_cf")
+            or lhs_name.endswith("_out_cf")
+        ):
+            return None
+        preferred_channel_count = _infer_cf_channel_count(input_name)
+        if preferred_channel_count is None:
+            lhs_exact_shape = _model_ir_exact_shape(lhs_name)
+            if lhs_exact_shape is not None and len(lhs_exact_shape) == 4:
+                normalized_exact = _normalize_cf_rank4_shape(
+                    lhs_exact_shape,
+                    out_hw=(out_h, out_w),
+                )
+                preferred_channel_count = int(normalized_exact[1])
+        normalized_shape = _normalize_cf_rank4_shape(
+            current_target_shape,
+            preferred_channel_count=preferred_channel_count,
+            out_hw=(out_h, out_w),
+        )
+        if normalized_shape == [int(v) for v in list(current_target_shape)]:
+            return None
+        return normalized_shape
 
     for index, line in enumerate(lines):
         resize_cf_match = apply_resize_cf_bad_target_re.match(line)
@@ -21639,8 +21649,6 @@ def _canonicalize_generated_model_source_for_raw_export(
             continue
         input_name = str(resize_cf_match.group("input"))
         lhs = str(resize_cf_match.group("lhs"))
-        if _pidnet_forced_resize_target(lhs) is not None:
-            continue
         if not _is_known_cf_name(input_name, singleton_cf_vars):
             continue
         indent = str(resize_cf_match.group("indent"))
@@ -21717,7 +21725,13 @@ def _canonicalize_generated_model_source_for_raw_export(
             cf_aliases.add(lhs)
             changed = True
             continue
-        forced_pidnet_target = _pidnet_forced_resize_target(lhs)
+        forced_pidnet_target = _pidnet_forced_resize_target(
+            lhs,
+            input_name,
+            [n, h, w, c],
+            out_h,
+            out_w,
+        )
         if forced_pidnet_target is not None:
             lines[index] = (
                 f"{indent}{lhs} = _apply_resize("
@@ -24051,14 +24065,26 @@ def _canonicalize_generated_model_source_for_raw_export(
     pidnet_forced_resize_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\("
         r"(?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', "
-        r"target_shape=\[[^\]]+\], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?:True|False)\)$"
+        r"target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], "
+        r"align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?:True|False)\)$"
     )
     for index, line in enumerate(lines):
         pidnet_forced_resize_match = pidnet_forced_resize_re.match(line)
         if pidnet_forced_resize_match is None:
             continue
         lhs = str(pidnet_forced_resize_match.group("lhs"))
-        target_shape = _pidnet_forced_resize_target(lhs)
+        target_shape = _pidnet_forced_resize_target(
+            lhs,
+            str(pidnet_forced_resize_match.group("input")),
+            [
+                int(pidnet_forced_resize_match.group("n")),
+                int(pidnet_forced_resize_match.group("h")),
+                int(pidnet_forced_resize_match.group("w")),
+                int(pidnet_forced_resize_match.group("c")),
+            ],
+            int(pidnet_forced_resize_match.group("out_h")),
+            int(pidnet_forced_resize_match.group("out_w")),
+        )
         if target_shape is None:
             continue
         lines[index] = (

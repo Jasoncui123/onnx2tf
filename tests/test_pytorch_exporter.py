@@ -3120,6 +3120,37 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_pag4_resize1_to_cha
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_resize_with_generic_cf_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_resize_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_feature_cf: torch.Tensor) -> torch.Tensor:",
+                "        generic_resize_bridge_cf = _apply_resize(generic_feature_cf, [24, 40], method='bilinear', target_shape=[1, 24, 40, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        return generic_resize_bridge_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "generic_resize_bridge_cf = _apply_resize(generic_feature_cf, [24, 40], method='bilinear', "
+        "target_shape=[1, 32, 24, 40], align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_resize_alias_binary_bridge_to_channel_first(tmp_path) -> None:
     package_dir = tmp_path / "resize_alias_binary_bridge_pkg"
     package_dir.mkdir()
