@@ -26726,36 +26726,6 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
                 f"torch.add(tmp37_nhwc_bridge_cf, cv70_out_cf), [1, 128, 6, 6])"
             )
             changed = True
-        elif stripped.startswith("resize10_out_nhwc = _apply_resize("):
-            lines[index] = (
-                f"{indent}resize10_out_nhwc = _apply_resize("
-                f"resize10_in_nhwc, [48, 48], method='bilinear', target_shape=[1, 32, 48, 48], "
-                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
-            )
-            changed = True
-        elif stripped.startswith("resize11_out_nhwc = _apply_resize("):
-            lines[index] = (
-                f"{indent}resize11_out_nhwc = _apply_resize("
-                f"resize11_in_nhwc, [48, 48], method='bilinear', target_shape=[1, 64, 48, 48], "
-                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
-            )
-            changed = True
-        elif stripped.startswith("resize12_out = _apply_resize("):
-            lines[index] = (
-                f"{indent}resize12_out = _apply_resize("
-                f"resize12_in, [48, 48], method='bilinear', target_shape=[1, 128, 48, 48], "
-                f"align_corners=False, half_pixel_centers=True, channel_last=False)"
-            )
-            changed = True
-        elif stripped.startswith("cv71_in = _apply_concat("):
-            lines[index] = (
-                f"{indent}cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)"
-            )
-            changed = True
-        elif stripped.startswith("cv72_in_cf = self.conv_block_71(_torch_permute("):
-            lines[index] = f"{indent}cv72_in_cf = self.conv_block_71(cv71_in)"
-            changed = True
-
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
