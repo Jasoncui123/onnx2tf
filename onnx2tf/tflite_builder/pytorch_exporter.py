@@ -27554,14 +27554,12 @@ def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
 
 
 def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
-    pool_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_pool2d\([A-Za-z0-9_]+, .*channel_last=False\)$"
-    )
+    pool_channel_last_re = re.compile(r"(?:^|[,(])\s*channel_last\s*=\s*False(?:$|[,)])")
 
     has_cf_pool = False
     for line in lines:
         current_line = str(line)
-        if pool_re.match(current_line) is not None:
+        if "_apply_pool2d(" in current_line and pool_channel_last_re.search(current_line) is not None:
             has_cf_pool = True
     softmax_shapes = _collect_shadowformer_softmax_shapes(lines)
     if not has_cf_pool:
