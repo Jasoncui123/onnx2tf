@@ -26677,7 +26677,7 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, _resolve_reshape_shape\(\[-1, 1\], [A-Za-z0-9_]+, allow_zero=False\)\)$"
     )
     singleton_anchor_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\([A-Za-z0-9_]+, [A-Za-z0-9_]+, \[1, 1, 1, 1\]\)$"
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\([A-Za-z0-9_]+, [A-Za-z0-9_]+, (?:\[|\()1, 1, 1, 1(?:\]|\))\)$"
     )
     stage7_return_re = re.compile(
         r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
@@ -26779,10 +26779,10 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
     )
     stage7_shape_tensor_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _shape_tensor\((?P<input>[A-Za-z0-9_]+), dtype=torch\.int32, device=(?P=input)\.device\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _shape_tensor\((?P<input>[A-Za-z0-9_]+), dtype=torch\.int32(?:, device=(?P=input)\.device)?\)$"
     )
     stage7_singleton_anchor_re = re.compile(
-        r"^\s*(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<rs>[A-Za-z0-9_]+), (?P<tr>[A-Za-z0-9_]+), \[1, 1, 1, 1\]\)$"
+        r"^\s*(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<rs>[A-Za-z0-9_]+), (?P<tr>[A-Za-z0-9_]+), (?:\[|\()1, 1, 1, 1(?:\]|\))\)$"
     )
 
     changed = False
