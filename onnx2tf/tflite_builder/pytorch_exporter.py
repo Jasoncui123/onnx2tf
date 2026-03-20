@@ -27011,6 +27011,24 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN = (
+    r"(?:"
+    r"\*\(\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\)"
+    r"|0\s*,\s*2\s*,\s*1\s*,\s*3"
+    r"|\(\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\)"
+    r"|\[\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\]"
+    r"|dims\s*=\s*\(\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\)"
+    r"|dims\s*=\s*\[\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\]"
+    r")"
+)
+_SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
+    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\(\))?\)$"
+)
+_SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
+    rf"^.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\(\))?$"
+)
+
+
 def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     if not model_path.exists():
         return
@@ -27043,9 +27061,6 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     register_buffer_re = re.compile(
         r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\((?:size=)?(?:\[|\()1, (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?:\]|\)), dtype=torch\.(?P<dtype>[A-Za-z0-9_]+)\), persistent=(?P<persistent>True|False)\)"
     )
-    copy_permute_re = re.compile(
-        r"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\((?:\*\(0, 2, 1, 3\)|0, 2, 1, 3|\(0, 2, 1, 3\)|\[0, 2, 1, 3\]|dims=\(0, 2, 1, 3\)|dims=\[0, 2, 1, 3\])\)(?:\.contiguous\(\))?\)$"
-    )
     binary_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
     )
@@ -27077,7 +27092,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
                 lines[index] = rewritten
                 changed = True
             continue
-        copy_match = copy_permute_re.match(current_line)
+        copy_match = _SHADOWFORMER_COPY_PERMUTE_RE.match(current_line)
         if copy_match is not None:
             if copy_match.group("buffer") not in supported_buffers:
                 continue
@@ -27587,14 +27602,7 @@ def _collect_shadowformer_fast_repair_facts(
         copy_match = copy_re.match(current_line)
         if copy_match is not None and copy_match.group("buffer") in raw_buffer_dims:
             src_expr = str(copy_match.group("src"))
-            if (
-                ".permute(*(0, 2, 1, 3))" in src_expr
-                or ".permute(0, 2, 1, 3)" in src_expr
-                or ".permute((0, 2, 1, 3))" in src_expr
-                or ".permute([0, 2, 1, 3])" in src_expr
-                or ".permute(dims=(0, 2, 1, 3))" in src_expr
-                or ".permute(dims=[0, 2, 1, 3])" in src_expr
-            ):
+            if _SHADOWFORMER_COPY_PERMUTE_SRC_RE.match(src_expr) is not None:
                 permuted_copy_buffers.add(copy_match.group("buffer"))
             else:
                 plain_copy_buffers.add(copy_match.group("buffer"))
