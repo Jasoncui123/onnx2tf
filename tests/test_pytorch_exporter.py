@@ -1789,6 +1789,95 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_annotated
     assert "_align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])" not in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_compact_annotated_packed_outputs(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alike_full_compact_annotated_packed_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_7(self, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        desc_out = _torch_permute(score_div, [1, 0])",
+                "        shape_a = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)",
+                "        shape_b = _shape_tensor(add_b, dtype=torch.int32, device=add_b.device)",
+                "        rs_a = torch.reshape(gather_a, _resolve_reshape_shape([-1, 1], gather_a, allow_zero=False))",
+                "        rs_b = torch.reshape(gather_b, _resolve_reshape_shape([-1, 1], gather_b, allow_zero=False))",
+                "        pair0_lhs, pair0_rhs = _align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])",
+                "        pair1_lhs, pair1_rhs = _align_binary_inputs_to_anchor(score_rs1, tr_b, [1, 1, 1, 1])",
+                "        out_scores = torch.reshape(score_tail, (([1]) + ([1])))",
+                "        return desc_out, out_scores",
+                "    def forward(self, scores_map: torch.Tensor, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor):",
+                "        stage7_outputs:tuple[torch.Tensor,torch.Tensor]=self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast)",
+                "        final_desc:torch.Tensor=stage7_outputs[0]",
+                "        final_scores:torch.Tensor=stage7_outputs[1]",
+                "        return final_desc, final_scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_alike_fast_precanonicalize_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "stage7_outputs:tuple[torch.Tensor,torch.Tensor]=self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map)" in rewritten
+    assert "final_desc:torch.Tensor=stage7_outputs[0]" in rewritten
+    assert "final_scores:torch.Tensor=stage7_outputs[1]" in rewritten
+    assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
+    assert "out_scores_stage7_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
+    assert "_align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_typing_module_tuple_outputs(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alike_full_typing_module_tuple_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import typing",
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_7(self, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor) -> typing.Tuple[torch.Tensor,torch.Tensor]:",
+                "        desc_out = _torch_permute(score_div, [1, 0])",
+                "        shape_a = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)",
+                "        shape_b = _shape_tensor(add_b, dtype=torch.int32, device=add_b.device)",
+                "        rs_a = torch.reshape(gather_a, _resolve_reshape_shape([-1, 1], gather_a, allow_zero=False))",
+                "        rs_b = torch.reshape(gather_b, _resolve_reshape_shape([-1, 1], gather_b, allow_zero=False))",
+                "        pair0_lhs, pair0_rhs = _align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])",
+                "        pair1_lhs, pair1_rhs = _align_binary_inputs_to_anchor(score_rs1, tr_b, [1, 1, 1, 1])",
+                "        out_scores = torch.reshape(score_tail, (([1]) + ([1])))",
+                "        return desc_out, out_scores",
+                "    def forward(self, scores_map: torch.Tensor, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor):",
+                "        stage7_outputs:typing.Tuple[torch.Tensor,torch.Tensor]=self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast)",
+                "        final_desc:torch.Tensor=stage7_outputs[0]",
+                "        final_scores:torch.Tensor=stage7_outputs[1]",
+                "        return final_desc, final_scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_alike_fast_precanonicalize_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "stage7_outputs:typing.Tuple[torch.Tensor,torch.Tensor]=self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map)" in rewritten
+    assert "final_desc:torch.Tensor=stage7_outputs[0]" in rewritten
+    assert "final_scores:torch.Tensor=stage7_outputs[1]" in rewritten
+    assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
+    assert "out_scores_stage7_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
+    assert "_align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])" not in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_efficientformer_attention_scalar_mul_target(
     tmp_path,
 ) -> None:

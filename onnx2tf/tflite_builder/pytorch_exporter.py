@@ -26662,16 +26662,16 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
 
 def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     stage7_def_re = re.compile(
-        r"^\s*def _forward_stage_7\(self, .+\)(?: -> (?:tuple|Tuple)\[torch\.Tensor, torch\.Tensor\])?:$"
+        r"^\s*def _forward_stage_7\(self, .+\)(?: -> (?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?:$"
     )
     forward_unpack_re = re.compile(
         r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
     )
     forward_packed_re = re.compile(
-        r"^\s*(?P<packed>[A-Za-z0-9_]+)(?:: (?:tuple|Tuple)\[torch\.Tensor, torch\.Tensor\])? = self\._forward_stage_7\(.+\)$"
+        r"^\s*(?P<packed>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?\s*=\s*self\._forward_stage_7\(.+\)$"
     )
     forward_index_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:: torch\.Tensor)? = (?P<packed>[A-Za-z0-9_]+)\[(?P<index>[01])\]$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\s*=\s*(?P<packed>[A-Za-z0-9_]+)\[(?P<index>[01])\]$"
     )
     gather_reshape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, _resolve_reshape_shape\(\[-1, 1\], [A-Za-z0-9_]+, allow_zero=False\)\)$"
@@ -26773,7 +26773,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
     )
     forward_packed_re = re.compile(
-        r"^\s*(?P<packed>[A-Za-z0-9_]+)(?:: (?:tuple|Tuple)\[torch\.Tensor, torch\.Tensor\])? = self\._forward_stage_7\(.+\)$"
+        r"^\s*(?P<packed>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?\s*=\s*self\._forward_stage_7\(.+\)$"
     )
     stage7_return_re = re.compile(
         r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
