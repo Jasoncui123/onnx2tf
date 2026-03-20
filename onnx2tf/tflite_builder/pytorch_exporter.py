@@ -27032,7 +27032,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
     )
     binary_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_\.]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
     )
     mul_align_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[)"
@@ -27545,7 +27545,7 @@ def _collect_shadowformer_fast_repair_facts(
         r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\(.+\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
     )
     binary_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, (?P<rhs>[A-Za-z0-9_\.]+), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\((?P<lhs>[A-Za-z0-9_\.]+), (?P<rhs>[A-Za-z0-9_\.]+), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     mul_align_shape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
@@ -27579,9 +27579,10 @@ def _collect_shadowformer_fast_repair_facts(
             inferred_shape = _infer_shadowformer_shape_from_dims(dims, registered_shapes)
             if inferred_shape is not None:
                 aligned_shapes.add(inferred_shape)
-                rhs_name = str(binary_match.group("rhs"))
-                if rhs_name.startswith("self."):
-                    buffer_name = rhs_name[len("self.") :]
+                for operand_name in (str(binary_match.group("lhs")), str(binary_match.group("rhs"))):
+                    if not operand_name.startswith("self."):
+                        continue
+                    buffer_name = operand_name[len("self.") :]
                     buffer_shape = buffer_shapes.get(buffer_name)
                     if buffer_shape == inferred_shape:
                         buffer_aligned_shapes.add(inferred_shape)
