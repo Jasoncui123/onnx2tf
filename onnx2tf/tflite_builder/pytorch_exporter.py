@@ -27564,23 +27564,14 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
     pool_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\([A-Za-z0-9_]+, .*channel_last=False\)$"
     )
-    softmax_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>\d+), (?P<window>\d+), (?P=window)\]\)$"
-    )
 
     has_cf_pool = False
-    distinct_head_counts: Set[int] = set()
-    softmax_count = 0
     for line in lines:
         current_line = str(line)
         if pool_re.match(current_line) is not None:
             has_cf_pool = True
-            continue
-        softmax_match = softmax_re.match(current_line)
-        if softmax_match is not None:
-            softmax_count += 1
-            distinct_head_counts.add(int(softmax_match.group("heads")))
-    return has_cf_pool and softmax_count >= 2 and len(distinct_head_counts) >= 2
+    softmax_pairs = _collect_shadowformer_softmax_pairs(lines)
+    return has_cf_pool and len(softmax_pairs) >= 2
 
 
 def _collect_shadowformer_fast_repair_facts(
@@ -27640,6 +27631,25 @@ def _collect_shadowformer_fast_repair_facts(
                 aligned_pairs.add((head_dims[0], repeated_dims[0]))
 
     return registered_pairs, registered_buffers, copied_pairs, aligned_pairs
+
+
+def _collect_shadowformer_softmax_pairs(lines: Sequence[str]) -> List[Tuple[int, int, int]]:
+    softmax_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>\d+), (?P<window>\d+), (?P=window)\]\)$"
+    )
+    softmax_pairs: List[Tuple[int, int, int]] = []
+    for line in lines:
+        softmax_match = softmax_re.match(str(line))
+        if softmax_match is None:
+            continue
+        softmax_pairs.append(
+            (
+                int(softmax_match.group("batches")),
+                int(softmax_match.group("heads")),
+                int(softmax_match.group("window")),
+            )
+        )
+    return softmax_pairs
 
 
 def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Path) -> bool:
