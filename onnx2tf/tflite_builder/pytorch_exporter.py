@@ -27488,7 +27488,8 @@ def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
 
 def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
     pad_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[4, 4, 4, 4\], mode='constant', value=0\.0\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), "
+        r"\[(?P<p0>\d+), (?P<p1>\d+), (?P<p2>\d+), (?P<p3>\d+)\], mode='constant', value=0\.0\)$"
     )
     global_mean_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
@@ -27512,7 +27513,14 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
         current_line = str(line)
         pad_match = pad_re.match(current_line)
         if pad_match is not None:
-            padded_inputs.add(str(pad_match.group("input")))
+            pad_values = [
+                int(pad_match.group("p0")),
+                int(pad_match.group("p1")),
+                int(pad_match.group("p2")),
+                int(pad_match.group("p3")),
+            ]
+            if len(set(pad_values)) == 1 and int(pad_values[0]) > 0:
+                padded_inputs.add(str(pad_match.group("input")))
             continue
         mean_match = global_mean_re.match(current_line)
         if mean_match is not None:
