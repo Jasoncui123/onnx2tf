@@ -26696,36 +26696,6 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
                 f"torch.add(_binary_lhs_108, _binary_rhs_108), [1, 32, 24, 24])"
             )
             changed = True
-        elif stripped.startswith("_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("):
-            lines[index] = (
-                f"{indent}_binary_rhs_116, _binary_lhs_116 = _align_binary_inputs_to_anchor("
-                f"resize8_out_nhwc, tmp31_nhwc_bridge, [1, 32, 24, 24])"
-            )
-            changed = True
-        elif stripped.startswith("resize10_in_nhwc = _align_tensor_to_target_shape("):
-            lines[index] = (
-                f"{indent}resize10_in_nhwc = _align_tensor_to_target_shape("
-                f"torch.add(_binary_lhs_116, _binary_rhs_116), [1, 32, 24, 24])"
-            )
-            changed = True
-        elif stripped.startswith("_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("):
-            lines[index] = (
-                f"{indent}_binary_rhs_117, _binary_lhs_117 = _align_binary_inputs_to_anchor("
-                f"resize9_out_nhwc, tmp34_nhwc_bridge_cf, [1, 64, 12, 12])"
-            )
-            changed = True
-        elif stripped.startswith("resize11_in_nhwc = _align_tensor_to_target_shape("):
-            lines[index] = (
-                f"{indent}resize11_in_nhwc = _align_tensor_to_target_shape("
-                f"torch.add(_binary_lhs_117, _binary_rhs_117), [1, 64, 12, 12])"
-            )
-            changed = True
-        elif stripped.startswith("resize12_in = _align_tensor_to_target_shape("):
-            lines[index] = (
-                f"{indent}resize12_in = _align_tensor_to_target_shape("
-                f"torch.add(tmp37_nhwc_bridge_cf, cv70_out_cf), [1, 128, 6, 6])"
-            )
-            changed = True
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
