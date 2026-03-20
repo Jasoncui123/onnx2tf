@@ -27555,7 +27555,7 @@ def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
 
 def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
     pool_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\([A-Za-z0-9_]+, .*channel_last=False\)$"
+        r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_pool2d\([A-Za-z0-9_]+, .*channel_last=False\)$"
     )
 
     has_cf_pool = False
@@ -27658,7 +27658,7 @@ def _collect_shadowformer_fast_repair_facts(
 
 def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int, int, int, int]]:
     softmax_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>\d+), (?P<height>\d+), (?P<width>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_softmax\([A-Za-z0-9_]+,\s*axis=3,\s*beta=1\.0,\s*target_shape=\[(?P<batches>\d+)\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\]\)$"
     )
     softmax_shapes: List[Tuple[int, int, int, int]] = []
     for line in lines:
