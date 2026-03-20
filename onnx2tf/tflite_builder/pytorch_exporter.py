@@ -26637,7 +26637,7 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         r"^\s*def _forward_stage_7\(self, .+\) -> tuple\[torch\.Tensor, torch\.Tensor\]:$"
     )
     forward_call_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = self\._forward_stage_7\(.+\)$"
+        r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
     )
     gather_reshape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, _resolve_reshape_shape\(\[-1, 1\], [A-Za-z0-9_]+, allow_zero=False\)\)$"
@@ -26719,6 +26719,9 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     cast_float_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\.to\(dtype=torch\.float32\)$"
+    )
+    forward_call_re = re.compile(
+        r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
     )
     stage7_return_re = re.compile(
         r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
@@ -26850,7 +26853,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         (
             index
             for index, line in enumerate(lines)
-            if re.match(r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = self\._forward_stage_7\(.+\)$", line)
+            if forward_call_re.match(line)
         ),
         None,
     )
