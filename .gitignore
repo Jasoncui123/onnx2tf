@@ -32,3 +32,4 @@ flatbuffer_direct_bulk_report*/
 
 *.sarif
 *.data
+generic_rule_refactor.md
