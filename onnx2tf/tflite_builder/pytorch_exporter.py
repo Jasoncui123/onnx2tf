@@ -26966,6 +26966,49 @@ def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
     )
 
 
+def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
+    pad_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[4, 4, 4, 4\], mode='constant', value=0\.0\)$"
+    )
+    global_mean_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
+    )
+    scale4_mul_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.mul\([A-Za-z0-9_]+, torch\.reshape\(self\.[A-Za-z0-9_]+, \[1, 512, 1, 1\]\)\)$"
+    )
+    scale4_add_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\([A-Za-z0-9_]+, torch\.reshape\(self\.[A-Za-z0-9_]+, \[1, 512, 1, 1\]\), \[1, 512, 1, 1\]\)$"
+    )
+    pag_mul_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[1, 64, 24, 40\]\)$"
+    )
+
+    padded_inputs: Set[str] = set()
+    mean_inputs: Set[str] = set()
+    has_scale4_mul = False
+    has_scale4_add = False
+    has_pag_mul = False
+    for line in lines:
+        current_line = str(line)
+        pad_match = pad_re.match(current_line)
+        if pad_match is not None:
+            padded_inputs.add(str(pad_match.group("input")))
+            continue
+        mean_match = global_mean_re.match(current_line)
+        if mean_match is not None:
+            mean_inputs.add(str(mean_match.group("input")))
+            continue
+        if scale4_mul_re.match(current_line) is not None:
+            has_scale4_mul = True
+            continue
+        if scale4_add_re.match(current_line) is not None:
+            has_scale4_add = True
+            continue
+        if pag_mul_re.match(current_line) is not None:
+            has_pag_mul = True
+    return bool(padded_inputs & mean_inputs) and has_scale4_mul and has_scale4_add and has_pag_mul
+
+
 def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     register_buffer_count = _count_lines_matching(
         lines,
@@ -27024,13 +27067,7 @@ def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Pat
     )
     if all(marker in model_source for marker in sinet_markers):
         return True
-    pidnet_markers = (
-        "walayer2_layer20_cv2_cv_in_cf = self.conv_block_6(walayer2_layer20_cv1_cv_in)",
-        "wapag3_resize1_out_nhwc = wapag3_resize1_out_nhwc_cf",
-        "wasppsc_scale20_average_nhwc_padded_846b = F.pad(wasppscale1_scale10_average_p_in, [4, 4, 4, 4], mode='constant', value=0.0)",
-        "wasppscale4_scale40_global_a_cf_3f9a = torch.mean(wasppscale1_scale10_average_p_in, dim=[2, 3], keepdim=True)",
-    )
-    if all(marker in model_source for marker in pidnet_markers):
+    if _has_pidnet_skip_signature(model_lines):
         return True
     if _has_humanseg_skip_signature(model_lines):
         return True

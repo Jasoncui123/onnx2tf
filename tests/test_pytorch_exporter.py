@@ -1970,6 +1970,33 @@ def test_should_skip_expensive_raw_canonicalize_for_iat_llie_semantic_signature(
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_semantic_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_input, pag_lhs, pag_rhs, scale4_input):",
+                "        spp_average_padded = F.pad(spp_input, [4, 4, 4, 4], mode='constant', value=0.0)",
+                "        spp_global = torch.mean(spp_input, dim=[2, 3], keepdim=True)",
+                "        scale4_mul = torch.mul(scale4_input, torch.reshape(self.const_scale4_bn_mul, [1, 512, 1, 1]))",
+                "        scale4_add_lhs, scale4_add_rhs = _align_binary_inputs_to_anchor(scale4_input, torch.reshape(self.const_scale4_bn_add, [1, 512, 1, 1]), [1, 512, 1, 1])",
+                "        pag_out = _align_tensor_to_target_shape(torch.mul(pag_lhs, pag_rhs), [1, 64, 24, 40])",
+                "        return spp_average_padded, spp_global, scale4_mul, scale4_add_lhs, scale4_add_rhs, pag_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_l1_package(
     tmp_path,
 ) -> None:
