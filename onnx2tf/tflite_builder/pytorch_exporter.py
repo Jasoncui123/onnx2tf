@@ -26372,49 +26372,78 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
+    stage7_def_re = re.compile(
+        r"^\s*def _forward_stage_7\(self, .+\) -> tuple\[torch\.Tensor, torch\.Tensor\]:$"
+    )
+    forward_call_re = re.compile(
+        r"^\s*descriptors, scores = self\._forward_stage_7\(.+\)$"
+    )
+    gather_reshape_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, _resolve_reshape_shape\(\[-1, 1\], [A-Za-z0-9_]+, allow_zero=False\)\)$"
+    )
+    singleton_anchor_re = re.compile(
+        r"^\s*_[A-Za-z0-9_]+, _[A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\([A-Za-z0-9_]+, [A-Za-z0-9_]+, \[1, 1, 1, 1\]\)$"
+    )
+    score_tail_re = re.compile(
+        r"^\s*scores = torch\.reshape\([A-Za-z0-9_]+, .+\)$"
+    )
+
+    has_stage7_def = False
+    has_forward_call = False
+    gather_reshape_count = 0
+    singleton_anchor_count = 0
+    has_score_tail = False
+    for line in lines:
+        current_line = str(line)
+        if stage7_def_re.match(current_line) is not None:
+            has_stage7_def = True
+            continue
+        if forward_call_re.match(current_line) is not None:
+            has_forward_call = True
+            continue
+        if gather_reshape_re.match(current_line) is not None:
+            gather_reshape_count += 1
+            continue
+        if singleton_anchor_re.match(current_line) is not None:
+            singleton_anchor_count += 1
+            continue
+        if score_tail_re.match(current_line) is not None:
+            has_score_tail = True
+    return (
+        has_stage7_def
+        and has_forward_call
+        and gather_reshape_count >= 4
+        and singleton_anchor_count >= 4
+        and has_score_tail
+    )
+
+
 def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     if not model_path.exists():
         return
     model_source = model_path.read_text(encoding="utf-8")
+    lines = model_source.splitlines()
+    if not _has_alike_fast_repair_signature(lines):
+        return
+
+    rank4_eq_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.eq\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+    )
+    nhwc_to_nchw_singleton_reshape_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
+    )
+    singleton_rank4_wrapper_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<expr>torch\.(?:lt|add|sub|logical_and|mul)\(.+\)), \[1, 1, 1, 1\]\)$"
+    )
+    div_floor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.div\((?P<input>[A-Za-z0-9_]+), (?P<divisor>\d+)\.0\), \[1\]\)$"
+    )
+    cast_float_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\.to\(dtype=torch\.float32\)$"
+    )
+
     exact_replacements = {
-        "        wadkd_equal_out0 = _align_tensor_to_target_shape(torch.eq(wadkd_max_p_in, wadkd_max_p_out), [1, 192, 320, 1])":
-            "        wadkd_equal_out0 = torch.eq(wadkd_max_p_in, wadkd_max_p_out)",
-        "        wadkd_equal_out0_nchw = torch.reshape(wadkd_equal_out0.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
-            "        wadkd_equal_out0_nchw = torch.reshape(wadkd_equal_out0, [1, 1, 192, 320])",
-        "        wadkd_max_p1_out0 = torch.reshape(wadkd_max_p1_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
-            "        wadkd_max_p1_out0 = torch.reshape(wadkd_max_p1_out, [1, 1, 192, 320])",
-        "        wadkd_max_p2_out0 = torch.reshape(wadkd_max_p2_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
-            "        wadkd_max_p2_out0 = torch.reshape(wadkd_max_p2_out, [1, 1, 192, 320])",
-        "        wadkd_max_p3_out0 = torch.reshape(wadkd_max_p3_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
-            "        wadkd_max_p3_out0 = torch.reshape(wadkd_max_p3_out, [1, 1, 192, 320])",
-        "        wadkd_max_p4_out0 = torch.reshape(wadkd_max_p4_out.permute(0, 3, 1, 2).contiguous(), [1, 1, 192, 320])":
-            "        wadkd_max_p4_out0 = torch.reshape(wadkd_max_p4_out, [1, 1, 192, 320])",
-        "        wadkd_less_out0 = torch.reshape(torch.lt(wadkd_split1_out0, 0.0), [1, 1, 1, 1])":
-            "        wadkd_less_out0 = torch.lt(wadkd_split1_out0, 0.0)",
-        "        wadkd_less1_out0 = torch.reshape(torch.lt(wadkd_split1_out1, 0.0), [1, 1, 1, 1])":
-            "        wadkd_less1_out0 = torch.lt(wadkd_split1_out1, 0.0)",
-        "        wadkd_less2_out0 = torch.reshape(torch.lt(wadkd_split1_out0, 319.0), [1, 1, 1, 1])":
-            "        wadkd_less2_out0 = torch.lt(wadkd_split1_out0, 319.0)",
-        "        wadkd_less3_out0 = torch.reshape(torch.lt(wadkd_split1_out1, 191.0), [1, 1, 1, 1])":
-            "        wadkd_less3_out0 = torch.lt(wadkd_split1_out1, 191.0)",
-        "        wadkd_add_out0 = torch.reshape(torch.add(wadkd_floor_out0, 1.0), [1, 1, 1, 1])":
-            "        wadkd_add_out0 = torch.add(wadkd_floor_out0, 1.0)",
-        "        wadkd_sub4_out0 = torch.reshape(torch.sub(wadkd_split1_out0, wadkd_floor_out0), [1, 1, 1, 1])":
-            "        wadkd_sub4_out0 = torch.sub(wadkd_split1_out0, wadkd_floor_out0)",
-        "        wadkd_add1_out0 = torch.reshape(torch.add(wadkd_floor1_out0, 1.0), [1, 1, 1, 1])":
-            "        wadkd_add1_out0 = torch.add(wadkd_floor1_out0, 1.0)",
-        "        wadkd_sub3_out0 = torch.reshape(torch.sub(wadkd_split1_out1, wadkd_floor1_out0), [1, 1, 1, 1])":
-            "        wadkd_sub3_out0 = torch.sub(wadkd_split1_out1, wadkd_floor1_out0)",
-        "        wadkd_and2_out0 = torch.reshape(torch.logical_and(wadkd_not2_out0, wadkd_not3_out0), [1, 1, 1, 1])":
-            "        wadkd_and2_out0 = torch.logical_and(wadkd_not2_out0, wadkd_not3_out0)",
-        "        wadkd_and3_out0 = torch.reshape(torch.logical_and(wadkd_and2_out0, wadkd_less2_out0), [1, 1, 1, 1])":
-            "        wadkd_and3_out0 = torch.logical_and(wadkd_and2_out0, wadkd_less2_out0)",
-        "        wadkd_and4_out0 = torch.reshape(torch.logical_and(wadkd_and3_out0, wadkd_less3_out0), [1, 1, 1, 1])":
-            "        wadkd_and4_out0 = torch.logical_and(wadkd_and3_out0, wadkd_less3_out0)",
-        "        wadkd_mul21_out0 = torch.reshape(torch.mul(wadkd_floor_out0, wadkd_cast5_out0), [1, 1, 1, 1])":
-            "        wadkd_mul21_out0 = torch.mul(wadkd_floor_out0, wadkd_cast5_out0)",
-        "        wadkd_mul22_out0 = torch.reshape(torch.mul(wadkd_floor1_out0, wadkd_cast5_out0), [1, 1, 1, 1])":
-            "        wadkd_mul22_out0 = torch.mul(wadkd_floor1_out0, wadkd_cast5_out0)",
         "        wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.float32)":
             "        wadkd_div_out0_div_lhs_cast = wadkd_gather_out0.to(dtype=torch.int64)",
         "        wadkd_div_out0_div_out = _align_tensor_to_target_shape(torch.div(wadkd_div_out0_div_lhs_cast, 320.0), [1])":
@@ -26439,16 +26468,50 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             changed = True
 
     lines = model_source.splitlines()
-    required_markers = (
-        "def _forward_stage_7(self, wadkd_mul29_out0: torch.Tensor",
-        "wadkd_rs13_out0 = torch.reshape(wadkd_gather7_out0, _resolve_reshape_shape([-1, 1], wadkd_gather7_out0, allow_zero=False))",
-        "_binary_lhs_266, _binary_rhs_266 = _align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])",
-        "descriptors, scores = self._forward_stage_7(",
-    )
-    if not all(marker in model_source for marker in required_markers):
-        if changed:
-            model_path.write_text(model_source + ("\n" if not model_source.endswith("\n") else ""), encoding="utf-8")
-        return
+    for index, line in enumerate(lines):
+        current_line = str(line)
+        rank4_eq_align_match = rank4_eq_align_re.match(current_line)
+        if rank4_eq_align_match is not None:
+            lines[index] = (
+                f"{rank4_eq_align_match.group('indent')}{rank4_eq_align_match.group('lhs')} = "
+                f"torch.eq({rank4_eq_align_match.group('a')}, {rank4_eq_align_match.group('b')})"
+            )
+            changed = True
+            continue
+        nhwc_to_nchw_match = nhwc_to_nchw_singleton_reshape_re.match(current_line)
+        if nhwc_to_nchw_match is not None:
+            lines[index] = (
+                f"{nhwc_to_nchw_match.group('indent')}{nhwc_to_nchw_match.group('lhs')} = "
+                f"torch.reshape({nhwc_to_nchw_match.group('input')}, "
+                f"[{nhwc_to_nchw_match.group('n')}, 1, {nhwc_to_nchw_match.group('h')}, {nhwc_to_nchw_match.group('w')}])"
+            )
+            changed = True
+            continue
+        singleton_wrapper_match = singleton_rank4_wrapper_re.match(current_line)
+        if singleton_wrapper_match is not None:
+            lines[index] = (
+                f"{singleton_wrapper_match.group('indent')}{singleton_wrapper_match.group('lhs')} = "
+                f"{singleton_wrapper_match.group('expr')}"
+            )
+            changed = True
+            continue
+        cast_float_match = cast_float_re.match(current_line)
+        if cast_float_match is not None and str(cast_float_match.group("lhs")) == "wadkd_div_out0_div_lhs_cast":
+            lines[index] = (
+                f"{cast_float_match.group('indent')}{cast_float_match.group('lhs')} = "
+                f"{cast_float_match.group('input')}.to(dtype=torch.int64)"
+            )
+            changed = True
+            continue
+        div_floor_match = div_floor_re.match(current_line)
+        if div_floor_match is not None and str(div_floor_match.group("lhs")) == "wadkd_div_out0_div_out":
+            lines[index] = (
+                f"{div_floor_match.group('indent')}{div_floor_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.div({div_floor_match.group('input')}, "
+                f"{div_floor_match.group('divisor')}, rounding_mode='floor'), [1])"
+            )
+            changed = True
+            continue
 
     stage7_def_index = next(
         (index for index, line in enumerate(lines) if line.startswith("    def _forward_stage_7(")),
