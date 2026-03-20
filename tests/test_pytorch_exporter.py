@@ -5142,6 +5142,45 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_gene
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_without_source_set_gate(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale4_no_source_gate_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        spp_global_cf = torch.mean(generic_stage_input, dim=[1, 2], keepdim=True)",
+                "        spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, self.const_demo_scale4_mul_any), [1, 256, 1, 1])",
+                "        _binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, self.const_demo_scale4_add_any, [1, 1, 1, 256])",
+                "        return _binary_lhs_11",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "spp_global_cf = torch.mean(generic_stage_input, dim=[2, 3], keepdim=True)" in rewritten
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_mul_any, [1, 256, 1, 1])), [1, 256, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
+        "torch.reshape(self.const_demo_scale4_add_any, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_pad_pool_anchor_with_generic_names(
     tmp_path,
 ) -> None:

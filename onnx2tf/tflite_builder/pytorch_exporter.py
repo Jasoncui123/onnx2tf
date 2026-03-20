@@ -26093,6 +26093,15 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 and str(scale3_anchor_match.group("input")) in tracked_names
             ):
                 return True
+            bn_mul_match = pidnet_bn_mul_re.match(future_line)
+            if bn_mul_match is not None and str(bn_mul_match.group("input")) in tracked_names:
+                return True
+            bn_add_anchor_match = pidnet_bn_add_anchor_re.match(future_line)
+            if (
+                bn_add_anchor_match is not None
+                and str(bn_add_anchor_match.group("input")) in tracked_names
+            ):
+                return True
             mul_align_match = pidnet_mul_align_re.match(future_line)
             if mul_align_match is not None and (
                 str(mul_align_match.group("a")) in tracked_names
@@ -26362,7 +26371,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                     current_shape,
                     preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
                 )
-            if input_name in pidnet_cf_pool_sources:
+            if _pidnet_is_cf_like_name(input_name):
                 lines[index] = (
                     f"{pidnet_scale3_anchor_match.group('indent')}{pidnet_scale3_anchor_match.group('lhs0')}, "
                     f"{pidnet_scale3_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
@@ -26374,19 +26383,20 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         pidnet_cf_mean_match = pidnet_cf_mean_re.match(line)
         if pidnet_cf_mean_match is not None:
             input_name = str(pidnet_cf_mean_match.group("input"))
+            lhs_name = str(pidnet_cf_mean_match.group("lhs"))
             if (
-                input_name in pidnet_cf_add_sources
-                or _pidnet_is_cf_like_name(input_name)
+                _pidnet_is_cf_like_name(input_name)
+                or _pidnet_has_cf_layout_consumer(lhs_name, start_index=index)
             ) and (
                 str(pidnet_cf_mean_match.group("axis0")),
                 str(pidnet_cf_mean_match.group("axis1")),
             ) == ("1", "2"):
                 lines[index] = (
-                    f"{pidnet_cf_mean_match.group('indent')}{pidnet_cf_mean_match.group('lhs')} = "
+                    f"{pidnet_cf_mean_match.group('indent')}{lhs_name} = "
                     f"torch.mean({input_name}, dim=[2, 3], keepdim=True)"
                 )
                 changed = True
-                pidnet_cf_mean_sources.add(str(pidnet_cf_mean_match.group("lhs")))
+                pidnet_cf_mean_sources.add(lhs_name)
                 continue
         pidnet_bn_mul_match = pidnet_bn_mul_re.match(line)
         if pidnet_bn_mul_match is not None:
@@ -26424,7 +26434,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 current_shape,
                 preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
             )
-            if input_name in pidnet_cf_mul_sources or input_name in pidnet_cf_mean_sources:
+            if _pidnet_is_cf_like_name(input_name):
                 lines[index] = (
                     f"{pidnet_bn_add_anchor_match.group('indent')}{pidnet_bn_add_anchor_match.group('lhs0')}, "
                     f"{pidnet_bn_add_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
@@ -26441,7 +26451,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         permute_conv_match = pidnet_permute_conv_re.match(line)
         if (
             permute_conv_match is not None
-            and str(permute_conv_match.group("input")) in pidnet_cf_add_sources
+            and _pidnet_is_cf_like_name(str(permute_conv_match.group("input")))
         ):
             lines[index] = (
                 f"{permute_conv_match.group('indent')}{permute_conv_match.group('lhs')} = "
