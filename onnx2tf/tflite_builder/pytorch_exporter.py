@@ -27001,13 +27001,17 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         return
     model_source = model_path.read_text(encoding="utf-8")
     model_lines = model_source.splitlines()
-    registered_shapes, registered_buffers, _, aligned_shapes = _collect_shadowformer_fast_repair_facts(model_lines)
+    registered_shapes, registered_buffers, copied_shapes, aligned_shapes = _collect_shadowformer_fast_repair_facts(model_lines)
     if not _has_shadowformer_fast_repair_signature(model_lines):
         return
 
     changed = False
     lines = model_lines
-    known_shadowformer_shapes = registered_shapes.intersection(aligned_shapes)
+    known_shadowformer_shapes = _collect_shadowformer_supported_shapes(
+        registered_shapes,
+        copied_shapes,
+        aligned_shapes,
+    )
     register_buffer_re = re.compile(
         r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<height>\d+), (?P<heads>\d+), (?P<width>\d+)\], dtype=torch\.float32\), persistent=False\)"
     )
@@ -27484,8 +27488,7 @@ def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
 
 def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     registered_shapes, _, copied_shapes, aligned_shapes = _collect_shadowformer_fast_repair_facts(lines)
-    shared_shapes = registered_shapes.intersection(copied_shapes).intersection(aligned_shapes)
-    return len(shared_shapes) >= 1
+    return len(_collect_shadowformer_supported_shapes(registered_shapes, copied_shapes, aligned_shapes)) >= 1
 
 
 def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
@@ -27576,6 +27579,23 @@ def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int
             )
         )
     return softmax_shapes
+
+
+def _collect_shadowformer_supported_shapes(
+    registered_shapes: Set[Tuple[int, int, int]],
+    copied_shapes: Set[Tuple[int, int, int]],
+    aligned_shapes: Set[Tuple[int, int, int]],
+) -> Set[Tuple[int, int, int]]:
+    supported_shapes: Set[Tuple[int, int, int]] = set()
+    for known_shape in registered_shapes.union(copied_shapes).union(aligned_shapes):
+        evidence_count = sum(
+            1
+            for shape_set in (registered_shapes, copied_shapes, aligned_shapes)
+            if known_shape in shape_set
+        )
+        if evidence_count >= 2:
+            supported_shapes.add(known_shape)
+    return supported_shapes
 
 
 def _infer_shadowformer_shape_from_dims(
