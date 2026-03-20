@@ -26662,7 +26662,7 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
 
 def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     stage7_def_re = re.compile(
-        r"^\s*def _forward_stage_7\(self, .+\) -> tuple\[torch\.Tensor, torch\.Tensor\]:$"
+        r"^\s*def _forward_stage_7\(self, .+\)(?: -> (?:tuple|Tuple)\[torch\.Tensor, torch\.Tensor\])?:$"
     )
     forward_unpack_re = re.compile(
         r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
@@ -26954,12 +26954,20 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         return
 
     if "scores_map: torch.Tensor" not in lines[stage7_def_index]:
-        lines[stage7_def_index] = re.sub(
-            r"\)\s*->",
-            ", scores_map: torch.Tensor) ->",
-            lines[stage7_def_index],
-            count=1,
-        )
+        if "->" in lines[stage7_def_index]:
+            lines[stage7_def_index] = re.sub(
+                r"\)\s*->",
+                ", scores_map: torch.Tensor) ->",
+                lines[stage7_def_index],
+                count=1,
+            )
+        else:
+            lines[stage7_def_index] = re.sub(
+                r"\)\s*:$",
+                ", scores_map: torch.Tensor):",
+                lines[stage7_def_index],
+                count=1,
+            )
         changed = True
     if "scores_map)" not in lines[forward_call_index]:
         lines[forward_call_index] = re.sub(
