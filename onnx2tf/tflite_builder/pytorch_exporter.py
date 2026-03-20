@@ -24162,11 +24162,11 @@ def _canonicalize_generated_model_source_for_raw_export(
         changed = True
     pidnet_forced_scale4_mul_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
-        r"self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul)\), \[1, 1, (?P<c>\d+), 1\]\)$"
+        r"self\.(?P<const_attr>[A-Za-z0-9_]+)\), \[1, 1, (?P<c>\d+), 1\]\)$"
     )
     pidnet_forced_scale4_add_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_add), \[1, 1, 1, (?P<c>\d+)\]\)$"
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     for index, line in enumerate(lines):
         pidnet_forced_scale4_mul_match = pidnet_forced_scale4_mul_re.match(line)
