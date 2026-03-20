@@ -1360,6 +1360,56 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
     assert "div3 = torch.div(_lhs_196, _rhs_196)" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_generic_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alike_full_generic_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_7(self, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, add_c: torch.Tensor, add_d: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, tr_c: torch.Tensor, tr_d: torch.Tensor, score_cast: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        descriptors = _torch_permute(score_div, [1, 0])",
+                "        shape_a = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)",
+                "        shape_b = _shape_tensor(add_b, dtype=torch.int32, device=add_b.device)",
+                "        shape_c = _shape_tensor(add_c, dtype=torch.int32, device=add_c.device)",
+                "        shape_d = _shape_tensor(add_d, dtype=torch.int32, device=add_d.device)",
+                "        rs_a = torch.reshape(gather_a, _resolve_reshape_shape([-1, 1], gather_a, allow_zero=False))",
+                "        rs_b = torch.reshape(gather_b, _resolve_reshape_shape([-1, 1], gather_b, allow_zero=False))",
+                "        rs_c = torch.reshape(gather_c, _resolve_reshape_shape([-1, 1], gather_c, allow_zero=False))",
+                "        rs_d = torch.reshape(gather_d, _resolve_reshape_shape([-1, 1], gather_d, allow_zero=False))",
+                "        pair0_lhs, pair0_rhs = _align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])",
+                "        pair1_lhs, pair1_rhs = _align_binary_inputs_to_anchor(score_rs1, tr_b, [1, 1, 1, 1])",
+                "        pair2_lhs, pair2_rhs = _align_binary_inputs_to_anchor(score_rs2, tr_c, [1, 1, 1, 1])",
+                "        pair3_lhs, pair3_rhs = _align_binary_inputs_to_anchor(score_rs3, tr_d, [1, 1, 1, 1])",
+                "        scores = torch.reshape(score_tail, (([1]) + ([1])))",
+                "        return descriptors, scores",
+                "    def forward(self, scores_map: torch.Tensor, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, add_c: torch.Tensor, add_d: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, tr_c: torch.Tensor, tr_d: torch.Tensor, score_cast: torch.Tensor):",
+                "        descriptors, scores = self._forward_stage_7(x0, add_a, add_b, add_c, add_d, score_div, tr_a, tr_b, tr_c, tr_d, score_cast)",
+                "        return descriptors, scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_alike_fast_precanonicalize_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
+    assert "score_cast, scores_map)" in rewritten
+    assert "wadkd_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
+    assert "wadkd_shape13_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
+    assert "wadkd_gather7_out0_wrapped_runtime = _align_tensor_to_target_shape(torch.add(add_a, _tensor_shape_list(wadkd_flatten_out0)[0]), _tensor_shape_list(add_a))" in rewritten
+    assert "wadkd_mul30_out0 = torch.mul(wadkd_rs14_out0, tr_a)" in rewritten
+    assert "wadkd_mul44_out0 = torch.mul(wadkd_tr14_out0, score_cast)" in rewritten
+    assert "_align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])" not in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_efficientformer_attention_scalar_mul_target(
     tmp_path,
 ) -> None:
