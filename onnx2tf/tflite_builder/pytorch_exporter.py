@@ -27083,10 +27083,10 @@ _SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN = (
     r")"
 )
 _SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
-    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\(\))?\)$"
+    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?\)$"
 )
 _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
-    rf"^.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\(\))?$"
+    rf"^.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?$"
 )
 _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
     r"^\s*self\.register_buffer\((?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote),\s*"
