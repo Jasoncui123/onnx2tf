@@ -441,6 +441,38 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_bn_mul_to_ch
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_direct_mul_with_generic_channels(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_direct_mul_generic_channels_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 256, 1, 1])",
+                "        spp_bn_mul_out = torch.mul(spp_global_cf, self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul)",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 256, 1, 1]))"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_removes_permute_for_singleton_rank4_matmul_conv_input(
     tmp_path,
 ) -> None:
