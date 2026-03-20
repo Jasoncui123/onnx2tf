@@ -27657,12 +27657,18 @@ def _collect_shadowformer_fast_repair_facts(
 
 
 def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int, int, int, int]]:
-    softmax_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_softmax\([A-Za-z0-9_]+,\s*axis=3,\s*beta=1\.0,\s*target_shape=\[(?P<batches>\d+)\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\]\)$"
+    axis_re = re.compile(r"(?:^|[,(])\s*axis\s*=\s*3(?:$|[,)])")
+    target_shape_re = re.compile(
+        r"target_shape=\[\s*(?P<batches>\d+)\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\s*\]"
     )
     softmax_shapes: List[Tuple[int, int, int, int]] = []
     for line in lines:
-        softmax_match = softmax_re.match(str(line))
+        current_line = str(line)
+        if "_apply_softmax(" not in current_line:
+            continue
+        if axis_re.search(current_line) is None:
+            continue
+        softmax_match = target_shape_re.search(current_line)
         if softmax_match is None:
             continue
         softmax_shapes.append(
