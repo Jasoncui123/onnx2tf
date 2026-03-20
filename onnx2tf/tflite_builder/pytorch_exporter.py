@@ -27074,6 +27074,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
 _SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN = (
     r"(?:"
     r"\*\(\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\)"
+    r"|\*\[\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\]"
     r"|0\s*,\s*2\s*,\s*1\s*,\s*3"
     r"|\(\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\)"
     r"|\[\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\]"
