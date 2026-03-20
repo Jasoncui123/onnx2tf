@@ -27082,11 +27082,17 @@ _SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN = (
     r"|dims\s*=\s*\[\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\]"
     r")"
 )
+_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN = (
+    r"(?:"
+    r"\(\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\)"
+    r"|\[\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\]"
+    r")"
+)
 _SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
-    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
+    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?:(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?P<src_fn>.+?),\s*{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
 )
 _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
-    rf"^.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?$"
+    rf"^(?:.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\(.+?,\s*{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?$"
 )
 _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
     r"^\s*self\.register_buffer\((?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote),\s*"
@@ -27176,7 +27182,8 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         if copy_match is not None:
             if copy_match.group("buffer") not in supported_buffers:
                 continue
-            rewritten = f"{copy_match.group('indent')}{copy_match.group('src')}{copy_match.group('copy_kwargs')})"
+            src_expr = str(copy_match.group("src") or copy_match.group("src_fn"))
+            rewritten = f"{copy_match.group('indent')}{src_expr}{copy_match.group('copy_kwargs')})"
             if rewritten != current_line:
                 lines[index] = rewritten
                 changed = True
