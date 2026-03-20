@@ -27026,7 +27026,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         if buffer_shape in known_shadowformer_shapes
     }
     register_buffer_re = re.compile(
-        r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<height>\d+), (?P<heads>\d+), (?P<width>\d+)\], dtype=torch\.float32\), persistent=False\)"
+        r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\], dtype=torch\.float32\), persistent=False\)"
     )
     copy_permute_re = re.compile(
         r"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
@@ -27043,16 +27043,20 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         current_line = str(line)
         register_match = register_buffer_re.search(current_line)
         if register_match is not None:
-            shape = (
-                int(register_match.group("heads")),
-                int(register_match.group("height")),
-                int(register_match.group("width")),
+            dims = (
+                int(register_match.group("d1")),
+                int(register_match.group("d2")),
+                int(register_match.group("d3")),
             )
+            if dims in known_shadowformer_shapes:
+                shape = dims
+            else:
+                shape = (dims[1], dims[0], dims[2])
             if shape not in known_shadowformer_shapes:
                 continue
             rewritten = (
                 f"        self.register_buffer('{register_match.group('buffer')}', "
-                f"torch.zeros([1, {register_match.group('heads')}, {register_match.group('height')}, {register_match.group('width')}], dtype=torch.float32), persistent=False)"
+                f"torch.zeros([1, {shape[0]}, {shape[1]}, {shape[2]}], dtype=torch.float32), persistent=False)"
             )
             if rewritten != current_line:
                 lines[index] = rewritten
@@ -27539,10 +27543,10 @@ def _collect_shadowformer_fast_repair_facts(
     Set[Tuple[int, int, int]],
 ]:
     register_buffer_re = re.compile(
-        r"^\s*self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<height>\d+), (?P<heads>\d+), (?P<width>\d+)\], dtype=torch\.float32\), persistent=False\)$"
+        r"^\s*self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\], dtype=torch\.float32\), persistent=False\)$"
     )
-    copy_permute_re = re.compile(
-        r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\(.+\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
+    copy_re = re.compile(
+        r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+)\)$"
     )
     binary_shape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\((?P<lhs>[A-Za-z0-9_\.]+), (?P<rhs>[A-Za-z0-9_\.]+), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
@@ -27551,28 +27555,47 @@ def _collect_shadowformer_fast_repair_facts(
         r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
 
+    raw_buffer_dims: Dict[str, Tuple[int, int, int]] = {}
+    plain_copy_buffers: Set[str] = set()
+    permuted_copy_buffers: Set[str] = set()
+
+    for line in lines:
+        current_line = str(line)
+        register_match = register_buffer_re.match(current_line)
+        if register_match is not None:
+            raw_buffer_dims[register_match.group("buffer")] = (
+                int(register_match.group("d1")),
+                int(register_match.group("d2")),
+                int(register_match.group("d3")),
+            )
+            continue
+        copy_match = copy_re.match(current_line)
+        if copy_match is not None and copy_match.group("buffer") in raw_buffer_dims:
+            src_expr = str(copy_match.group("src"))
+            if ".permute(*(0, 2, 1, 3)).contiguous()" in src_expr:
+                permuted_copy_buffers.add(copy_match.group("buffer"))
+            else:
+                plain_copy_buffers.add(copy_match.group("buffer"))
+            continue
+
     registered_shapes: Set[Tuple[int, int, int]] = set()
     buffer_shapes: Dict[str, Tuple[int, int, int]] = {}
     copied_shapes: Set[Tuple[int, int, int]] = set()
     aligned_shapes: Set[Tuple[int, int, int]] = set()
     buffer_aligned_shapes: Set[Tuple[int, int, int]] = set()
 
+    for buffer_name, dims in raw_buffer_dims.items():
+        if buffer_name in plain_copy_buffers and buffer_name not in permuted_copy_buffers:
+            shape = dims
+        else:
+            shape = (dims[1], dims[0], dims[2])
+        registered_shapes.add(shape)
+        buffer_shapes[buffer_name] = shape
+        if buffer_name in plain_copy_buffers or buffer_name in permuted_copy_buffers:
+            copied_shapes.add(shape)
+
     for line in lines:
         current_line = str(line)
-        register_match = register_buffer_re.match(current_line)
-        if register_match is not None:
-            shape = (
-                int(register_match.group("heads")),
-                int(register_match.group("height")),
-                int(register_match.group("width")),
-            )
-            registered_shapes.add(shape)
-            buffer_shapes[register_match.group("buffer")] = shape
-            continue
-        copy_match = copy_permute_re.match(current_line)
-        if copy_match is not None and copy_match.group("buffer") in buffer_shapes:
-            copied_shapes.add(buffer_shapes[copy_match.group("buffer")])
-            continue
         binary_match = binary_shape_re.match(current_line)
         if binary_match is not None:
             dims = [int(binary_match.group("d1")), int(binary_match.group("d2")), int(binary_match.group("d3"))]
