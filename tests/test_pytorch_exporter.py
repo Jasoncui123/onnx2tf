@@ -45,6 +45,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     ModelIRPyTorchExportError,
     NativePyTorchGenerationTimeoutError,
     _apply_fast_precanonicalize_repairs,
+    _apply_fast_precanonicalize_repairs_until_stable,
     _build_metadata_payload,
     _build_tensor_var_name_map,
     _build_torchscript_example_inputs,
@@ -1254,6 +1255,281 @@ def test_apply_fast_precanonicalize_repairs_propagates_cf_aliases_to_softmax_and
     assert "out_public_layout_bridge = torch.cat([box_out_cf, obj_out_cf, cls_scores], dim=1)" in rewritten
 
 
+@pytest.mark.parametrize(("height", "width"), [(180, 320), (96, 160)])
+def test_apply_fast_precanonicalize_repairs_repairs_split_axis_from_cf_consumers(
+    tmp_path,
+    height: int,
+    width: int,
+) -> None:
+    package_dir = tmp_path / f"fast_precanon_split_cf_{height}x{width}_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=1,",
+                "            out_channels=8,",
+                "        )",
+                "        self.conv_block_1 = _Conv2dBlock(",
+                "            in_channels=1,",
+                "            out_channels=8,",
+                "        )",
+                "        self.conv_block_2 = _Conv2dBlock(",
+                "            in_channels=1,",
+                "            out_channels=8,",
+                "        )",
+                "",
+                "    def forward(self, in_public_layout_bridge: torch.Tensor) -> torch.Tensor:",
+                "        split0, split1, split2 = list(torch.tensor_split(in_public_layout_bridge, 3, dim=_normalize_dim(3, in_public_layout_bridge.ndim)))",
+                "        cv0 = self.conv_block_0(split0)",
+                "        cv1 = self.conv_block_1(split1)",
+                "        cv2 = self.conv_block_2(split2)",
+                "        out = _align_tensor_to_target_shape(torch.add(cv0, cv1), [1, 8, "
+                f"{height}, {width}])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "torch.tensor_split(in_public_layout_bridge, 3, dim=_normalize_dim(1, in_public_layout_bridge.ndim))" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_split_axis_for_nhwc_consumers(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_split_nhwc_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, logits_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        score0, score1, score2 = list(torch.tensor_split(logits_nhwc, 3, dim=_normalize_dim(3, logits_nhwc.ndim)))",
+                "        out = _apply_concat([score0, score1, score2], axis=3, target_shape=[1, 22, 22, 3], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "score0, score1, score2 = list(torch.tensor_split(logits_nhwc, 3, dim=_normalize_dim(3, logits_nhwc.ndim)))" in rewritten
+
+
+@pytest.mark.parametrize(("height", "width", "channels"), [(80, 80, 2), (48, 64, 5)])
+def test_apply_fast_precanonicalize_repairs_normalizes_cf_resize_target_shape_by_topology(
+    tmp_path,
+    height: int,
+    width: int,
+    channels: int,
+) -> None:
+    package_dir = tmp_path / f"fast_precanon_resize_topology_{height}x{width}_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_bn_mul', torch.zeros([1, 1, 1, "
+                f"{channels}], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, features_cf: torch.Tensor) -> torch.Tensor:",
+                f"        resize_out = _apply_resize(features_cf, [{height}, {width}], method='bilinear', target_shape=[1, {height}, {channels}, {width}], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                f"        bn_out = _align_tensor_to_target_shape(torch.mul(resize_out, self.const_bn_mul), [1, {channels}, {height}, {width}])",
+                "        return bn_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        f"resize_out = _apply_resize(features_cf, [{height}, {width}], method='bilinear', "
+        f"target_shape=[1, {channels}, {height}, {width}], align_corners=False, "
+        f"half_pixel_centers=True, channel_last=False)"
+    ) in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_already_correct_cf_resize_target_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_resize_keeps_correct_cf_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    original = "\n".join(
+        [
+            "import torch",
+            "",
+            "class Model(torch.nn.Module):",
+            "    def __init__(self):",
+            "        super().__init__()",
+            "        self.conv_block_0 = _Conv2dBlock(",
+            "            in_channels=32,",
+            "            out_channels=16,",
+            "        )",
+            "",
+            "    def forward(self, features_cf: torch.Tensor, residual_cf: torch.Tensor) -> torch.Tensor:",
+            "        resize_out = _apply_resize(features_cf, [48, 64], method='bilinear', target_shape=[1, 32, 48, 64], align_corners=False, half_pixel_centers=True, channel_last=False)",
+            "        merged = _align_tensor_to_target_shape(torch.add(resize_out, residual_cf), [1, 32, 48, 64])",
+            "        out = self.conv_block_0(merged)",
+            "        return out",
+            "",
+        ]
+    )
+    model_path.write_text(original, encoding="utf-8")
+
+    _apply_fast_precanonicalize_repairs_until_stable(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert rewritten == original
+
+
+def test_apply_fast_precanonicalize_repairs_repairs_cf_pool_and_binary_alignment_from_consumers(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_pool_binary_topology_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=24,",
+                "            out_channels=32,",
+                "        )",
+                "",
+                "    def forward(self, features_cf: torch.Tensor, residual_cf: torch.Tensor) -> torch.Tensor:",
+                "        features_cf_padded = F.pad(features_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        pooled = _apply_pool2d(features_cf_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
+                "        merged = _align_tensor_to_target_shape(torch.add(pooled, residual_cf), [1, 104, 104, 24])",
+                "        out = self.conv_block_0(merged)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "pooled = _apply_pool2d(features_cf_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)" in rewritten
+    assert "merged = _align_tensor_to_target_shape(torch.add(pooled, residual_cf), [1, 24, 104, 104])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_recovers_conv_block_channel_counts_for_cf_pools(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_pool_conv_channels_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=32,",
+                "            out_channels=64,",
+                "            kernel_size=(3, 3),",
+                "        )",
+                "        self.conv_block_1 = _Conv2dBlock(",
+                "            in_channels=64,",
+                "            out_channels=128,",
+                "            kernel_size=(3, 3),",
+                "        )",
+                "",
+                "    def forward(self, stage0_cf: torch.Tensor) -> torch.Tensor:",
+                "        stage1_cf = self.conv_block_0(stage0_cf)",
+                "        pooled = _apply_pool2d(stage1_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 22, 40, 64], is_max_pool=True, channel_last=False)",
+                "        out = self.conv_block_1(pooled)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "pooled = _apply_pool2d(stage1_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 64, 22, 40], is_max_pool=True, channel_last=False)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_prefers_downstream_conv_channels_over_producer_channels_for_cf_pools(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_pool_prefers_downstream_channels_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=8,",
+                "            out_channels=16,",
+                "            kernel_size=(3, 3),",
+                "        )",
+                "        self.conv_block_1 = _Conv2dBlock(",
+                "            in_channels=32,",
+                "            out_channels=64,",
+                "            kernel_size=(3, 3),",
+                "        )",
+                "",
+                "    def forward(self, stage0_cf: torch.Tensor) -> torch.Tensor:",
+                "        stage1_cf = self.conv_block_0(stage0_cf)",
+                "        pooled = _apply_pool2d(stage1_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 22, 32, 40], is_max_pool=True, channel_last=False)",
+                "        out = self.conv_block_1(pooled)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "pooled = _apply_pool2d(stage1_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 32, 22, 40], is_max_pool=True, channel_last=False)" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_pool_lrn_conv_cf_chain(
     tmp_path,
 ) -> None:
@@ -1423,6 +1699,121 @@ def test_apply_fast_precanonicalize_repairs_does_not_inject_humanseg_resize_alia
     assert "foo, tmp34_nhwc_bridge_cf" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_bridge_with_generic_alias_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_generic_alias_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, relu51_tmp0, bridge0_in, bridge1_in, bridge2_in):",
+                "        branch0_resize = _apply_resize(bridge0_in, [48, 48], method='bilinear', target_shape=[1, 48, 48, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        branch1_resize = _apply_resize(bridge1_in, [48, 48], method='bilinear', target_shape=[1, 48, 48, 64], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        branch2_resize = _apply_resize(bridge2_in, [48, 48], method='bilinear', target_shape=[1, 48, 48, 128], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        merge_tensor = _apply_concat([relu51_tmp0, branch0_resize, branch1_resize, branch2_resize], axis=3, target_shape=[1, 48, 48, 240], fused='NONE')",
+                "        conv71_out = self.conv_block_71(merge_tensor)",
+                "        return conv71_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "branch0_resize = _apply_resize(bridge0_in, [48, 48], method='bilinear', target_shape=[1, 32, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "branch1_resize = _apply_resize(bridge1_in, [48, 48], method='bilinear', target_shape=[1, 64, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "branch2_resize = _apply_resize(bridge2_in, [48, 48], method='bilinear', target_shape=[1, 128, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "merge_tensor = torch.cat([relu51_tmp0, branch0_resize, branch1_resize, branch2_resize], dim=1)" in rewritten
+    assert "conv71_out = self.conv_block_71(merge_tensor)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_bridge_with_generic_shapes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_generic_shape_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, relu51_tmp0, branch0_in, branch1_in, branch2_in):",
+                "        low_resize = _apply_resize(branch0_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 16], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        mid_resize = _apply_resize(branch1_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        high_resize = _apply_resize(branch2_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 64], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        merge_tensor = _apply_concat([relu51_tmp0, low_resize, mid_resize, high_resize], axis=3, target_shape=[1, 32, 64, 144], fused='NONE')",
+                "        conv71_out = self.conv_block_71(merge_tensor)",
+                "        return conv71_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "low_resize = _apply_resize(branch0_in, [32, 64], method='bilinear', target_shape=[1, 16, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "mid_resize = _apply_resize(branch1_in, [32, 64], method='bilinear', target_shape=[1, 32, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "high_resize = _apply_resize(branch2_in, [32, 64], method='bilinear', target_shape=[1, 64, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "merge_tensor = torch.cat([relu51_tmp0, low_resize, mid_resize, high_resize], dim=1)" in rewritten
+    assert "conv71_out = self.conv_block_71(merge_tensor)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_prelude_with_generic_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_generic_prelude_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, relu51_tmp0, bridge_cf, skip_nhwc, low_cf, mid_cf, branch0_in, branch1_in, branch2_in):",
+                "        left_pair, right_pair = _align_binary_inputs_to_anchor(low_cf, skip_nhwc, [1, 16, 16, 8])",
+                "        low_merge = _align_tensor_to_target_shape(torch.add(right_pair, left_pair), [1, 16, 16, 8])",
+                "        low_up = _apply_resize(low_merge, [32, 64], method='bilinear', target_shape=[1, 32, 64, 8], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        mid_merge = _align_tensor_to_target_shape(torch.add(mid_cf, bridge_cf), [1, 8, 8, 16])",
+                "        mid_up = _apply_resize(mid_merge, [32, 64], method='bilinear', target_shape=[1, 32, 64, 16], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        high_merge = _align_tensor_to_target_shape(torch.add(mid_up, bridge_cf), [1, 4, 4, 32])",
+                "        high_up = _apply_resize(high_merge, [32, 64], method='bilinear', target_shape=[1, 32, 64, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        merge_tensor = _apply_concat([relu51_tmp0, low_up, mid_up, high_up], axis=3, target_shape=[1, 32, 64, 88], fused='NONE')",
+                "        conv71_out = self.conv_block_71(_torch_permute(merge_tensor, [0, 3, 1, 2]))",
+                "        branch0_resize = _apply_resize(branch0_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 8], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        branch1_resize = _apply_resize(branch1_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 16], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        branch2_resize = _apply_resize(branch2_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        tail_merge = _apply_concat([relu51_tmp0, branch0_resize, branch1_resize, branch2_resize], axis=3, target_shape=[1, 32, 64, 88], fused='NONE')",
+                "        conv72_out = self.conv_block_71(tail_merge)",
+                "        return conv72_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "left_pair, right_pair = _align_binary_inputs_to_anchor(low_cf, skip_nhwc, [1, 8, 16, 16])" in rewritten
+    assert "low_merge = _align_tensor_to_target_shape(torch.add(right_pair, left_pair), [1, 8, 16, 16])" in rewritten
+    assert "low_up = _apply_resize(low_merge, [32, 64], method='bilinear', target_shape=[1, 8, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "mid_merge = _align_tensor_to_target_shape(torch.add(mid_cf, bridge_cf), [1, 16, 8, 8])" in rewritten
+    assert "mid_up = _apply_resize(mid_merge, [32, 64], method='bilinear', target_shape=[1, 16, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "high_merge = _align_tensor_to_target_shape(torch.add(mid_up, bridge_cf), [1, 32, 4, 4])" in rewritten
+    assert "high_up = _apply_resize(high_merge, [32, 64], method='bilinear', target_shape=[1, 32, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "merge_tensor = torch.cat([relu51_tmp0, low_up, mid_up, high_up], dim=1)" in rewritten
+    assert "conv71_out = self.conv_block_71(merge_tensor)" in rewritten
+
+
 def test_should_skip_expensive_raw_canonicalize_for_sinet_fast_repaired_package(
     tmp_path,
 ) -> None:
@@ -1469,6 +1860,61 @@ def test_should_not_skip_expensive_raw_canonicalize_for_generic_package(
     )
 
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
+
+
+def test_should_skip_expensive_raw_canonicalize_for_humanseg_semantic_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_semantic_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, a, b, relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out):",
+                "        resize10_in_nhwc = _align_tensor_to_target_shape(torch.add(a, b), [1, 32, 24, 24])",
+                "        resize12_out = _apply_resize(resize12_in, [48, 48], method='bilinear', target_shape=[1, 128, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)",
+                "        cv72_in_cf = self.conv_block_71(cv71_in)",
+                "        return cv72_in_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_humanseg_generic_cat_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_generic_cat_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, relu_tail, a, b, c, d):",
+                "        low_merge = _align_tensor_to_target_shape(torch.add(a, b), [1, 8, 16, 16])",
+                "        mid_merge = _align_tensor_to_target_shape(torch.add(c, d), [1, 16, 8, 8])",
+                "        low_up = _apply_resize(low_merge, [32, 64], method='bilinear', target_shape=[1, 8, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        mid_up = _apply_resize(mid_merge, [32, 64], method='bilinear', target_shape=[1, 16, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        aux_up = _apply_resize(mid_merge, [32, 64], method='bilinear', target_shape=[1, 16, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        merge_tensor = torch.cat([relu_tail, low_up, mid_up, aux_up], dim=1)",
+                "        conv71_out = self.conv_block_71(merge_tensor)",
+                "        return conv71_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
 def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_l1_package(
@@ -1586,6 +2032,31 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_plain_partially_fas
                 "    def forward(self, fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc, fdnetdow_downmaxp_convmaxp_d5_cf4777, fdnetup2_upup_resize_out_nhwc, out_nhwc):",
                 "        fdnetup1_upconvconvconv0_cv_in = torch.cat([fdnetdow_downmaxp_convmaxp_ffa_cf_c147, fdnetup1_upup_resize_out_nhwc], dim=1)",
                 "        fdnetup2_upconvconvconv0_cv_in = torch.cat([fdnetdow_downmaxp_convmaxp_d5_cf4777, fdnetup2_upup_resize_out_nhwc], dim=1)",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_semantic_signature_without_fixed_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_semantic_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_a_cf, branch0_resize_out_nhwc, stem_b_cf, branch1_resize_out_nhwc, out_nhwc):",
+                "        decoder_merge0 = torch.cat([stem_a_cf, branch0_resize_out_nhwc], dim=1)",
+                "        decoder_merge1 = torch.cat([stem_b_cf, branch1_resize_out_nhwc], dim=1)",
                 "        out = out_nhwc",
                 "        return out",
                 "",
@@ -1856,6 +2327,32 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_current_channel_l
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_semantic_signature_without_fixed_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_semantic_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pyramid_cf, neck_in_nhwc, det0, det1, det2, det3):",
+                "        neck_pool_padded = F.pad(pyramid_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        neck_pool = _apply_pool2d(neck_pool_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
+                "        fpnupsample1_resize_out_nhwc = _apply_resize(neck_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([head_rs_out0, head_rs1_out0, head_rs2_out0, head_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_package(
     tmp_path,
 ) -> None:
@@ -1945,6 +2442,33 @@ def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes
     assert "[6, 16, 100, 100]" in repaired
 
 
+def test_apply_fast_precanonicalize_repairs_does_not_apply_shadowformer_repair_without_structural_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_no_signature_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    original = "\n".join(
+        [
+            "import torch",
+            "class Model(torch.nn.Module):",
+            "    def __init__(self):",
+            "        super().__init__()",
+            "        self.register_buffer('const_wa_encoderlayer2_x4_x100_6c60', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)",
+            "    def forward(self, x, y):",
+            "        _binary_lhs_255, _binary_rhs_255 = _align_binary_inputs(x, y, [24, 4, 100, 100])",
+            "        return _binary_lhs_255",
+            "",
+        ]
+    )
+    model_path.write_text(original, encoding="utf-8")
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert repaired == original
+
+
 def test_should_skip_expensive_raw_canonicalize_for_bread_after_fast_canonical_form(
     tmp_path,
 ) -> None:
@@ -1960,6 +2484,30 @@ def test_should_skip_expensive_raw_canonicalize_for_bread_after_fast_canonical_f
                 "        wa_mul_out0 = torch.reshape(torch.mul(wa_slice_out0, 0.29899999499320984), [1, 1, 180, 320])",
                 "        wamodel_fdnetup1_upconvconvconv0_cv_in = torch.cat([wamodel_fdnetdow_downmaxpo_a6_cf_b28e, wamodel_fdnetup1_upup_resize_out_nhwc], dim=1)",
                 "        wa_add10_out0 = _align_tensor_to_target_shape(torch.add(wa_mul14_out0, wa_mul15_out0_cf), [1, 3, 180, 320])",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_bread_semantic_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_semantic_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, encoder_cf, upsample_resize_out_nhwc, out_nhwc):",
+                "        decoder_merge = torch.cat([encoder_cf, upsample_resize_out_nhwc], dim=1)",
                 "        out = out_nhwc",
                 "        return out",
                 "",
