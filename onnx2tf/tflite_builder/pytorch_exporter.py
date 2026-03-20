@@ -27027,6 +27027,12 @@ _SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
 _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
     rf"^.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\(\))?$"
 )
+_SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
+    r"^\s*self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', "
+    r"torch\.zeros\((?:size=)?(?:\[|\()1, (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?:\]|\))"
+    r"(?:, dtype=torch\.(?P<dtype>[A-Za-z0-9_]+))?\)"
+    r"(?:, persistent=(?P<persistent>True|False))?\)$"
+)
 
 
 def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
@@ -27058,9 +27064,6 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         for buffer_name, buffer_shape in buffer_shapes.items()
         if buffer_shape in known_shadowformer_shapes
     }
-    register_buffer_re = re.compile(
-        r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\((?:size=)?(?:\[|\()1, (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?:\]|\)), dtype=torch\.(?P<dtype>[A-Za-z0-9_]+)\), persistent=(?P<persistent>True|False)\)"
-    )
     binary_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
     )
@@ -27071,7 +27074,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
 
     for index, line in enumerate(lines):
         current_line = str(line)
-        register_match = register_buffer_re.search(current_line)
+        register_match = _SHADOWFORMER_REGISTER_BUFFER_RE.match(current_line)
         if register_match is not None:
             dims = (
                 int(register_match.group("d1")),
@@ -27084,10 +27087,14 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
                 shape = (dims[1], dims[0], dims[2])
             if shape not in known_shadowformer_shapes:
                 continue
-            rewritten = (
-                f"        self.register_buffer('{register_match.group('buffer')}', "
-                f"torch.zeros([1, {shape[0]}, {shape[1]}, {shape[2]}], dtype=torch.{register_match.group('dtype')}), persistent={register_match.group('persistent')})"
-            )
+            zeros_expr = f"torch.zeros([1, {shape[0]}, {shape[1]}, {shape[2]}]"
+            if register_match.group("dtype") is not None:
+                zeros_expr += f", dtype=torch.{register_match.group('dtype')}"
+            zeros_expr += ")"
+            rewritten = f"        self.register_buffer('{register_match.group('buffer')}', {zeros_expr}"
+            if register_match.group("persistent") is not None:
+                rewritten += f", persistent={register_match.group('persistent')}"
+            rewritten += ")"
             if rewritten != current_line:
                 lines[index] = rewritten
                 changed = True
@@ -27572,9 +27579,6 @@ def _collect_shadowformer_fast_repair_facts(
     Set[Tuple[int, int, int]],
     Set[Tuple[int, int, int]],
 ]:
-    register_buffer_re = re.compile(
-        r"^\s*self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\((?:size=)?(?:\[|\()1, (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?:\]|\)), dtype=torch\.[A-Za-z0-9_]+\), persistent=(?:True|False)\)$"
-    )
     copy_re = re.compile(
         r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+)\)$"
     )
@@ -27591,7 +27595,7 @@ def _collect_shadowformer_fast_repair_facts(
 
     for line in lines:
         current_line = str(line)
-        register_match = register_buffer_re.match(current_line)
+        register_match = _SHADOWFORMER_REGISTER_BUFFER_RE.match(current_line)
         if register_match is not None:
             raw_buffer_dims[register_match.group("buffer")] = (
                 int(register_match.group("d1")),
