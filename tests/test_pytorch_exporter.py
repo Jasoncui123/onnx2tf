@@ -5187,6 +5187,83 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_pad_pool_
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_pad_pool_anchor_without_source_set_gate(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale3_no_source_gate_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        spp_padded = F.pad(_align_tensor_to_target_shape(generic_stage_input, [1, 3, 5, 256]), [0, 0, 8, 8, 8, 8], mode='constant', value=0.0)",
+                "        spp_pool_out = _apply_pool2d(spp_padded, filter_height=17, filter_width=17, stride_h=8, stride_w=8, padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=True)",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, self.const_demo_scale3_any, [1, 256, 1, 9])",
+                "        return _binary_lhs_21",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "spp_padded = F.pad(generic_stage_input, [8, 8, 8, 8], mode='constant', value=0.0)" in rewritten
+    assert (
+        "spp_pool_out = _apply_pool2d(spp_padded, filter_height=17, filter_width=17, stride_h=8, stride_w=8, "
+        "padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=False)"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(self.const_demo_scale3_any, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_pool_anchor_without_source_set_gate(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_pool_no_source_gate_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        spp_pool_out = _apply_pool2d(generic_stage_input, filter_height=17, filter_width=17, stride_h=8, stride_w=8, padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=True)",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, self.const_demo_scale3_any, [1, 256, 1, 13])",
+                "        return _binary_lhs_21",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_pool_out = _apply_pool2d(generic_stage_input, filter_height=17, filter_width=17, stride_h=8, stride_w=8, "
+        "padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=False)"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(self.const_demo_scale3_any, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_with_generic_const_names(
     tmp_path,
 ) -> None:

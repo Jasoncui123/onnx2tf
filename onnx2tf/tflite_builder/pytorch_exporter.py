@@ -26078,10 +26078,19 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             cf_pad_match = pidnet_cf_pad_re.match(future_line)
             if cf_pad_match is not None and str(cf_pad_match.group("input")) in tracked_names:
                 return True
+            cf_pool_match = pidnet_cf_pool_re.match(future_line)
+            if cf_pool_match is not None and str(cf_pool_match.group("input")) in tracked_names:
+                return True
             binary_anchor_match = pidnet_binary_anchor_re.match(future_line)
             if binary_anchor_match is not None and (
                 str(binary_anchor_match.group("a")) in tracked_names
                 or str(binary_anchor_match.group("b")) in tracked_names
+            ):
+                return True
+            scale3_anchor_match = pidnet_scale3_anchor_re.match(future_line)
+            if (
+                scale3_anchor_match is not None
+                and str(scale3_anchor_match.group("input")) in tracked_names
             ):
                 return True
             mul_align_match = pidnet_mul_align_re.match(future_line)
@@ -26195,6 +26204,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         pidnet_cf_pad_match = pidnet_cf_pad_re.match(line)
         if pidnet_cf_pad_match is not None:
             input_name = str(pidnet_cf_pad_match.group("input"))
+            lhs_name = str(pidnet_cf_pad_match.group("lhs"))
             current_shape = [
                 int(pidnet_cf_pad_match.group("n")),
                 int(pidnet_cf_pad_match.group("d1")),
@@ -26205,16 +26215,22 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 current_shape,
                 preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
             )
-            if input_name in pidnet_cf_add_sources and normalized_shape != current_shape:
+            if (
+                (
+                    _pidnet_is_cf_like_name(input_name)
+                    or _pidnet_has_cf_layout_consumer(lhs_name, start_index=index)
+                )
+                and normalized_shape != current_shape
+            ):
                 lines[index] = (
-                    f"{pidnet_cf_pad_match.group('indent')}{pidnet_cf_pad_match.group('lhs')} = "
+                    f"{pidnet_cf_pad_match.group('indent')}{lhs_name} = "
                     f"F.pad({input_name}, "
                     f"[{pidnet_cf_pad_match.group('pad_top')}, {pidnet_cf_pad_match.group('pad_bottom')}, "
                     f"{pidnet_cf_pad_match.group('pad_left')}, {pidnet_cf_pad_match.group('pad_right')}], "
                     f"mode='constant', value=0.0)"
                 )
                 changed = True
-                pidnet_cf_pad_sources.add(str(pidnet_cf_pad_match.group("lhs")))
+                pidnet_cf_pad_sources.add(lhs_name)
                 continue
         pidnet_binary_anchor_match = pidnet_binary_anchor_re.match(line)
         if pidnet_binary_anchor_match is not None:
@@ -26252,9 +26268,13 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         pidnet_cf_pool_match = pidnet_cf_pool_re.match(line)
         if pidnet_cf_pool_match is not None:
             input_name = str(pidnet_cf_pool_match.group("input"))
-            if input_name in pidnet_cf_add_sources or input_name in pidnet_cf_pad_sources:
+            lhs_name = str(pidnet_cf_pool_match.group("lhs"))
+            if (
+                _pidnet_is_cf_like_name(input_name)
+                or _pidnet_has_cf_layout_consumer(lhs_name, start_index=index)
+            ):
                 lines[index] = (
-                    f"{pidnet_cf_pool_match.group('indent')}{pidnet_cf_pool_match.group('lhs')} = _apply_pool2d("
+                    f"{pidnet_cf_pool_match.group('indent')}{lhs_name} = _apply_pool2d("
                     f"{input_name}, filter_height={pidnet_cf_pool_match.group('fh')}, "
                     f"filter_width={pidnet_cf_pool_match.group('fw')}, stride_h={pidnet_cf_pool_match.group('sh')}, "
                     f"stride_w={pidnet_cf_pool_match.group('sw')}, padding='{pidnet_cf_pool_match.group('padding')}', "
@@ -26263,7 +26283,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                     f"is_max_pool={pidnet_cf_pool_match.group('is_max')}, channel_last=False)"
                 )
                 changed = True
-                pidnet_cf_pool_sources.add(str(pidnet_cf_pool_match.group("lhs")))
+                pidnet_cf_pool_sources.add(lhs_name)
                 continue
         pidnet_mul_align_match = pidnet_mul_align_re.match(line)
         if pidnet_mul_align_match is not None:
