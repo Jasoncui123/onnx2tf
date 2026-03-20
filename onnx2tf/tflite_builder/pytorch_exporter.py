@@ -27071,11 +27071,12 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     (
         registered_shapes,
         buffer_shapes,
+        copied_buffers,
         copied_shapes,
         aligned_shapes,
+        buffer_aligned_buffers,
         buffer_aligned_shapes,
     ) = _collect_shadowformer_fast_repair_facts(model_lines)
-    registered_buffers = set(buffer_shapes)
     if not _has_shadowformer_fast_repair_signature(model_lines):
         return
 
@@ -27090,7 +27091,13 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     supported_buffers = {
         buffer_name
         for buffer_name, buffer_shape in buffer_shapes.items()
-        if buffer_shape in known_shadowformer_shapes
+        if (
+            buffer_shape in known_shadowformer_shapes
+            and (
+                buffer_name in copied_buffers
+                or buffer_name in buffer_aligned_buffers
+            )
+        )
     }
     binary_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+,\s*[A-Za-z0-9_\.]+,\s*(?:\[|\())"
@@ -27105,6 +27112,8 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         current_line = str(line)
         register_match = _SHADOWFORMER_REGISTER_BUFFER_RE.match(current_line)
         if register_match is not None:
+            if register_match.group("buffer") not in supported_buffers:
+                continue
             dims = (
                 int(register_match.group("d1")),
                 int(register_match.group("d2")),
@@ -27574,8 +27583,10 @@ def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
     (
         registered_shapes,
         _buffer_shapes,
+        _copied_buffers,
         copied_shapes,
         aligned_shapes,
+        _buffer_aligned_buffers,
         buffer_aligned_shapes,
     ) = _collect_shadowformer_fast_repair_facts(lines)
     return len(_collect_shadowformer_supported_shapes(registered_shapes, copied_shapes, aligned_shapes, buffer_aligned_shapes)) >= 1
@@ -27603,8 +27614,10 @@ def _collect_shadowformer_fast_repair_facts(
 ) -> Tuple[
     Set[Tuple[int, int, int]],
     Dict[str, Tuple[int, int, int]],
+    Set[str],
     Set[Tuple[int, int, int]],
     Set[Tuple[int, int, int]],
+    Set[str],
     Set[Tuple[int, int, int]],
 ]:
     copy_re = re.compile(
@@ -27642,8 +27655,10 @@ def _collect_shadowformer_fast_repair_facts(
 
     registered_shapes: Set[Tuple[int, int, int]] = set()
     buffer_shapes: Dict[str, Tuple[int, int, int]] = {}
+    copied_buffers: Set[str] = set()
     copied_shapes: Set[Tuple[int, int, int]] = set()
     aligned_shapes: Set[Tuple[int, int, int]] = set()
+    buffer_aligned_buffers: Set[str] = set()
     buffer_aligned_shapes: Set[Tuple[int, int, int]] = set()
 
     for buffer_name, dims in raw_buffer_dims.items():
@@ -27654,6 +27669,7 @@ def _collect_shadowformer_fast_repair_facts(
         registered_shapes.add(shape)
         buffer_shapes[buffer_name] = shape
         if buffer_name in plain_copy_buffers or buffer_name in permuted_copy_buffers:
+            copied_buffers.add(buffer_name)
             copied_shapes.add(shape)
 
     for line in lines:
@@ -27670,6 +27686,7 @@ def _collect_shadowformer_fast_repair_facts(
                     buffer_name = operand_name[len("self.") :]
                     buffer_shape = buffer_shapes.get(buffer_name)
                     if buffer_shape == inferred_shape:
+                        buffer_aligned_buffers.add(buffer_name)
                         buffer_aligned_shapes.add(inferred_shape)
             continue
         mul_match = mul_align_shape_re.match(current_line)
@@ -27679,7 +27696,15 @@ def _collect_shadowformer_fast_repair_facts(
             if inferred_shape is not None:
                 aligned_shapes.add(inferred_shape)
 
-    return registered_shapes, buffer_shapes, copied_shapes, aligned_shapes, buffer_aligned_shapes
+    return (
+        registered_shapes,
+        buffer_shapes,
+        copied_buffers,
+        copied_shapes,
+        aligned_shapes,
+        buffer_aligned_buffers,
+        buffer_aligned_shapes,
+    )
 
 
 def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int, int, int, int]]:
