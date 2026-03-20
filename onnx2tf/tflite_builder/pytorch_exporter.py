@@ -27067,24 +27067,21 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         return
     model_source = model_path.read_text(encoding="utf-8")
     model_lines = model_source.splitlines()
-    registered_pairs, registered_buffers, _, aligned_pairs = _collect_shadowformer_fast_repair_facts(model_lines)
+    registered_shapes, registered_buffers, _, aligned_shapes = _collect_shadowformer_fast_repair_facts(model_lines)
     if not _has_shadowformer_fast_repair_signature(model_lines):
         return
 
     changed = False
     lines = model_lines
-    known_shadowformer_pairs = registered_pairs.intersection(aligned_pairs)
+    known_shadowformer_shapes = registered_shapes.intersection(aligned_shapes)
     register_buffer_re = re.compile(
-        r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<window>\d+), (?P<heads>\d+), (?P=window)\], dtype=torch\.float32\), persistent=False\)"
+        r"self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<height>\d+), (?P<heads>\d+), (?P<width>\d+)\], dtype=torch\.float32\), persistent=False\)"
     )
     copy_permute_re = re.compile(
         r"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
     )
     binary_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P<heads>\d+), (?P=window)(?P<suffix>\]\))$"
-    )
-    binary_const_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<window>\d+), (?P=window), (?P<heads>\d+)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
     )
     mul_align_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[)"
@@ -27095,12 +27092,16 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         current_line = str(line)
         register_match = register_buffer_re.search(current_line)
         if register_match is not None:
-            pair = (int(register_match.group("heads")), int(register_match.group("window")))
-            if pair not in known_shadowformer_pairs:
+            shape = (
+                int(register_match.group("heads")),
+                int(register_match.group("height")),
+                int(register_match.group("width")),
+            )
+            if shape not in known_shadowformer_shapes:
                 continue
             rewritten = (
                 f"        self.register_buffer('{register_match.group('buffer')}', "
-                f"torch.zeros([1, {register_match.group('heads')}, {register_match.group('window')}, {register_match.group('window')}], dtype=torch.float32), persistent=False)"
+                f"torch.zeros([1, {register_match.group('heads')}, {register_match.group('height')}, {register_match.group('width')}], dtype=torch.float32), persistent=False)"
             )
             if rewritten != current_line:
                 lines[index] = rewritten
@@ -27117,25 +27118,18 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             continue
         binary_match = binary_shape_re.match(current_line)
         if binary_match is not None:
-            pair = (int(binary_match.group("heads")), int(binary_match.group("window")))
-            if pair not in known_shadowformer_pairs:
+            dims = [
+                int(binary_match.group("d1")),
+                int(binary_match.group("d2")),
+                int(binary_match.group("d3")),
+            ]
+            inferred_shape = _infer_shadowformer_shape_from_dims(dims, known_shadowformer_shapes)
+            if inferred_shape is None:
                 continue
+            heads, height, width = inferred_shape
             rewritten = (
                 f"{binary_match.group('indent')}{binary_match.group('batch')}, "
-                f"{binary_match.group('heads')}, {binary_match.group('window')}, {binary_match.group('window')}{binary_match.group('suffix')}"
-            )
-            if rewritten != current_line:
-                lines[index] = rewritten
-                changed = True
-            continue
-        binary_const_match = binary_const_shape_re.match(current_line)
-        if binary_const_match is not None:
-            pair = (int(binary_const_match.group("heads")), int(binary_const_match.group("window")))
-            if pair not in known_shadowformer_pairs:
-                continue
-            rewritten = (
-                f"{binary_const_match.group('indent')}{binary_const_match.group('batch')}, "
-                f"{binary_const_match.group('heads')}, {binary_const_match.group('window')}, {binary_const_match.group('window')}{binary_const_match.group('suffix')}"
+                f"{heads}, {height}, {width}{binary_match.group('suffix')}"
             )
             if rewritten != current_line:
                 lines[index] = rewritten
@@ -27148,20 +27142,12 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
                 int(mul_match.group("d2")),
                 int(mul_match.group("d3")),
             ]
-            repeated_dims = [
-                dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 2
-            ]
-            repeated_dims = list(dict.fromkeys(repeated_dims))
-            head_dims = [
-                dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 1
-            ]
-            if len(repeated_dims) == 1 and len(head_dims) == 1:
-                pair = (head_dims[0], repeated_dims[0])
-                if pair not in known_shadowformer_pairs:
-                    continue
+            inferred_shape = _infer_shadowformer_shape_from_dims(dims, known_shadowformer_shapes)
+            if inferred_shape is not None:
+                heads, height, width = inferred_shape
                 rewritten = (
                     f"{mul_match.group('indent')}{mul_match.group('batch')}, "
-                    f"{head_dims[0]}, {repeated_dims[0]}, {repeated_dims[0]}{mul_match.group('suffix')}"
+                    f"{heads}, {height}, {width}{mul_match.group('suffix')}"
                 )
                 if rewritten != current_line:
                     lines[index] = rewritten
@@ -27555,9 +27541,9 @@ def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
 
 
 def _has_shadowformer_fast_repair_signature(lines: Sequence[str]) -> bool:
-    registered_pairs, _, copied_pairs, aligned_pairs = _collect_shadowformer_fast_repair_facts(lines)
-    shared_pairs = registered_pairs.intersection(copied_pairs).intersection(aligned_pairs)
-    return len(shared_pairs) >= 2
+    registered_shapes, _, copied_shapes, aligned_shapes = _collect_shadowformer_fast_repair_facts(lines)
+    shared_shapes = registered_shapes.intersection(copied_shapes).intersection(aligned_shapes)
+    return len(shared_shapes) >= 1
 
 
 def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
@@ -27570,86 +27556,94 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
         current_line = str(line)
         if pool_re.match(current_line) is not None:
             has_cf_pool = True
-    softmax_pairs = _collect_shadowformer_softmax_pairs(lines)
-    return has_cf_pool and len(softmax_pairs) >= 2
+    softmax_shapes = _collect_shadowformer_softmax_shapes(lines)
+    return has_cf_pool and len(softmax_shapes) >= 2
 
 
 def _collect_shadowformer_fast_repair_facts(
     lines: Sequence[str],
-) -> Tuple[Set[Tuple[int, int]], Set[str], Set[Tuple[int, int]], Set[Tuple[int, int]]]:
+) -> Tuple[Set[Tuple[int, int, int]], Set[str], Set[Tuple[int, int, int]], Set[Tuple[int, int, int]]]:
     register_buffer_re = re.compile(
-        r"^\s*self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<window>\d+), (?P<heads>\d+), (?P=window)\], dtype=torch\.float32\), persistent=False\)$"
+        r"^\s*self\.register_buffer\('(?P<buffer>[A-Za-z0-9_]+)', torch\.zeros\(\[1, (?P<height>\d+), (?P<heads>\d+), (?P<width>\d+)\], dtype=torch\.float32\), persistent=False\)$"
     )
     copy_permute_re = re.compile(
         r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\(.+\.permute\(\*\(0, 2, 1, 3\)\)\.contiguous\(\)\)$"
     )
     binary_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[(?P<batch>\d+), (?P<window>\d+), (?P<heads>\d+), (?P=window)\]\)$"
-    )
-    binary_const_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[(?P<batch>\d+), (?P<window>\d+), (?P=window), (?P<heads>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, [A-Za-z0-9_\.]+, \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     mul_align_shape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
 
-    registered_pairs: Set[Tuple[int, int]] = set()
+    registered_shapes: Set[Tuple[int, int, int]] = set()
     registered_buffers: Set[str] = set()
-    buffer_pairs: Dict[str, Tuple[int, int]] = {}
-    copied_pairs: Set[Tuple[int, int]] = set()
-    aligned_pairs: Set[Tuple[int, int]] = set()
+    buffer_shapes: Dict[str, Tuple[int, int, int]] = {}
+    copied_shapes: Set[Tuple[int, int, int]] = set()
+    aligned_shapes: Set[Tuple[int, int, int]] = set()
 
     for line in lines:
         current_line = str(line)
         register_match = register_buffer_re.match(current_line)
         if register_match is not None:
-            pair = (int(register_match.group("heads")), int(register_match.group("window")))
-            registered_pairs.add(pair)
+            shape = (
+                int(register_match.group("heads")),
+                int(register_match.group("height")),
+                int(register_match.group("width")),
+            )
+            registered_shapes.add(shape)
             registered_buffers.add(register_match.group("buffer"))
-            buffer_pairs[register_match.group("buffer")] = pair
+            buffer_shapes[register_match.group("buffer")] = shape
             continue
         copy_match = copy_permute_re.match(current_line)
-        if copy_match is not None and copy_match.group("buffer") in buffer_pairs:
-            copied_pairs.add(buffer_pairs[copy_match.group("buffer")])
+        if copy_match is not None and copy_match.group("buffer") in buffer_shapes:
+            copied_shapes.add(buffer_shapes[copy_match.group("buffer")])
             continue
         binary_match = binary_shape_re.match(current_line)
         if binary_match is not None:
-            aligned_pairs.add((int(binary_match.group("heads")), int(binary_match.group("window"))))
-            continue
-        binary_const_match = binary_const_shape_re.match(current_line)
-        if binary_const_match is not None:
-            aligned_pairs.add((int(binary_const_match.group("heads")), int(binary_const_match.group("window"))))
+            dims = [int(binary_match.group("d1")), int(binary_match.group("d2")), int(binary_match.group("d3"))]
+            inferred_shape = _infer_shadowformer_shape_from_dims(dims, registered_shapes)
+            if inferred_shape is not None:
+                aligned_shapes.add(inferred_shape)
             continue
         mul_match = mul_align_shape_re.match(current_line)
         if mul_match is not None:
             dims = [int(mul_match.group("d1")), int(mul_match.group("d2")), int(mul_match.group("d3"))]
-            repeated_dims = list(dict.fromkeys(
-                dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 2
-            ))
-            head_dims = [dim for dim in dims if sum(1 for candidate in dims if candidate == dim) == 1]
-            if len(repeated_dims) == 1 and len(head_dims) == 1:
-                aligned_pairs.add((head_dims[0], repeated_dims[0]))
+            inferred_shape = _infer_shadowformer_shape_from_dims(dims, registered_shapes)
+            if inferred_shape is not None:
+                aligned_shapes.add(inferred_shape)
 
-    return registered_pairs, registered_buffers, copied_pairs, aligned_pairs
+    return registered_shapes, registered_buffers, copied_shapes, aligned_shapes
 
 
-def _collect_shadowformer_softmax_pairs(lines: Sequence[str]) -> List[Tuple[int, int, int]]:
+def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int, int, int, int]]:
     softmax_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>\d+), (?P<window>\d+), (?P=window)\]\)$"
+        r"^\s*[A-Za-z0-9_]+ = _apply_softmax\([A-Za-z0-9_]+, axis=3, beta=1\.0, target_shape=\[(?P<batches>\d+), (?P<heads>\d+), (?P<height>\d+), (?P<width>\d+)\]\)$"
     )
-    softmax_pairs: List[Tuple[int, int, int]] = []
+    softmax_shapes: List[Tuple[int, int, int, int]] = []
     for line in lines:
         softmax_match = softmax_re.match(str(line))
         if softmax_match is None:
             continue
-        softmax_pairs.append(
+        softmax_shapes.append(
             (
                 int(softmax_match.group("batches")),
                 int(softmax_match.group("heads")),
-                int(softmax_match.group("window")),
+                int(softmax_match.group("height")),
+                int(softmax_match.group("width")),
             )
         )
-    return softmax_pairs
+    return softmax_shapes
+
+
+def _infer_shadowformer_shape_from_dims(
+    dims: Sequence[int],
+    known_shapes: Set[Tuple[int, int, int]],
+) -> Tuple[int, int, int] | None:
+    for known_shape in known_shapes:
+        if sorted(dims) == sorted(known_shape):
+            return known_shape
+    return None
 
 
 def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Path) -> bool:
