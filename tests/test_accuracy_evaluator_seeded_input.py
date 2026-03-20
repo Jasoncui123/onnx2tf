@@ -2,6 +2,8 @@ import numpy as np
 from onnx import TensorProto, helper
 
 from onnx2tf.tflite_builder.accuracy_evaluator import (
+    _FLOAT_METRIC_THRESHOLDS,
+    _QUANT_METRIC_THRESHOLDS,
     _build_seeded_input_distribution_overrides,
     _build_eval_inputs_for_sample,
     _collect_onnx_input_specs,
@@ -10,6 +12,17 @@ from onnx2tf.tflite_builder.accuracy_evaluator import (
     _max_abs_error,
     _MetricAccumulator,
 )
+
+
+def test_default_accuracy_thresholds_match_pytorch_style() -> None:
+    expected = {
+        "max_abs": 5.0e-2,
+        "mean_abs": 5.0e-3,
+        "rmse": 6.0e-3,
+        "cosine_similarity": 0.9990,
+    }
+    assert _FLOAT_METRIC_THRESHOLDS == expected
+    assert _QUANT_METRIC_THRESHOLDS == expected
 
 
 def test_generate_seeded_input_float_nchw_image_shape_defaults_normal(

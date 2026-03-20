@@ -1277,6 +1277,7 @@ def convert(
     flatbuffer_direct_output_torchscript: Optional[bool] = False,
     flatbuffer_direct_output_dynamo_onnx: Optional[bool] = False,
     flatbuffer_direct_output_exported_program: Optional[bool] = False,
+    native_pytorch_generation_timeout_sec: Optional[int] = 0,
     flatbuffer_direct_allow_custom_ops: Optional[bool] = False,
     flatbuffer_direct_custom_op_allowlist: Optional[List[str]] = None,
     tflite_split_max_bytes: Optional[int] = 1073741824,
@@ -1511,6 +1512,13 @@ def convert(
         If a public input has dynamic dimensions, provide a concrete example
         input with `shape_hints` (recommended), `test_data_nhwc_path` for 4D
         RGB image inputs, or `custom_input_op_name_np_data_path`.
+
+    native_pytorch_generation_timeout_sec: Optional[int]
+        Timeout in seconds for generated native PyTorch package creation.\n
+        When this timeout is exceeded, onnx2tf treats the generation as a
+        recursion explosion, aborts native PyTorch generation for the current
+        model, and continues conversion without PyTorch artifacts.\n
+        `0` disables this timeout. Default: `0`.
 
     flatbuffer_direct_allow_custom_ops: Optional[bool]
         Allow lowering selected unsupported ONNX ops as TFLite CUSTOM ops in
@@ -2050,6 +2058,13 @@ def convert(
         or flatbuffer_direct_output_exported_program
     ):
         flatbuffer_direct_output_pytorch = True
+    native_pytorch_generation_timeout_sec = int(
+        native_pytorch_generation_timeout_sec or 0
+    )
+    if native_pytorch_generation_timeout_sec < 0:
+        raise ValueError(
+            "native_pytorch_generation_timeout_sec must be greater than or equal to 0."
+        )
     flatbuffer_direct_allow_custom_ops = bool(flatbuffer_direct_allow_custom_ops)
     replace_to_pseudo_operators = _normalize_replace_to_pseudo_operators(
         replace_to_pseudo_operators
@@ -4520,19 +4535,25 @@ def convert(
                 )
             if flatbuffer_direct_output_pytorch:
                 from onnx2tf.tflite_builder.pytorch_exporter import (
+                    NativePyTorchGenerationTimeoutError,
                     export_dynamo_onnx_from_generated_package,
                     export_exported_program_from_generated_package,
                     export_pytorch_package_from_model_ir,
                     export_torchscript_from_generated_package,
                 )
-                pytorch_package_path = export_pytorch_package_from_model_ir(
-                    model_ir=model_ir_fp32,
-                    output_folder_path=os.path.join(
-                        output_folder_path,
-                        f'{output_file_name}_pytorch',
-                    ),
-                )
-                if flatbuffer_direct_output_torchscript:
+                try:
+                    pytorch_package_path = export_pytorch_package_from_model_ir(
+                        model_ir=model_ir_fp32,
+                        output_folder_path=os.path.join(
+                            output_folder_path,
+                            f'{output_file_name}_pytorch',
+                        ),
+                        native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
+                    )
+                except NativePyTorchGenerationTimeoutError as ex:
+                    pytorch_package_path = None
+                    warn(str(ex))
+                if pytorch_package_path is not None and flatbuffer_direct_output_torchscript:
                     pytorch_torchscript_path = export_torchscript_from_generated_package(
                         package_dir=pytorch_package_path,
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
@@ -4540,7 +4561,7 @@ def convert(
                         test_data_nhwc_path=test_data_nhwc_path,
                         raise_on_failure=False,
                     )
-                if flatbuffer_direct_output_dynamo_onnx:
+                if pytorch_package_path is not None and flatbuffer_direct_output_dynamo_onnx:
                     pytorch_dynamo_onnx_path = export_dynamo_onnx_from_generated_package(
                         package_dir=pytorch_package_path,
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
@@ -4548,7 +4569,7 @@ def convert(
                         test_data_nhwc_path=test_data_nhwc_path,
                         raise_on_failure=False,
                     )
-                if flatbuffer_direct_output_exported_program:
+                if pytorch_package_path is not None and flatbuffer_direct_output_exported_program:
                     pytorch_exported_program_path = export_exported_program_from_generated_package(
                         package_dir=pytorch_package_path,
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
@@ -5798,6 +5819,7 @@ def convert(
                         output_torchscript_from_model_ir=flatbuffer_direct_output_torchscript,
                         output_dynamo_onnx_from_model_ir=flatbuffer_direct_output_dynamo_onnx,
                         output_exported_program_from_model_ir=flatbuffer_direct_output_exported_program,
+                        native_pytorch_generation_timeout_sec=native_pytorch_generation_timeout_sec,
                         saved_model_output_folder_path=saved_model_output_folder_path,
                         pytorch_output_folder_path=pytorch_output_folder_path,
                         persist_saved_model_output=persist_saved_model_output,
@@ -8476,6 +8498,7 @@ def main():
             '"flatbuffer_direct": Use direct FlatBuffer builder path (limited OP/quantization support).'
     )
     parser.add_argument(
+        '-ewo',
         '--eval_with_onnx',
         action='store_true',
         help=\
@@ -8483,6 +8506,7 @@ def main():
             'Currently available only with --tflite_backend flatbuffer_direct.'
     )
     parser.add_argument(
+        '-ens',
         '--eval_num_samples',
         type=int,
         default=10,
@@ -8491,6 +8515,7 @@ def main():
             'Default: 10'
     )
     parser.add_argument(
+        '-ert',
         '--eval_rtol',
         type=float,
         default=1e-4,
@@ -8499,6 +8524,7 @@ def main():
             'Default: 1e-4'
     )
     parser.add_argument(
+        '-eat',
         '--eval_atol',
         type=float,
         default=1e-4,
@@ -8507,12 +8533,14 @@ def main():
             'Default: 1e-4'
     )
     parser.add_argument(
+        '-efot',
         '--eval_fail_on_threshold',
         action='store_true',
         help=\
             'Return failure when evaluation thresholds are not satisfied.'
     )
     parser.add_argument(
+        '-ett',
         '--eval_target_tflite',
         type=str,
         choices=[
@@ -8530,6 +8558,7 @@ def main():
             'Default: float32'
     )
     parser.add_argument(
+        '-ecm',
         '--eval_compare_mode',
         type=str,
         choices=['auto', 'dequant', 'raw'],
@@ -8555,12 +8584,14 @@ def main():
             '*_accuracy_report.json remains the unsplit base float32 TFLite vs ONNX report.'
     )
     parser.add_argument(
+        '-esfot',
         '--eval_split_fail_on_threshold',
         action='store_true',
         help=\
             'Return failure when split-model evaluation thresholds are not satisfied.'
     )
     parser.add_argument(
+        '-roc',
         '--report_op_coverage',
         action='store_true',
         help=\
@@ -8615,12 +8646,25 @@ def main():
             '--test_data_nhwc_path is also accepted for 4D RGB inputs, and -cind remains available.'
     )
     parser.add_argument(
+        '-npgts',
+        '--native_pytorch_generation_timeout_sec',
+        type=int,
+        default=0,
+        help=\
+            'Timeout in seconds for generated native PyTorch package creation. \n' +
+            'When exceeded, onnx2tf treats the generation as a recursion explosion, \n' +
+            'skips PyTorch artifact generation for the current model, and continues. \n' +
+            '0 disables this timeout.'
+    )
+    parser.add_argument(
+        '-fdaco',
         '--flatbuffer_direct_allow_custom_ops',
         action='store_true',
         help=\
             'Allow lowering selected unsupported ONNX ops as TFLite CUSTOM ops in flatbuffer_direct backend.'
     )
     parser.add_argument(
+        '-fdcoa',
         '--flatbuffer_direct_custom_op_allowlist',
         type=str,
         default='',
@@ -8629,6 +8673,7 @@ def main():
             'Requires --flatbuffer_direct_allow_custom_ops.'
     )
     parser.add_argument(
+        '-tsmb',
         '--tflite_split_max_bytes',
         type=int,
         default=1073741824,
@@ -8637,6 +8682,7 @@ def main():
             'Default: 1073741824 (1GiB)'
     )
     parser.add_argument(
+        '-tstb',
         '--tflite_split_target_bytes',
         type=int,
         default=1060000000,
@@ -8973,6 +9019,7 @@ def main():
             'Default: 1GB'
     )
     parser.add_argument(
+        '-asmmb',
         '--auto_split_max_size_mb',
         type=int,
         default=None,
@@ -9386,6 +9433,7 @@ def main():
         flatbuffer_direct_output_torchscript=args.flatbuffer_direct_output_torchscript,
         flatbuffer_direct_output_dynamo_onnx=args.flatbuffer_direct_output_dynamo_onnx,
         flatbuffer_direct_output_exported_program=args.flatbuffer_direct_output_exported_program,
+        native_pytorch_generation_timeout_sec=args.native_pytorch_generation_timeout_sec,
         flatbuffer_direct_allow_custom_ops=args.flatbuffer_direct_allow_custom_ops,
         flatbuffer_direct_custom_op_allowlist=flatbuffer_direct_custom_op_allowlist,
         tflite_split_max_bytes=args.tflite_split_max_bytes,

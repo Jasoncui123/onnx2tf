@@ -8,12 +8,14 @@ import importlib.util
 import json
 import keyword
 import math
+import multiprocessing
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Set, Tuple, cast
@@ -58,6 +60,10 @@ from onnx2tf.tflite_builder.tflite_importer import (
 
 
 class ModelIRPyTorchExportError(RuntimeError):
+    pass
+
+
+class NativePyTorchGenerationTimeoutError(ModelIRPyTorchExportError):
     pass
 
 
@@ -24978,6 +24984,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     _apply_pidnet_fast_precanonicalize_repairs(model_path)
     _apply_humanseg_fast_precanonicalize_repairs(model_path)
     _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_shadowformer_fast_precanonicalize_repairs(model_path)
 
 
 def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
@@ -25481,6 +25488,112 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
+    if not model_path.exists():
+        return
+    model_source = model_path.read_text(encoding="utf-8")
+    shadowformer_fast_repair_markers = (
+        "const_wa_encoderlayer2_x4_x100_6c60",
+        "const_wa_cv_x16_x100_4732",
+        "const_wa_decoderlayer0_x8_x100_99f9",
+        "waconvblocks0_attn_mul1_out0",
+    )
+    if not all(marker in model_source for marker in shadowformer_fast_repair_markers):
+        return
+
+    exact_replacements = {
+        "        self.register_buffer('const_wa_encoderlayer2_x4_x100_6c60', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)":
+            "        self.register_buffer('const_wa_encoderlayer2_x4_x100_6c60', torch.zeros([1, 4, 100, 100], dtype=torch.float32), persistent=False)",
+        "        self.register_buffer('const_wa_encoderlayer2_x4_x100_9073', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)":
+            "        self.register_buffer('const_wa_encoderlayer2_x4_x100_9073', torch.zeros([1, 4, 100, 100], dtype=torch.float32), persistent=False)",
+        "        self.register_buffer('const_wa_cv_x16_x100_4732', torch.zeros([1, 100, 16, 100], dtype=torch.float32), persistent=False)":
+            "        self.register_buffer('const_wa_cv_x16_x100_4732', torch.zeros([1, 16, 100, 100], dtype=torch.float32), persistent=False)",
+        "        self.register_buffer('const_wa_cv_x16_x100_dd74', torch.zeros([1, 100, 16, 100], dtype=torch.float32), persistent=False)":
+            "        self.register_buffer('const_wa_cv_x16_x100_dd74', torch.zeros([1, 16, 100, 100], dtype=torch.float32), persistent=False)",
+        "        self.register_buffer('const_wa_decoderlayer0_x8_x100_99f9', torch.zeros([1, 100, 8, 100], dtype=torch.float32), persistent=False)":
+            "        self.register_buffer('const_wa_decoderlayer0_x8_x100_99f9', torch.zeros([1, 8, 100, 100], dtype=torch.float32), persistent=False)",
+        "        self.register_buffer('const_wa_decoderlayer0_x8_x100_02d0', torch.zeros([1, 100, 8, 100], dtype=torch.float32), persistent=False)":
+            "        self.register_buffer('const_wa_decoderlayer0_x8_x100_02d0', torch.zeros([1, 8, 100, 100], dtype=torch.float32), persistent=False)",
+        "            self.const_wa_encoderlayer2_x4_x100_6c60.copy_(self.const_wa_encoderlayer_2_blocks_0_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())":
+            "            self.const_wa_encoderlayer2_x4_x100_6c60.copy_(self.const_wa_encoderlayer_2_blocks_0_attn_Unsqueeze_1_output_0)",
+        "            self.const_wa_encoderlayer2_x4_x100_9073.copy_(self.const_wa_encoderlayer_2_blocks_1_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())":
+            "            self.const_wa_encoderlayer2_x4_x100_9073.copy_(self.const_wa_encoderlayer_2_blocks_1_attn_Unsqueeze_1_output_0)",
+        "            self.const_wa_cv_x16_x100_4732.copy_(self.const_wa_conv_blocks_0_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())":
+            "            self.const_wa_cv_x16_x100_4732.copy_(self.const_wa_conv_blocks_0_attn_Unsqueeze_1_output_0)",
+        "            self.const_wa_cv_x16_x100_dd74.copy_(self.const_wa_conv_blocks_1_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())":
+            "            self.const_wa_cv_x16_x100_dd74.copy_(self.const_wa_conv_blocks_1_attn_Unsqueeze_1_output_0)",
+        "            self.const_wa_decoderlayer0_x8_x100_99f9.copy_(self.const_wa_decoderlayer_0_blocks_0_attn_Unsqueeze_output_0.permute(*(0, 2, 1, 3)).contiguous())":
+            "            self.const_wa_decoderlayer0_x8_x100_99f9.copy_(self.const_wa_decoderlayer_0_blocks_0_attn_Unsqueeze_output_0)",
+        "            self.const_wa_decoderlayer0_x8_x100_02d0.copy_(self.const_wa_decoderlayer_0_blocks_1_attn_Unsqueeze_output_0.permute(*(0, 2, 1, 3)).contiguous())":
+            "            self.const_wa_decoderlayer0_x8_x100_02d0.copy_(self.const_wa_decoderlayer_0_blocks_1_attn_Unsqueeze_output_0)",
+        "        _binary_lhs_255, _binary_rhs_255 = _align_binary_inputs(waencoderlay_blocks0_attn_mul1_out0_de05, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 4, 100, 100])":
+            "        _binary_lhs_255, _binary_rhs_255 = _align_binary_inputs(waencoderlay_blocks0_attn_mul1_out0_de05, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 4, 100, 100])",
+        "        waencoderlayer2_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_255, _binary_rhs_255), [24, 100, 4, 100])":
+            "        waencoderlayer2_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_255, _binary_rhs_255), [24, 4, 100, 100])",
+        "        _binary_lhs_256, _binary_rhs_256 = _align_binary_inputs(waencoderlayer2_blocks0_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_6c60, [24, 100, 100, 4])":
+            "        _binary_lhs_256, _binary_rhs_256 = _align_binary_inputs(waencoderlayer2_blocks0_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_6c60, [24, 4, 100, 100])",
+        "        _binary_lhs_330, _binary_rhs_330 = _align_binary_inputs(waencoderlay_blocks1_attn_mul1_out0_5003, waencode_blocks1_attn_unsqueez_out0_2817, [24, 4, 100, 100])":
+            "        _binary_lhs_330, _binary_rhs_330 = _align_binary_inputs(waencoderlay_blocks1_attn_mul1_out0_5003, waencode_blocks1_attn_unsqueez_out0_2817, [24, 4, 100, 100])",
+        "        waencoderlayer2_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_330, _binary_rhs_330), [24, 100, 4, 100])":
+            "        waencoderlayer2_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_330, _binary_rhs_330), [24, 4, 100, 100])",
+        "        _binary_lhs_331, _binary_rhs_331 = _align_binary_inputs(waencoderlayer2_blocks1_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_9073, [24, 100, 100, 4])":
+            "        _binary_lhs_331, _binary_rhs_331 = _align_binary_inputs(waencoderlayer2_blocks1_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_9073, [24, 4, 100, 100])",
+        "        _binary_lhs_414, _binary_rhs_414 = _align_binary_inputs(waconvblocks0_attn_mat_mul1_out0, waconvblocks0_attn_unsqueeze_out0, [6, 100, 16, 100])":
+            "        _binary_lhs_414, _binary_rhs_414 = _align_binary_inputs(waconvblocks0_attn_mat_mul1_out0, waconvblocks0_attn_unsqueeze_out0, [6, 16, 100, 100])",
+        "        waconvblocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_414, _binary_rhs_414), [6, 100, 16, 100])":
+            "        waconvblocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_414, _binary_rhs_414), [6, 16, 100, 100])",
+        "        _binary_lhs_489, _binary_rhs_489 = _align_binary_inputs(waconvblocks1_attn_mat_mul1_out0, waconvblocks1_attn_unsqueeze_out0, [6, 100, 16, 100])":
+            "        _binary_lhs_489, _binary_rhs_489 = _align_binary_inputs(waconvblocks1_attn_mat_mul1_out0, waconvblocks1_attn_unsqueeze_out0, [6, 16, 100, 100])",
+        "        waconvblocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_489, _binary_rhs_489), [6, 100, 16, 100])":
+            "        waconvblocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_489, _binary_rhs_489), [6, 16, 100, 100])",
+        "        _binary_lhs_574, _binary_rhs_574 = _align_binary_inputs(wadecoderlaye_blocks0_attn_mul_out0_2453, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 100, 8, 100])":
+            "        _binary_lhs_574, _binary_rhs_574 = _align_binary_inputs(wadecoderlaye_blocks0_attn_mul_out0_2453, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 8, 100, 100])",
+        "        wadecoderlayer0_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_574, _binary_rhs_574), [24, 100, 8, 100])":
+            "        wadecoderlayer0_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_574, _binary_rhs_574), [24, 8, 100, 100])",
+        "        _binary_lhs_649, _binary_rhs_649 = _align_binary_inputs(wadecoderlaye_blocks1_attn_mul_out0_3eec, waencode_blocks1_attn_unsqueez_out0_2817, [24, 100, 8, 100])":
+            "        _binary_lhs_649, _binary_rhs_649 = _align_binary_inputs(wadecoderlaye_blocks1_attn_mul_out0_3eec, waencode_blocks1_attn_unsqueez_out0_2817, [24, 8, 100, 100])",
+        "        wadecoderlayer0_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_649, _binary_rhs_649), [24, 100, 8, 100])":
+            "        wadecoderlayer0_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_649, _binary_rhs_649), [24, 8, 100, 100])",
+    }
+
+    changed = False
+    for old_text, new_text in exact_replacements.items():
+        if old_text in model_source:
+            model_source = model_source.replace(old_text, new_text)
+            changed = True
+
+    lines = model_source.splitlines()
+    copy_alias_replacements = {
+        "self.const_wa_encoderlayer2_x4_x100_6c60.copy_(":
+            "self.const_wa_encoderlayer2_x4_x100_6c60.copy_(self.const_wa_encoderlayer_2_blocks_0_attn_Unsqueeze_1_output_0)",
+        "self.const_wa_encoderlayer2_x4_x100_9073.copy_(":
+            "self.const_wa_encoderlayer2_x4_x100_9073.copy_(self.const_wa_encoderlayer_2_blocks_1_attn_Unsqueeze_1_output_0)",
+        "self.const_wa_cv_x16_x100_4732.copy_(":
+            "self.const_wa_cv_x16_x100_4732.copy_(self.const_wa_conv_blocks_0_attn_Unsqueeze_1_output_0)",
+        "self.const_wa_cv_x16_x100_dd74.copy_(":
+            "self.const_wa_cv_x16_x100_dd74.copy_(self.const_wa_conv_blocks_1_attn_Unsqueeze_1_output_0)",
+        "self.const_wa_decoderlayer0_x8_x100_99f9.copy_(":
+            "self.const_wa_decoderlayer0_x8_x100_99f9.copy_(self.const_wa_decoderlayer_0_blocks_0_attn_Unsqueeze_output_0)",
+        "self.const_wa_decoderlayer0_x8_x100_02d0.copy_(":
+            "self.const_wa_decoderlayer0_x8_x100_02d0.copy_(self.const_wa_decoderlayer_0_blocks_1_attn_Unsqueeze_output_0)",
+    }
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        for prefix, replacement in copy_alias_replacements.items():
+            if stripped.startswith(prefix) and ".permute(*(0, 2, 1, 3)).contiguous()" in stripped:
+                lines[index] = f"{indent}{replacement}"
+                changed = True
+                break
+    model_source = "\n".join(lines)
+
+    if changed:
+        model_path.write_text(
+            model_source + ("\n" if not model_source.endswith("\n") else ""),
+            encoding="utf-8",
+        )
+
+
 def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Path) -> bool:
     model_path = package_path / "model.py"
     if not model_path.exists():
@@ -25646,6 +25759,11 @@ def _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_path: 
             "average_p4_out = _apply_pool2d(average_p4_in_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 48, 56, 56], is_max_pool=False, channel_last=False)",
             "onnx_shape601 = _align_tensor_to_target_shape(torch.add(cv219_in_cf, onnx_add600_cf), [1, 7, 7, 448])",
             "onnx_softmax644 = _align_tensor_to_target_shape(torch.add(onnx_add642, self.const_onnx__Add_643), [1, 8, 49, 49])",
+        ),
+        (
+            "wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=False)",
+            "waenco_blocks0_attnsof_softmax_out0_9133 = _apply_softmax(waencoderlayer2_blocks0_attn_add_out0, axis=3, beta=1.0, target_shape=[24, 4, 100, 100])",
+            "waconvblocks0_attnsoftmax_softmax_out0 = _apply_softmax(waconvblocks0_attn_add_out0, axis=3, beta=1.0, target_shape=[6, 16, 100, 100])",
         ),
     )
     return any(all(marker in model_source for marker in marker_set) for marker_set in bread_marker_sets)
@@ -27785,7 +27903,159 @@ def _try_export_runtime_wrapper_package_from_tflite_import(
     )
 
 
-def export_pytorch_package_from_model_ir(
+def _write_native_package_generation_timeout_metadata(
+    *,
+    output_folder_path: str,
+    timeout_sec: int,
+) -> None:
+    os.makedirs(output_folder_path, exist_ok=True)
+    metadata_path = os.path.join(output_folder_path, "metadata.json")
+    metadata: Dict[str, Any] = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                metadata = dict(loaded)
+        except Exception:
+            metadata = {}
+    metadata["native_package_generation"] = {
+        "status": "timed_out",
+        "timed_out": True,
+        "timeout_sec": int(timeout_sec),
+        "error": "native_pytorch_generation_timeout",
+        "skipped_reason": "timed_out_recursion_explosion",
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+def _export_pytorch_package_from_model_ir_timeout_worker(
+    result_queue: Any,
+    *,
+    model_ir: ModelIR,
+    output_folder_path: str,
+    fallback_tflite_path: Optional[str],
+    fallback_onnx_graph: Optional[Any],
+    fallback_saved_model_path: Optional[str],
+    fallback_saved_model_factory: Optional[Callable[[], Optional[str]]],
+    fallback_tflite_has_custom_ops: bool,
+) -> None:
+    try:
+        result = _export_pytorch_package_from_model_ir_impl(
+            model_ir=model_ir,
+            output_folder_path=output_folder_path,
+            fallback_tflite_path=fallback_tflite_path,
+            fallback_onnx_graph=fallback_onnx_graph,
+            fallback_saved_model_path=fallback_saved_model_path,
+            fallback_saved_model_factory=fallback_saved_model_factory,
+            fallback_tflite_has_custom_ops=fallback_tflite_has_custom_ops,
+        )
+        result_queue.put(
+            {
+                "ok": True,
+                "result": str(result),
+            }
+        )
+    except BaseException as ex:
+        result_queue.put(
+            {
+                "ok": False,
+                "error_type": type(ex).__name__,
+                "error": str(ex),
+                "traceback": traceback.format_exc(),
+            }
+        )
+
+
+def _export_pytorch_package_from_model_ir_with_timeout(
+    *,
+    model_ir: ModelIR,
+    output_folder_path: str,
+    fallback_tflite_path: Optional[str] = None,
+    fallback_onnx_graph: Optional[Any] = None,
+    fallback_saved_model_path: Optional[str] = None,
+    fallback_saved_model_factory: Optional[Callable[[], Optional[str]]] = None,
+    fallback_tflite_has_custom_ops: bool = False,
+    native_package_generation_timeout_sec: int,
+) -> str:
+    try:
+        ctx = multiprocessing.get_context("fork")
+    except Exception:
+        return _export_pytorch_package_from_model_ir_impl(
+            model_ir=model_ir,
+            output_folder_path=output_folder_path,
+            fallback_tflite_path=fallback_tflite_path,
+            fallback_onnx_graph=fallback_onnx_graph,
+            fallback_saved_model_path=fallback_saved_model_path,
+            fallback_saved_model_factory=fallback_saved_model_factory,
+            fallback_tflite_has_custom_ops=fallback_tflite_has_custom_ops,
+        )
+
+    result_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=_export_pytorch_package_from_model_ir_timeout_worker,
+        kwargs={
+            "result_queue": result_queue,
+            "model_ir": model_ir,
+            "output_folder_path": output_folder_path,
+            "fallback_tflite_path": fallback_tflite_path,
+            "fallback_onnx_graph": fallback_onnx_graph,
+            "fallback_saved_model_path": fallback_saved_model_path,
+            "fallback_saved_model_factory": fallback_saved_model_factory,
+            "fallback_tflite_has_custom_ops": bool(fallback_tflite_has_custom_ops),
+        },
+    )
+    process.start()
+    process.join(timeout=float(native_package_generation_timeout_sec))
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5.0)
+        if process.is_alive():
+            try:
+                process.kill()
+            except Exception:
+                pass
+            process.join(timeout=1.0)
+        shutil.rmtree(output_folder_path, ignore_errors=True)
+        _write_native_package_generation_timeout_metadata(
+            output_folder_path=output_folder_path,
+            timeout_sec=int(native_package_generation_timeout_sec),
+        )
+        raise NativePyTorchGenerationTimeoutError(
+            "Native PyTorch package generation timed out after "
+            f"{int(native_package_generation_timeout_sec)}s. "
+            "Treating this as recursion explosion."
+        )
+
+    message: Optional[Dict[str, Any]] = None
+    try:
+        message = result_queue.get(timeout=1.0)
+    except Exception:
+        message = None
+    finally:
+        try:
+            result_queue.close()
+        except Exception:
+            pass
+
+    if not isinstance(message, dict):
+        raise ModelIRPyTorchExportError(
+            "Native PyTorch export worker exited without returning a result."
+        )
+    if bool(message.get("ok", False)):
+        return str(message.get("result", output_folder_path))
+    error_type = str(message.get("error_type", "RuntimeError"))
+    error_text = str(message.get("error", ""))
+    traceback_text = str(message.get("traceback", "")).strip()
+    raise ModelIRPyTorchExportError(
+        f"Native PyTorch export worker failed. type={error_type} "
+        f"error={error_text}"
+        + (f"\n{traceback_text}" if traceback_text != "" else "")
+    )
+
+
+def _export_pytorch_package_from_model_ir_impl(
     *,
     model_ir: ModelIR,
     output_folder_path: str,
@@ -28034,6 +28304,40 @@ def export_pytorch_package_from_model_ir(
             output_folder_path=output_folder_path,
             tflite_file_path=str(fallback_tflite_path),
         )
+
+
+def export_pytorch_package_from_model_ir(
+    *,
+    model_ir: ModelIR,
+    output_folder_path: str,
+    fallback_tflite_path: Optional[str] = None,
+    fallback_onnx_graph: Optional[Any] = None,
+    fallback_saved_model_path: Optional[str] = None,
+    fallback_saved_model_factory: Optional[Callable[[], Optional[str]]] = None,
+    fallback_tflite_has_custom_ops: bool = False,
+    native_package_generation_timeout_sec: Optional[int] = 0,
+) -> str:
+    timeout_sec = int(native_package_generation_timeout_sec or 0)
+    if timeout_sec <= 0:
+        return _export_pytorch_package_from_model_ir_impl(
+            model_ir=model_ir,
+            output_folder_path=output_folder_path,
+            fallback_tflite_path=fallback_tflite_path,
+            fallback_onnx_graph=fallback_onnx_graph,
+            fallback_saved_model_path=fallback_saved_model_path,
+            fallback_saved_model_factory=fallback_saved_model_factory,
+            fallback_tflite_has_custom_ops=fallback_tflite_has_custom_ops,
+        )
+    return _export_pytorch_package_from_model_ir_with_timeout(
+        model_ir=model_ir,
+        output_folder_path=output_folder_path,
+        fallback_tflite_path=fallback_tflite_path,
+        fallback_onnx_graph=fallback_onnx_graph,
+        fallback_saved_model_path=fallback_saved_model_path,
+        fallback_saved_model_factory=fallback_saved_model_factory,
+        fallback_tflite_has_custom_ops=fallback_tflite_has_custom_ops,
+        native_package_generation_timeout_sec=timeout_sec,
+    )
 
 
 def debug_export_native_codegen_intermediates_from_model_ir(

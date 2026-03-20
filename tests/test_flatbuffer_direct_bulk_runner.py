@@ -1,0 +1,538 @@
+import json
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List
+
+from onnx2tf.utils import flatbuffer_direct_bulk_runner as bulk_runner
+from onnx2tf.utils.flatbuffer_direct_bulk_runner import (
+    run_flatbuffer_direct_bulk_verification,
+)
+
+
+def _write_dummy(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"dummy")
+
+
+def _write_accuracy_report(
+    *,
+    path: Path,
+    evaluation_pass: bool,
+) -> None:
+    payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "evaluation_pass": bool(evaluation_pass),
+        "overall_metrics": {
+            "max_abs": 0.0 if evaluation_pass else 1.0,
+            "rmse": 0.0 if evaluation_pass else 1.0,
+            "cosine_similarity": 1.0 if evaluation_pass else 0.0,
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_flatbuffer_direct_bulk_runner_preserves_sorted_discovery_order(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_b = tmp_path / "z_dir" / "b.onnx"
+    model_a = tmp_path / "a_dir" / "a.onnx"
+    _write_dummy(model_b)
+    _write_dummy(model_a)
+
+    calls: List[str] = []
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        model_path = str(cmd[cmd.index("-i") + 1])
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(model_path).stem
+        calls.append(model_path)
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    assert [entry["model_path"] for entry in state["entries"]] == sorted(
+        [str(model_a.resolve()), str(model_b.resolve())]
+    )
+    assert calls == sorted([str(model_a.resolve()), str(model_b.resolve())])
+
+
+def test_flatbuffer_direct_bulk_runner_skips_missing_models_cleanly(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    existing = tmp_path / "a.onnx"
+    missing = tmp_path / "missing.onnx"
+    _write_dummy(existing)
+
+    monkeypatch.setattr(
+        "onnx2tf.utils.flatbuffer_direct_bulk_runner._discover_onnx_models",
+        lambda _root_dir: [str(existing), str(missing)],
+    )
+
+    calls: List[str] = []
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        model_path = str(cmd[cmd.index("-i") + 1])
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(model_path).stem
+        calls.append(model_path)
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    assert [entry["classification"] for entry in state["entries"]] == ["pass", "missing_model"]
+    assert state["entries"][1]["strict_pass"] is False
+    assert calls == [str(existing)]
+
+
+def test_flatbuffer_direct_bulk_runner_resume_skips_completed_entries(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_a = tmp_path / "a.onnx"
+    model_b = tmp_path / "b.onnx"
+    _write_dummy(model_a)
+    _write_dummy(model_b)
+    output_dir = tmp_path / "out"
+
+    first_calls: List[str] = []
+
+    def _fake_run_first(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        model_path = str(cmd[cmd.index("-i") + 1])
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(model_path).stem
+        first_calls.append(model_path)
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run_first)
+    first_state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(output_dir),
+    )
+    assert len(first_state["entries"]) == 2
+    assert len(first_calls) == 2
+
+    second_calls: List[str] = []
+
+    def _fake_run_second(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        second_calls.append("called")
+        return type("CP", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run_second)
+    second_state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(output_dir),
+        resume=True,
+    )
+    assert len(second_state["entries"]) == 2
+    assert second_calls == []
+
+
+def test_flatbuffer_direct_bulk_runner_marks_pass_only_when_both_reports_pass(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "ok.onnx"
+    _write_dummy(model)
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(cmd[cmd.index("-i") + 1]).stem
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    entry = state["entries"][0]
+    assert entry["classification"] == "pass"
+    assert entry["strict_pass"] is True
+
+
+def test_flatbuffer_direct_bulk_runner_marks_tflite_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "tflite_fail.onnx"
+    _write_dummy(model)
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(cmd[cmd.index("-i") + 1]).stem
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=False,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    entry = state["entries"][0]
+    assert entry["classification"] == "tflite_fail"
+    assert entry["strict_pass"] is False
+
+
+def test_flatbuffer_direct_bulk_runner_marks_pytorch_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "pytorch_fail.onnx"
+    _write_dummy(model)
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(cmd[cmd.index("-i") + 1]).stem
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=False,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    entry = state["entries"][0]
+    assert entry["classification"] == "pytorch_fail"
+    assert entry["strict_pass"] is False
+
+
+def test_flatbuffer_direct_bulk_runner_marks_both_failures(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "both_fail.onnx"
+    _write_dummy(model)
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(cmd[cmd.index("-i") + 1]).stem
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=False,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=False,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    entry = state["entries"][0]
+    assert entry["classification"] == "both_fail"
+    assert entry["strict_pass"] is False
+
+
+def test_flatbuffer_direct_bulk_runner_marks_missing_single_report(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "missing_report.onnx"
+    _write_dummy(model)
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(cmd[cmd.index("-i") + 1]).stem
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    entry = state["entries"][0]
+    assert entry["classification"] == "missing_pytorch_report"
+    assert entry["strict_pass"] is False
+
+
+def test_flatbuffer_direct_bulk_runner_marks_timeout(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "slow.onnx"
+    _write_dummy(model)
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+        timeout_sec=1,
+    )
+    entry = state["entries"][0]
+    assert entry["classification"] == "timeout"
+    assert entry["strict_pass"] is False
+
+
+def test_flatbuffer_direct_bulk_runner_marks_conversion_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "error.onnx"
+    _write_dummy(model)
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        return type("CP", (), {"returncode": 1, "stdout": "", "stderr": "failed"})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    entry = state["entries"][0]
+    assert entry["classification"] == "conversion_error"
+    assert entry["strict_pass"] is False
+
+
+def test_flatbuffer_direct_bulk_runner_passes_native_pytorch_generation_timeout(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "ok.onnx"
+    _write_dummy(model)
+    seen_cmds: List[List[str]] = []
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        seen_cmds.append(list(cmd))
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(cmd[cmd.index("-i") + 1]).stem
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+        native_pytorch_generation_timeout_sec=37,
+    )
+    assert len(seen_cmds) == 1
+    assert "--native_pytorch_generation_timeout_sec" in seen_cmds[0]
+    timeout_index = seen_cmds[0].index("--native_pytorch_generation_timeout_sec")
+    assert seen_cmds[0][timeout_index + 1] == "37"
+
+
+def test_flatbuffer_direct_bulk_runner_updates_tqdm_progress(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_a = tmp_path / "a.onnx"
+    model_b = tmp_path / "b.onnx"
+    _write_dummy(model_a)
+    _write_dummy(model_b)
+
+    class _FakeProgressBar:
+        def __init__(self) -> None:
+            self.postfixes: List[str] = []
+            self.updates: List[int] = []
+            self.closed = False
+
+        def set_postfix_str(self, text, refresh=True):
+            self.postfixes.append(str(text))
+
+        def update(self, value):
+            self.updates.append(int(value))
+
+        def close(self):
+            self.closed = True
+
+    created_progress_bars: List[_FakeProgressBar] = []
+
+    def _fake_create_progress_bar(*, total, initial=0, desc):
+        assert total == 2
+        assert initial == 0
+        assert desc == "flatbuffer_direct bulk"
+        bar = _FakeProgressBar()
+        created_progress_bars.append(bar)
+        return bar
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(cmd[cmd.index("-i") + 1]).stem
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(
+        "onnx2tf.utils.flatbuffer_direct_bulk_runner._create_progress_bar",
+        _fake_create_progress_bar,
+    )
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    assert len(created_progress_bars) == 1
+    assert created_progress_bars[0].updates == [1, 1]
+    assert created_progress_bars[0].closed is True
+    assert created_progress_bars[0].postfixes[-1].endswith("[pass]")
+
+
+def test_flatbuffer_direct_bulk_runner_starts_spinner_while_running(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model = tmp_path / "spin.onnx"
+    _write_dummy(model)
+
+    class _FakeSpinner:
+        instances: List["_FakeSpinner"] = []
+
+        def __init__(self, progress_bar) -> None:
+            self.progress_bar = progress_bar
+            self.contexts: List[tuple[str, str]] = []
+            self.starts = 0
+            self.stops = 0
+            _FakeSpinner.instances.append(self)
+
+        def set_context(self, *, model_name: str, status: str = "running") -> None:
+            self.contexts.append((str(model_name), str(status)))
+
+        def start(self) -> None:
+            self.starts += 1
+
+        def stop(self) -> None:
+            self.stops += 1
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        stem = Path(cmd[cmd.index("-i") + 1]).stem
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        _write_accuracy_report(
+            path=artifact_dir / f"{stem}_pytorch_accuracy_report.json",
+            evaluation_pass=True,
+        )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(bulk_runner, "_ProgressSpinner", _FakeSpinner)
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    assert len(_FakeSpinner.instances) == 1
+    spinner = _FakeSpinner.instances[0]
+    assert spinner.contexts == [("spin.onnx", "running")]
+    assert spinner.starts == 1
+    assert spinner.stops >= 2
+
+
+def test_flatbuffer_direct_bulk_runner_summary_lists_failed_models_only(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    ok_model = tmp_path / "ok.onnx"
+    fail_model = tmp_path / "fail.onnx"
+    _write_dummy(ok_model)
+    _write_dummy(fail_model)
+
+    def _fake_run(cmd, cwd=None, stdout=None, stderr=None, text=None, timeout=None):
+        model_path = Path(cmd[cmd.index("-i") + 1])
+        artifact_dir = Path(cmd[cmd.index("-o") + 1])
+        if model_path.stem == "ok":
+            _write_accuracy_report(
+                path=artifact_dir / "ok_accuracy_report.json",
+                evaluation_pass=True,
+            )
+            _write_accuracy_report(
+                path=artifact_dir / "ok_pytorch_accuracy_report.json",
+                evaluation_pass=True,
+            )
+        else:
+            _write_accuracy_report(
+                path=artifact_dir / "fail_accuracy_report.json",
+                evaluation_pass=False,
+            )
+            _write_accuracy_report(
+                path=artifact_dir / "fail_pytorch_accuracy_report.json",
+                evaluation_pass=True,
+            )
+        return type("CP", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    state = run_flatbuffer_direct_bulk_verification(
+        root_dir=str(tmp_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    failed_models = state["summary"]["failed_models"]
+    assert len(failed_models) == 1
+    assert failed_models[0]["model"] == "fail.onnx"
+    assert failed_models[0]["classification"] == "tflite_fail"

@@ -24,6 +24,8 @@ tmp_*/
 tflite2sm_*/
 *pytorch_test*/
 *pytorch_bulk*/
+partial_onnx*/
+flatbuffer_direct_bulk_report*/
 
 .act.secrets
 .act.env

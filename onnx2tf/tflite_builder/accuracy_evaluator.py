@@ -1303,19 +1303,21 @@ class _MetricAccumulator:
         }
 
 
+_PYTORCH_ALIGNED_METRIC_THRESHOLDS = {
+    "max_abs": 5.0e-2,
+    "mean_abs": 5.0e-3,
+    "rmse": 6.0e-3,
+    "cosine_similarity": 0.9990,
+}
+
+
 _FLOAT_METRIC_THRESHOLDS = {
-    "max_abs": 1.0e-4,
-    "mean_abs": 1.0e-5,
-    "rmse": 1.0e-5,
-    "cosine_similarity": 0.9999,
+    **_PYTORCH_ALIGNED_METRIC_THRESHOLDS,
 }
 
 
 _QUANT_METRIC_THRESHOLDS = {
-    "max_abs": 5.0e-2,
-    "mean_abs": 1.0e-2,
-    "rmse": 2.0e-2,
-    "cosine_similarity": 0.98,
+    **_PYTORCH_ALIGNED_METRIC_THRESHOLDS,
 }
 
 

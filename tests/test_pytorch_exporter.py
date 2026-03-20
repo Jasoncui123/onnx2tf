@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import time
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -42,6 +43,7 @@ from onnx2tf.tflite_builder.pytorch_accuracy_evaluator import (
 )
 from onnx2tf.tflite_builder.pytorch_exporter import (
     ModelIRPyTorchExportError,
+    NativePyTorchGenerationTimeoutError,
     _apply_fast_precanonicalize_repairs,
     _build_metadata_payload,
     _build_tensor_var_name_map,
@@ -49,6 +51,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _canonicalize_generated_model_source_for_raw_export,
     _conv2d_input_pre_permute_for_codegen,
     _conv2d_same_pad_padding_arg_for_codegen,
+    _export_pytorch_package_from_model_ir_impl,
     _export_runtime_wrapper_package_from_model_ir,
     _fold_inverse_permute_round_trips_in_exported_program_archive,
     _fold_channel_first_hardsigmoid_gate_conv_bridges,
@@ -1851,6 +1854,95 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_current_channel_l
     )
 
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_package(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_fast_canon_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, wa_max_p_out, waencoderlayer2_blocks0_attn_add_out0, waconvblocks0_attn_add_out0):",
+                "        wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=False)",
+                "        waenco_blocks0_attnsof_softmax_out0_9133 = _apply_softmax(waencoderlayer2_blocks0_attn_add_out0, axis=3, beta=1.0, target_shape=[24, 4, 100, 100])",
+                "        waconvblocks0_attnsoftmax_softmax_out0 = _apply_softmax(waconvblocks0_attn_add_out0, axis=3, beta=1.0, target_shape=[6, 16, 100, 100])",
+                "        return wa_max_p1_out_nhwc",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_wa_encoderlayer2_x4_x100_6c60', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('const_wa_encoderlayer2_x4_x100_9073', torch.zeros([1, 100, 4, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('const_wa_cv_x16_x100_4732', torch.zeros([1, 100, 16, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('const_wa_cv_x16_x100_dd74', torch.zeros([1, 100, 16, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('const_wa_decoderlayer0_x8_x100_99f9', torch.zeros([1, 100, 8, 100], dtype=torch.float32), persistent=False)",
+                "        self.register_buffer('const_wa_decoderlayer0_x8_x100_02d0', torch.zeros([1, 100, 8, 100], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.const_wa_encoderlayer2_x4_x100_6c60.copy_(self.const_wa_encoderlayer_2_blocks_0_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.const_wa_encoderlayer2_x4_x100_9073.copy_(self.const_wa_encoderlayer_2_blocks_1_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.const_wa_cv_x16_x100_4732.copy_(self.const_wa_conv_blocks_0_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.const_wa_cv_x16_x100_dd74.copy_(self.const_wa_conv_blocks_1_attn_Unsqueeze_1_output_0.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.const_wa_decoderlayer0_x8_x100_99f9.copy_(self.const_wa_decoderlayer_0_blocks_0_attn_Unsqueeze_output_0.permute(*(0, 2, 1, 3)).contiguous())",
+                "        self.const_wa_decoderlayer0_x8_x100_02d0.copy_(self.const_wa_decoderlayer_0_blocks_1_attn_Unsqueeze_output_0.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, waencoderlay_blocks0_attn_mul1_out0_de05, waencode_blocks0_attn_unsqueez_out0_01b4, waencoderlay_blocks1_attn_mul1_out0_5003, waencode_blocks1_attn_unsqueez_out0_2817, waconvblocks0_attn_mat_mul1_out0, waconvblocks0_attn_unsqueeze_out0, waconvblocks1_attn_mat_mul1_out0, waconvblocks1_attn_unsqueeze_out0, wadecoderlaye_blocks0_attn_mul_out0_2453, wadecoderlaye_blocks1_attn_mul_out0_3eec):",
+                "        _binary_lhs_255, _binary_rhs_255 = _align_binary_inputs(waencoderlay_blocks0_attn_mul1_out0_de05, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 4, 100, 100])",
+                "        waencoderlayer2_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_255, _binary_rhs_255), [24, 100, 4, 100])",
+                "        _binary_lhs_256, _binary_rhs_256 = _align_binary_inputs(waencoderlayer2_blocks0_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_6c60, [24, 100, 100, 4])",
+                "        _binary_lhs_330, _binary_rhs_330 = _align_binary_inputs(waencoderlay_blocks1_attn_mul1_out0_5003, waencode_blocks1_attn_unsqueez_out0_2817, [24, 4, 100, 100])",
+                "        waencoderlayer2_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_330, _binary_rhs_330), [24, 100, 4, 100])",
+                "        _binary_lhs_331, _binary_rhs_331 = _align_binary_inputs(waencoderlayer2_blocks1_attn_mul1_out0, self.const_wa_encoderlayer2_x4_x100_9073, [24, 100, 100, 4])",
+                "        _binary_lhs_414, _binary_rhs_414 = _align_binary_inputs(waconvblocks0_attn_mat_mul1_out0, waconvblocks0_attn_unsqueeze_out0, [6, 100, 16, 100])",
+                "        waconvblocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_414, _binary_rhs_414), [6, 100, 16, 100])",
+                "        _binary_lhs_489, _binary_rhs_489 = _align_binary_inputs(waconvblocks1_attn_mat_mul1_out0, waconvblocks1_attn_unsqueeze_out0, [6, 100, 16, 100])",
+                "        waconvblocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_489, _binary_rhs_489), [6, 100, 16, 100])",
+                "        _binary_lhs_574, _binary_rhs_574 = _align_binary_inputs(wadecoderlaye_blocks0_attn_mul_out0_2453, waencode_blocks0_attn_unsqueez_out0_01b4, [24, 100, 8, 100])",
+                "        wadecoderlayer0_blocks0_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_574, _binary_rhs_574), [24, 100, 8, 100])",
+                "        _binary_lhs_649, _binary_rhs_649 = _align_binary_inputs(wadecoderlaye_blocks1_attn_mul_out0_3eec, waencode_blocks1_attn_unsqueez_out0_2817, [24, 100, 8, 100])",
+                "        wadecoderlayer0_blocks1_attn_mul1_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_649, _binary_rhs_649), [24, 100, 8, 100])",
+                "        return waconvblocks0_attn_mul1_out0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "torch.zeros([1, 4, 100, 100]" in repaired
+    assert "torch.zeros([1, 8, 100, 100]" in repaired
+    assert "torch.zeros([1, 16, 100, 100]" in repaired
+    assert ".permute(*(0, 2, 1, 3)).contiguous()" not in repaired
+    assert "[24, 100, 4, 100]" not in repaired
+    assert "[24, 100, 8, 100]" not in repaired
+    assert "[24, 100, 100, 4]" not in repaired
+    assert "[6, 100, 16, 100]" not in repaired
+    assert "[24, 4, 100, 100]" in repaired
+    assert "[24, 8, 100, 100]" in repaired
+    assert "[6, 16, 100, 100]" in repaired
 
 
 def test_should_skip_expensive_raw_canonicalize_for_bread_after_fast_canonical_form(
@@ -12101,6 +12193,64 @@ def test_export_pytorch_package_nhwc_same_conv_concat_supports_dynamo_and_export
     assert Path(dynamo_onnx_path).exists()
     assert exported_program_path is not None
     assert Path(exported_program_path).exists()
+
+
+def test_export_pytorch_package_from_model_ir_timeout_raises_and_writes_metadata(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_ir = ModelIR(name="timeout_model")
+    output_dir = tmp_path / "pkg"
+
+    def _fake_impl(**kwargs):
+        time.sleep(2.0)
+        return str(kwargs["output_folder_path"])
+
+    monkeypatch.setattr(
+        "onnx2tf.tflite_builder.pytorch_exporter._export_pytorch_package_from_model_ir_impl",
+        _fake_impl,
+    )
+
+    with pytest.raises(NativePyTorchGenerationTimeoutError):
+        export_pytorch_package_from_model_ir(
+            model_ir=model_ir,
+            output_folder_path=str(output_dir),
+            native_package_generation_timeout_sec=1,
+        )
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    timeout_entry = metadata["native_package_generation"]
+    assert timeout_entry["timed_out"] is True
+    assert timeout_entry["timeout_sec"] == 1
+    assert timeout_entry["skipped_reason"] == "timed_out_recursion_explosion"
+
+
+def test_export_pytorch_package_from_model_ir_timeout_delegates_to_impl_when_fast(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_ir = ModelIR(name="ok_model")
+    output_dir = tmp_path / "pkg"
+
+    def _fake_impl(**kwargs):
+        os.makedirs(kwargs["output_folder_path"], exist_ok=True)
+        (Path(kwargs["output_folder_path"]) / "metadata.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        return str(kwargs["output_folder_path"])
+
+    monkeypatch.setattr(
+        "onnx2tf.tflite_builder.pytorch_exporter._export_pytorch_package_from_model_ir_impl",
+        _fake_impl,
+    )
+
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=model_ir,
+        output_folder_path=str(output_dir),
+        native_package_generation_timeout_sec=5,
+    )
+    assert package_path == str(output_dir)
 
 
 def test_export_pytorch_package_nhwc_same_depthwise_conv_preserves_spatial_padding_axes(tmp_path) -> None:

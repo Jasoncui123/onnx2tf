@@ -352,6 +352,9 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
     )
     shape_hints = kwargs.get("shape_hints", None)
     test_data_nhwc_path = kwargs.get("test_data_nhwc_path", None)
+    native_pytorch_generation_timeout_sec = int(
+        kwargs.get("native_pytorch_generation_timeout_sec", 0) or 0
+    )
     output_nms_with_argmax = bool(kwargs.get("output_nms_with_argmax", False))
     switch_nms_version = str(kwargs.get("switch_nms_version", "v4")).strip().lower()
     if switch_nms_version not in {"v4", "v5"}:
@@ -855,6 +858,7 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                     custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
                     shape_hints=shape_hints,
                     test_data_nhwc_path=test_data_nhwc_path,
+                    native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
                 )
                 split_pytorch_package_dirs = split_pytorch_outputs["split_pytorch_package_dirs"]
                 split_pytorch_torchscript_paths = split_pytorch_outputs.get(
@@ -871,6 +875,7 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                 )
             else:
                 from onnx2tf.tflite_builder.pytorch_exporter import (
+                    NativePyTorchGenerationTimeoutError,
                     export_dynamo_onnx_from_generated_package,
                     export_exported_program_from_generated_package,
                     export_pytorch_package_from_model_ir,
@@ -901,16 +906,21 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                         else None
                     )
 
-                pytorch_package_path = export_pytorch_package_from_model_ir(
-                    model_ir=model_ir_fp32,
-                    output_folder_path=pytorch_output_folder_path,
-                    fallback_tflite_path=float32_path,
-                    fallback_onnx_graph=onnx_graph,
-                    fallback_saved_model_path=fallback_saved_model_path,
-                    fallback_saved_model_factory=_ensure_pytorch_saved_model_bridge,
-                    fallback_tflite_has_custom_ops=bool(len(custom_ops_used) > 0),
-                )
-                if output_torchscript_from_model_ir:
+                try:
+                    pytorch_package_path = export_pytorch_package_from_model_ir(
+                        model_ir=model_ir_fp32,
+                        output_folder_path=pytorch_output_folder_path,
+                        fallback_tflite_path=float32_path,
+                        fallback_onnx_graph=onnx_graph,
+                        fallback_saved_model_path=fallback_saved_model_path,
+                        fallback_saved_model_factory=_ensure_pytorch_saved_model_bridge,
+                        fallback_tflite_has_custom_ops=bool(len(custom_ops_used) > 0),
+                        native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
+                    )
+                except NativePyTorchGenerationTimeoutError as ex:
+                    pytorch_package_path = None
+                    warn(str(ex))
+                if pytorch_package_path is not None and output_torchscript_from_model_ir:
                     pytorch_torchscript_path = export_torchscript_from_generated_package(
                         package_dir=str(pytorch_package_path),
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
@@ -918,7 +928,7 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                         test_data_nhwc_path=test_data_nhwc_path,
                         raise_on_failure=False,
                     )
-                if output_dynamo_onnx_from_model_ir:
+                if pytorch_package_path is not None and output_dynamo_onnx_from_model_ir:
                     pytorch_dynamo_onnx_path = export_dynamo_onnx_from_generated_package(
                         package_dir=str(pytorch_package_path),
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
@@ -926,7 +936,7 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                         test_data_nhwc_path=test_data_nhwc_path,
                         raise_on_failure=False,
                     )
-                if output_exported_program_from_model_ir:
+                if pytorch_package_path is not None and output_exported_program_from_model_ir:
                     pytorch_exported_program_path = export_exported_program_from_generated_package(
                         package_dir=str(pytorch_package_path),
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,

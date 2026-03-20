@@ -2166,6 +2166,7 @@ usage: onnx2tf
 [-cind INPUT_NAME NUMPY_FILE_PATH MEAN STD]
 [-iqd {int8,uint8,float32}]
 [-oqd {int8,uint8,float32}]
+[-npgts NATIVE_PYTORCH_GENERATION_TIMEOUT_SEC]
 [-nuo]
 [-nuonag]
 [-b BATCH_SIZE]
@@ -2414,6 +2415,13 @@ optional arguments:
   -oqd {int8,uint8,float32}, --output_quant_dtype {int8,uint8,float32}
     Output dtypes when doing Full INT8 Quantization.
     "int8"(default) or "uint8" or "float32"
+
+  -npgts NATIVE_PYTORCH_GENERATION_TIMEOUT_SEC, --native_pytorch_generation_timeout_sec NATIVE_PYTORCH_GENERATION_TIMEOUT_SEC
+    Timeout in seconds for generated native PyTorch package creation.
+    When exceeded, onnx2tf treats the generation as a recursion explosion,
+    aborts native PyTorch generation for the current model, and continues
+    conversion without PyTorch artifacts for that model.
+    `0` disables this timeout.
 
   -nuo, --not_use_onnxsim
     No optimization by onnx-simplifier is performed.
@@ -2880,6 +2888,7 @@ convert(
   flatbuffer_direct_output_torchscript: Optional[bool] = False,
   flatbuffer_direct_output_dynamo_onnx: Optional[bool] = False,
   flatbuffer_direct_output_exported_program: Optional[bool] = False,
+  native_pytorch_generation_timeout_sec: Optional[int] = 0,
   tflite_backend: Optional[str] = 'tf_converter',
   quant_norm_mean: Optional[str] = '[[[[0.485, 0.456, 0.406]]]]',
   quant_norm_std: Optional[str] = '[[[[0.229, 0.224, 0.225]]]]',
@@ -3087,6 +3096,13 @@ convert(
       Recommended: `shape_hints`
       Also accepted: `test_data_nhwc_path` for eligible 4D RGB inputs, or
       `custom_input_op_name_np_data_path` for per-input custom example data.
+
+    native_pytorch_generation_timeout_sec: Optional[int]
+      Timeout in seconds for generated native PyTorch package creation.
+      When exceeded, onnx2tf treats the generation as a recursion explosion,
+      aborts native PyTorch generation for the current model, and continues
+      conversion without PyTorch artifacts for that model.
+      `0` disables this timeout.
 
     quant_norm_mean: Optional[str]
         Normalized average value during quantization.
