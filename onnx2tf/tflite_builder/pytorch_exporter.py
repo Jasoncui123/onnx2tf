@@ -24313,10 +24313,25 @@ def _canonicalize_generated_model_source_for_raw_export(
         pidnet_spp_scale4_mul_reshape_variant_match = pidnet_spp_scale4_mul_reshape_variant_re.match(line)
         if pidnet_spp_scale4_mul_reshape_variant_match is None:
             continue
+        preferred_channels = _infer_cf_channel_count(
+            str(pidnet_spp_scale4_mul_reshape_variant_match.group("input"))
+        )
+        if preferred_channels is None:
+            recent_shape = _find_recent_rank4_shape(
+                str(pidnet_spp_scale4_mul_reshape_variant_match.group("input")),
+                index,
+            )
+            if recent_shape is not None and len(recent_shape) == 4:
+                preferred_channels = int(recent_shape[1])
+        channel_count = (
+            int(preferred_channels)
+            if preferred_channels is not None
+            else int(pidnet_spp_scale4_mul_reshape_variant_match.group("c"))
+        )
         lines[index] = (
             f"{pidnet_spp_scale4_mul_reshape_variant_match.group('indent')}{pidnet_spp_scale4_mul_reshape_variant_match.group('lhs')} = "
             f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_match.group('input')}, "
-            f"torch.reshape(self.{pidnet_spp_scale4_mul_reshape_variant_match.group('const_attr')}, [1, 512, 1, 1])), [1, 512, 1, 1])"
+            f"torch.reshape(self.{pidnet_spp_scale4_mul_reshape_variant_match.group('const_attr')}, [1, {channel_count}, 1, 1])), [1, {channel_count}, 1, 1])"
         )
         changed = True
     finalized_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
