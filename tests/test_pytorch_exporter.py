@@ -1273,6 +1273,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
     _apply_alike_fast_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
+    stage7_prefix = "scores_stage7"
     assert "wadkd_cast5_out0: torch.Tensor, scores_map: torch.Tensor)" in rewritten
     assert "wadkd_cast5_out0, scores_map)" in rewritten
     assert "wadkd_equal_out0 = torch.eq(wadkd_max_p_in, wadkd_max_p_out)" in rewritten
@@ -1293,12 +1294,12 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
     assert "wadkd_expand23_out0 = torch.mul(_binary_lhs_191, _binary_rhs_191)" in rewritten
     assert "_binary_lhs_196, _binary_rhs_196 = wadkd_tr17_out0, wadkd_expand23_out0" in rewritten
     assert "wadkd_div3_out0 = torch.div(_binary_lhs_196, _binary_rhs_196)" in rewritten
-    assert "wadkd_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
-    assert "wadkd_shape_prefix_out0 = torch.ones([1], dtype=torch.int32, device=wadkd_shape13_out0.device)" in rewritten
+    assert f"{stage7_prefix}_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
+    assert f"{stage7_prefix}_shape_prefix_out0 = torch.ones([1], dtype=torch.int32, device={stage7_prefix}_shape0_out0.device)" in rewritten
     assert "self.const_inline_literal_5" not in rewritten
-    assert "wadkd_gather7_out0 = _reshape_gather_output(torch.index_select(wadkd_flatten_out0, 0, wadkd_gather7_out0_indices.to(dtype=torch.int64).reshape(-1)), wadkd_flatten_out0, _shape_tensor(wadkd_gather7_out0_indices, dtype=torch.int64, device=wadkd_gather7_out0_indices.device), axis=0)" in rewritten
-    assert "wadkd_mul30_out0 = torch.mul(wadkd_rs14_out0, wadkd_tr1_out0)" in rewritten
-    assert "wadkd_tr14_out0 = _torch_permute(wadkd_add12_out0, [0, 1, 3, 2])" in rewritten
+    assert f"{stage7_prefix}_gather0_out0 = _reshape_gather_output(torch.index_select({stage7_prefix}_flatten_out0, 0, {stage7_prefix}_gather0_indices.to(dtype=torch.int64).reshape(-1)), {stage7_prefix}_flatten_out0, _shape_tensor({stage7_prefix}_gather0_indices, dtype=torch.int64, device={stage7_prefix}_gather0_indices.device), axis=0)" in rewritten
+    assert f"{stage7_prefix}_mul0_out0 = torch.mul({stage7_prefix}_rs_fixed_0, wadkd_tr1_out0)" in rewritten
+    assert f"{stage7_prefix}_tr14_out0 = _torch_permute({stage7_prefix}_add2_out0, [0, 1, 3, 2])" in rewritten
     assert "_align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])" not in rewritten
 
 
@@ -1400,13 +1401,14 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_generic_n
     _apply_alike_fast_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
+    stage7_prefix = "scores_stage7"
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
     assert "score_cast, scores_map)" in rewritten
-    assert "wadkd_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
-    assert "wadkd_shape13_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
-    assert "wadkd_gather7_out0_wrapped_runtime = _align_tensor_to_target_shape(torch.add(add_a, _tensor_shape_list(wadkd_flatten_out0)[0]), _tensor_shape_list(add_a))" in rewritten
-    assert "wadkd_mul30_out0 = torch.mul(wadkd_rs14_out0, tr_a)" in rewritten
-    assert "wadkd_mul44_out0 = torch.mul(wadkd_tr14_out0, score_cast)" in rewritten
+    assert f"{stage7_prefix}_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
+    assert f"{stage7_prefix}_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
+    assert f"{stage7_prefix}_gather0_wrapped_runtime = _align_tensor_to_target_shape(torch.add(add_a, _tensor_shape_list({stage7_prefix}_flatten_out0)[0]), _tensor_shape_list(add_a))" in rewritten
+    assert f"{stage7_prefix}_mul0_out0 = torch.mul({stage7_prefix}_rs_fixed_0, tr_a)" in rewritten
+    assert f"{stage7_prefix}_mul44_out0 = torch.mul({stage7_prefix}_tr14_out0, score_cast)" in rewritten
     assert "_align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])" not in rewritten
 
 
