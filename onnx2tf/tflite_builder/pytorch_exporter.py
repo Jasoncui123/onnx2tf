@@ -27032,7 +27032,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?P<src>.+)\.permute\((?:\*\(0, 2, 1, 3\)|0, 2, 1, 3|\[0, 2, 1, 3\])\)(?:\.contiguous\(\))?\)$"
     )
     binary_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_\.]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+, [A-Za-z0-9_\.]+, \[)(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)(?P<suffix>\]\))$"
     )
     mul_align_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[)"
@@ -27549,7 +27549,7 @@ def _collect_shadowformer_fast_repair_facts(
         r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+)\)$"
     )
     binary_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\((?P<lhs>[A-Za-z0-9_\.]+), (?P<rhs>[A-Za-z0-9_\.]+), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+), (?P<rhs>[A-Za-z0-9_\.]+), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     mul_align_shape_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<batch>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
