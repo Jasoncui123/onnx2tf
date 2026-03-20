@@ -26004,6 +26004,63 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
 
+    def _pidnet_is_cf_like_name(name: str) -> bool:
+        if name.endswith("_cf") or name.endswith("_out_cf"):
+            return True
+        return name in (
+            pidnet_cf_add_sources
+            | pidnet_cf_alias_sources
+            | pidnet_cf_mul_sources
+            | pidnet_cf_reduce_sum_sources
+            | pidnet_cf_mean_sources
+            | pidnet_cf_pad_sources
+            | pidnet_cf_pool_sources
+        )
+
+    def _pidnet_has_cf_layout_consumer(name: str, *, start_index: int) -> bool:
+        tracked_names: Set[str] = {str(name)}
+        for lookahead_index in range(start_index + 1, len(lines)):
+            future_line = str(lines[lookahead_index])
+            alias_match = pidnet_cf_alias_re.match(future_line)
+            if alias_match is not None and str(alias_match.group("input")) in tracked_names:
+                tracked_names.add(str(alias_match.group("lhs")))
+                continue
+            permute_conv_match = pidnet_permute_conv_re.match(future_line)
+            if (
+                permute_conv_match is not None
+                and str(permute_conv_match.group("input")) in tracked_names
+            ):
+                return True
+            cf_mean_match = pidnet_cf_mean_re.match(future_line)
+            if (
+                cf_mean_match is not None
+                and str(cf_mean_match.group("input")) in tracked_names
+                and (str(cf_mean_match.group("axis0")), str(cf_mean_match.group("axis1"))) in {
+                    ("1", "2"),
+                    ("2", "3"),
+                }
+            ):
+                return True
+            cf_pad_match = pidnet_cf_pad_re.match(future_line)
+            if cf_pad_match is not None and str(cf_pad_match.group("input")) in tracked_names:
+                return True
+            binary_anchor_match = pidnet_binary_anchor_re.match(future_line)
+            if binary_anchor_match is not None and (
+                str(binary_anchor_match.group("a")) in tracked_names
+                or str(binary_anchor_match.group("b")) in tracked_names
+            ):
+                return True
+            mul_align_match = pidnet_mul_align_re.match(future_line)
+            if mul_align_match is not None and (
+                str(mul_align_match.group("a")) in tracked_names
+                or str(mul_align_match.group("b")) in tracked_names
+            ):
+                return True
+            reduce_sum_match = pidnet_reduce_sum_re.match(future_line)
+            if reduce_sum_match is not None and str(reduce_sum_match.group("input")) in tracked_names:
+                return True
+        return False
+
     exact_line_rewrites = {
     }
 
@@ -26013,10 +26070,9 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             input_name = str(pidnet_cf_resize_match.group("input"))
             lhs_name = str(pidnet_cf_resize_match.group("lhs"))
             if (
-                input_name.endswith("_cf")
-                or input_name.endswith("_out_cf")
-                or lhs_name.endswith("_cf")
-                or lhs_name.endswith("_out_cf")
+                _pidnet_is_cf_like_name(input_name)
+                or _pidnet_is_cf_like_name(lhs_name)
+                or _pidnet_has_cf_layout_consumer(lhs_name, start_index=index)
             ):
                 current_shape = [
                     int(pidnet_cf_resize_match.group("n")),
@@ -26066,7 +26122,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 ),
             )
             if (
-                (input_name.endswith("_cf") or input_name.endswith("_out_cf"))
+                (_pidnet_is_cf_like_name(input_name) or _pidnet_has_cf_layout_consumer(str(pidnet_cf_alias_match.group("lhs")), start_index=index))
                 and normalized_shape != current_shape
             ):
                 lines[index] = (
@@ -26080,9 +26136,9 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             input_a = str(pidnet_cf_add_match.group("a"))
             input_b = str(pidnet_cf_add_match.group("b"))
             if all(
-                input_name.endswith("_cf") or input_name.endswith("_out_cf")
+                _pidnet_is_cf_like_name(input_name)
                 for input_name in (input_a, input_b)
-            ):
+            ) or _pidnet_has_cf_layout_consumer(str(pidnet_cf_add_match.group("lhs")), start_index=index):
                 current_shape = [
                     int(pidnet_cf_add_match.group("n")),
                     int(pidnet_cf_add_match.group("d1")),
@@ -26265,8 +26321,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             input_name = str(pidnet_cf_mean_match.group("input"))
             if (
                 input_name in pidnet_cf_add_sources
-                or input_name.endswith("_cf")
-                or input_name.endswith("_out_cf")
+                or _pidnet_is_cf_like_name(input_name)
             ) and (
                 str(pidnet_cf_mean_match.group("axis0")),
                 str(pidnet_cf_mean_match.group("axis1")),
@@ -26291,7 +26346,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 current_shape,
                 preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
             )
-            if input_name in pidnet_cf_mean_sources or input_name.endswith("_cf") or input_name.endswith("_out_cf"):
+            if input_name in pidnet_cf_mean_sources or _pidnet_is_cf_like_name(input_name):
                 lines[index] = (
                     f"{pidnet_bn_mul_match.group('indent')}{pidnet_bn_mul_match.group('lhs')} = "
                     f"_align_tensor_to_target_shape(torch.mul({input_name}, "

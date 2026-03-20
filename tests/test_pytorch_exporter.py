@@ -3964,6 +3964,39 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_cf_add_conv_bridge_w
     assert "merge_cf.permute(0, 3, 1, 2).contiguous()" not in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_cf_add_conv_bridge_without_cf_suffixes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_cf_add_no_suffix_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, left_feature: torch.Tensor, right_feature: torch.Tensor) -> torch.Tensor:",
+                "        merge_feature = _align_tensor_to_target_shape(torch.add(left_feature, right_feature), [1, 24, 40, 64])",
+                "        conv_out = self.conv_block_7(merge_feature.permute(0, 3, 1, 2).contiguous())",
+                "        return conv_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "merge_feature = _align_tensor_to_target_shape(torch.add(left_feature, right_feature), [1, 64, 24, 40])"
+        in rewritten
+    )
+    assert "conv_out = self.conv_block_7(merge_feature)" in rewritten
+    assert "merge_feature.permute(0, 3, 1, 2).contiguous()" not in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_with_generic_names(
     tmp_path,
 ) -> None:
@@ -4001,6 +4034,59 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_with_gener
     assert "pag_resize_out = pag_resize_out_cf" in rewritten
     assert (
         "_binary_rhs_17, _binary_lhs_17 = _align_binary_inputs_to_anchor(pag_resize_out, skip_feature_out_cf, [1, 32, 24, 40])"
+        in rewritten
+    )
+    assert (
+        "pag_mul_out = _align_tensor_to_target_shape(torch.mul(_binary_lhs_17, _binary_rhs_17), [1, 32, 24, 40])"
+        in rewritten
+    )
+    assert (
+        "pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([1], pag_mul_out.ndim), True)"
+        in rewritten
+    )
+    assert (
+        "pag_sig_out = _align_tensor_to_target_shape(torch.sigmoid(pag_reduce_sum_out), [1, 1, 24, 40])"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_without_cf_suffixes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_pag_no_suffix_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, lowres_feature: torch.Tensor, skip_feature: torch.Tensor) -> torch.Tensor:",
+                "        pag_resize_out = _apply_resize(lowres_feature, [24, 40], method='bilinear', target_shape=[1, 24, 40, 32], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        pag_alias = _align_tensor_to_target_shape(pag_resize_out.permute(0, 2, 3, 1).contiguous(), [1, 24, 40, 32])",
+                "        _binary_rhs_17, _binary_lhs_17 = _align_binary_inputs_to_anchor(pag_alias, skip_feature, [1, 24, 40, 32])",
+                "        pag_mul_out = _align_tensor_to_target_shape(torch.mul(_binary_lhs_17, _binary_rhs_17), [1, 24, 40, 32])",
+                "        pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([3], pag_mul_out.ndim), True)",
+                "        pag_sig_out = torch.reshape(torch.sigmoid(pag_reduce_sum_out), [1, 1, 24, 40])",
+                "        return pag_sig_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "pag_resize_out = _apply_resize(lowres_feature, [24, 40], method='bilinear', "
+        "target_shape=[1, 32, 24, 40], align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+    assert "pag_alias = pag_resize_out" in rewritten
+    assert (
+        "_binary_rhs_17, _binary_lhs_17 = _align_binary_inputs_to_anchor(pag_alias, skip_feature, [1, 32, 24, 40])"
         in rewritten
     )
     assert (
