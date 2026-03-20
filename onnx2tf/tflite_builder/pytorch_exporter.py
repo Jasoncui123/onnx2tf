@@ -27065,12 +27065,12 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         if buffer_shape in known_shadowformer_shapes
     }
     binary_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+,\s*[A-Za-z0-9_\.]+,\s*\[)"
-        r"(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+,\s*[A-Za-z0-9_\.]+,\s*(?:\[|\())"
+        r"(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
     )
     mul_align_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*\[)"
-        r"(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>\]\))$"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*(?:\[|\())"
+        r"(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
     )
 
     for index, line in enumerate(lines):
@@ -27583,10 +27583,10 @@ def _collect_shadowformer_fast_repair_facts(
         r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+)\)$"
     )
     binary_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+),\s*(?P<rhs>[A-Za-z0-9_\.]+),\s*\[(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+),\s*(?P<rhs>[A-Za-z0-9_\.]+),\s*(?:\[|\()(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
     mul_align_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*\[(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*(?:\[|\()(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
 
     raw_buffer_dims: Dict[str, Tuple[int, int, int]] = {}
@@ -27657,7 +27657,7 @@ def _collect_shadowformer_fast_repair_facts(
 def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int, int, int, int]]:
     axis_re = re.compile(r"(?:^|[,(])\s*axis\s*=\s*3(?:$|[,)])")
     target_shape_re = re.compile(
-        r"target_shape=\[\s*(?P<batches>\d+)\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\s*\]"
+        r"target_shape=(?:\[|\()\s*(?P<batches>\d+)\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\s*(?:\]|\))"
     )
     softmax_shapes: List[Tuple[int, int, int, int]] = []
     for line in lines:
