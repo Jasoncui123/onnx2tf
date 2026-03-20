@@ -20115,6 +20115,13 @@ def _canonicalize_generated_model_source_for_raw_export(
     permute_contiguous_cf_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
     )
+    singleton_const_anchor_fix_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"(?P<input>[A-Za-z0-9_]+), torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 1, 1, 1\]\), \[1, 1, 1, 1\]\)$"
+    )
+    recent_cf_singleton_shape_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = .*\[(?P<n>\d+), (?P<c>\d+), 1, 1\]\)?$"
+    )
     reshape_from_inverse_permute_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<shape>[0-9, ]+)\]\)$"
     )
@@ -20157,31 +20164,31 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
     pidnet_spp_scale3_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+AveragePool_output_nhwc_div_reciprocal_mulfused)\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale3_anchor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+AveragePool_output_nhwc_div_reciprocal_mulfused), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale3_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_add), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale3_mul_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale4_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+)\)$"
     )
     pidnet_spp_scale4_mul_reshape_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
-        r"self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul)\), \[1, 1, (?P<c>\d+), 1\]\)$"
+        r"self\.(?P<const_attr>[A-Za-z0-9_]+)\), \[1, 1, (?P<c>\d+), 1\]\)$"
     )
     pidnet_spp_scale4_mul_reshape_variant_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
-        r"torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul), \[[0-9, ]+\]\)\), "
+        r"torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]+), \[[0-9, ]+\]\)\), "
         r"\[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     pidnet_spp_scale4_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_add), \[1, 1, 1, (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     pidnet_pag4_mul2_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
@@ -20544,6 +20551,17 @@ def _canonicalize_generated_model_source_for_raw_export(
         recent_rank4_shape_cache[cache_key] = None
         return None
 
+    def _find_recent_singleton_cf_channel_count(line_index: int) -> int | None:
+        function_start = function_start_by_index[line_index] if 0 <= line_index < len(function_start_by_index) else -1
+        for candidate in range(line_index - 1, function_start, -1):
+            match = recent_cf_singleton_shape_re.search(lines[candidate])
+            if match is None:
+                continue
+            channel_count = int(match.group("c"))
+            if channel_count > 1:
+                return channel_count
+        return None
+
     buffer_specs: Dict[str, Tuple[int, List[int], str, bool]] = {}
     const_temp_assignments: Dict[str, Tuple[int, str, str, str]] = {}
     transposed_const_alias_specs: Dict[str, Tuple[str, List[int], str]] = {}
@@ -20756,6 +20774,7 @@ def _canonicalize_generated_model_source_for_raw_export(
             )
             changed = True
             line = lines[index]
+            continue
         pidnet_pag4_mul2_out_match = pidnet_pag4_mul2_out_re.match(line)
         if pidnet_pag4_mul2_out_match is not None:
             lines[index] = (
@@ -24234,6 +24253,21 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"{pidnet_spp_scale4_mul_reshape_variant_match.group('indent')}{pidnet_spp_scale4_mul_reshape_variant_match.group('lhs')} = "
             f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_match.group('input')}, "
             f"torch.reshape(self.{pidnet_spp_scale4_mul_reshape_variant_match.group('const_attr')}, [1, {channel_count}, 1, 1])), [1, {channel_count}, 1, 1])"
+        )
+        changed = True
+    for index, line in enumerate(lines):
+        singleton_const_anchor_fix_match = singleton_const_anchor_fix_re.match(line)
+        if singleton_const_anchor_fix_match is None:
+            continue
+        channel_count = _find_recent_singleton_cf_channel_count(index)
+        if channel_count is None:
+            continue
+        lines[index] = (
+            f"{singleton_const_anchor_fix_match.group('indent')}{singleton_const_anchor_fix_match.group('lhs0')}, "
+            f"{singleton_const_anchor_fix_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+            f"{singleton_const_anchor_fix_match.group('input')}, "
+            f"torch.reshape(self.{singleton_const_anchor_fix_match.group('const_attr')}, [1, {channel_count}, 1, 1]), "
+            f"[1, {channel_count}, 1, 1])"
         )
         changed = True
     finalized_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
