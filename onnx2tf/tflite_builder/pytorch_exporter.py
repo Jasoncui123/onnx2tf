@@ -25986,6 +25986,9 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     pidnet_cf_alias_sources: Set[str] = set()
     pidnet_cf_mul_sources: Set[str] = set()
     pidnet_cf_reduce_sum_sources: Set[str] = set()
+    pidnet_cf_mean_sources: Set[str] = set()
+    pidnet_cf_pad_sources: Set[str] = set()
+    pidnet_cf_pool_sources: Set[str] = set()
 
     def _pidnet_rank4_preferred_channel_count(
         shape: Sequence[int],
@@ -26039,6 +26042,37 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.sigmoid\((?P<input>[A-Za-z0-9_]+)\), "
         r"\[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
+    pidnet_cf_mean_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), "
+        r"dim=\[(?P<axis0>\d+), (?P<axis1>\d+)\], keepdim=True\)$"
+    )
+    pidnet_bn_mul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_mul)\), "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+    pidnet_bn_add_anchor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+BatchNormalization_bn_add), "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+    pidnet_cf_pad_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\), "
+        r"\[0, 0, (?P<pad_top>\d+), (?P<pad_bottom>\d+), (?P<pad_left>\d+), (?P<pad_right>\d+)\], "
+        r"mode='constant', value=0\.0\)$"
+    )
+    pidnet_cf_pool_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), "
+        r"filter_height=(?P<fh>\d+), filter_width=(?P<fw>\d+), stride_h=(?P<sh>\d+), stride_w=(?P<sw>\d+), "
+        r"padding='(?P<padding>[^']+)', target_shape=\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\], "
+        r"is_max_pool=(?P<is_max>True|False), channel_last=True\)$"
+    )
+    pidnet_scale3_anchor_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+AveragePool_output_nhwc_div_reciprocal_mulfused), "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
     pidnet_permute_conv_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
@@ -26052,28 +26086,6 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             "        wa_resize1_out_nhwc_cf = _apply_resize(wadiff4_diff40_cv_out_nhwc_cf, [24, 40], method='bilinear', target_shape=[1, 64, 24, 40], align_corners=False, half_pixel_centers=True, channel_last=False)",
         "        wa_resize1_out_nhwc = _align_tensor_to_target_shape(wa_resize1_out_nhwc_cf.permute(0, 2, 3, 1).contiguous(), [1, 24, 40, 64])":
             "        wa_resize1_out_nhwc = wa_resize1_out_nhwc_cf",
-        "        wasppscale1_scale10_average_p_in = _align_tensor_to_target_shape(torch.add(walayer5_layer51_cv3_cv_out_cf, walayer5_layer51_cv1_cv_in_cf), [1, 3, 5, 512])":
-            "        wasppscale1_scale10_average_p_in = _align_tensor_to_target_shape(torch.add(walayer5_layer51_cv3_cv_out_cf, walayer5_layer51_cv1_cv_in_cf), [1, 512, 3, 5])",
-        "        wasppsc_scale10_average_include_pad_901e = _apply_pool2d(wasppscale1_scale10_average_p_in, filter_height=5, filter_width=5, stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 512, 2, 3], is_max_pool=False, channel_last=True)":
-            "        wasppsc_scale10_average_include_pad_901e = _apply_pool2d(wasppscale1_scale10_average_p_in, filter_height=5, filter_width=5, stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 512, 2, 3], is_max_pool=False, channel_last=False)",
-        "        wasppsc_scale20_average_nhwc_padded_846b = F.pad(_align_tensor_to_target_shape(wasppscale1_scale10_average_p_in, [1, 3, 5, 512]), [0, 0, 4, 4, 4, 4], mode='constant', value=0.0)":
-            "        wasppsc_scale20_average_nhwc_padded_846b = F.pad(wasppscale1_scale10_average_p_in, [4, 4, 4, 4], mode='constant', value=0.0)",
-        "        wasppscale_scale20_average_include_7802 = _apply_pool2d(wasppsc_scale20_average_nhwc_padded_846b, filter_height=9, filter_width=9, stride_h=4, stride_w=4, padding='VALID', target_shape=[1, 512, 1, 2], is_max_pool=False, channel_last=True)":
-            "        wasppscale_scale20_average_include_7802 = _apply_pool2d(wasppsc_scale20_average_nhwc_padded_846b, filter_height=9, filter_width=9, stride_h=4, stride_w=4, padding='VALID', target_shape=[1, 512, 1, 2], is_max_pool=False, channel_last=False)",
-        "        wasppsc_scale30_average_nhwc_padded_f142 = F.pad(_align_tensor_to_target_shape(wasppscale1_scale10_average_p_in, [1, 3, 5, 512]), [0, 0, 8, 8, 8, 8], mode='constant', value=0.0)":
-            "        wasppsc_scale30_average_nhwc_padded_f142 = F.pad(wasppscale1_scale10_average_p_in, [8, 8, 8, 8], mode='constant', value=0.0)",
-        "        wasppsc_scale30_average_include_pad_5bf3 = _apply_pool2d(wasppsc_scale30_average_nhwc_padded_f142, filter_height=17, filter_width=17, stride_h=8, stride_w=8, padding='VALID', target_shape=[1, 512, 1, 1], is_max_pool=False, channel_last=True)":
-            "        wasppsc_scale30_average_include_pad_5bf3 = _apply_pool2d(wasppsc_scale30_average_nhwc_padded_f142, filter_height=17, filter_width=17, stride_h=8, stride_w=8, padding='VALID', target_shape=[1, 512, 1, 1], is_max_pool=False, channel_last=False)",
-        "        wasppscale4_scale40_global_a_cf_3f9a = torch.mean(wasppscale1_scale10_average_p_in, dim=[1, 2], keepdim=True)":
-            "        wasppscale4_scale40_global_a_cf_3f9a = torch.mean(wasppscale1_scale10_average_p_in, dim=[2, 3], keepdim=True)",
-        "        _binary_lhs_124, _binary_rhs_124 = _align_binary_inputs_to_anchor(wasppsc_scale30_average_include_pad_5bf3, self.const_wa_spp_scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused, [1, 512, 1, 512])":
-            "        _binary_lhs_124, _binary_rhs_124 = _align_binary_inputs_to_anchor(wasppsc_scale30_average_include_pad_5bf3, torch.reshape(self.const_wa_spp_scale3_scale3_0_AveragePool_output_nhwc_div_reciprocal_mulfused, [1, 512, 1, 1]), [1, 512, 1, 1])",
-        "        _binary_lhs_125, _binary_rhs_125 = _align_binary_inputs_to_anchor(wasppscale3_scale31_batch_mul_out4943, self.const_wa_spp_scale3_scale3_1_BatchNormalization_bn_add, [1, 512, 1, 512])":
-            "        _binary_lhs_125, _binary_rhs_125 = _align_binary_inputs_to_anchor(wasppscale3_scale31_batch_mul_out4943, torch.reshape(self.const_wa_spp_scale3_scale3_1_BatchNormalization_bn_add, [1, 512, 1, 1]), [1, 512, 1, 1])",
-        "        wasppscale4_scale41_batch_mul_out_bb31 = _align_tensor_to_target_shape(torch.mul(wasppscale4_scale40_global_a_cf_3f9a, self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_mul), [1, 512, 1, 1])":
-            "        wasppscale4_scale41_batch_mul_out_bb31 = _align_tensor_to_target_shape(torch.mul(wasppscale4_scale40_global_a_cf_3f9a, torch.reshape(self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_mul, [1, 512, 1, 1])), [1, 512, 1, 1])",
-        "        _binary_lhs_127, _binary_rhs_127 = _align_binary_inputs_to_anchor(wasppscale4_scale41_batch_mul_out_bb31, self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_add, [1, 1, 1, 512])":
-            "        _binary_lhs_127, _binary_rhs_127 = _align_binary_inputs_to_anchor(wasppscale4_scale41_batch_mul_out_bb31, torch.reshape(self.const_wa_spp_scale4_scale4_1_BatchNormalization_bn_add, [1, 512, 1, 1]), [1, 512, 1, 1])",
         "        waspp_resize_out_nhwc_cf = _apply_resize(wasppscale1_scale13_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 5, 96, 3], align_corners=False, half_pixel_centers=True, channel_last=False)":
             "        waspp_resize_out_nhwc_cf = _apply_resize(wasppscale1_scale13_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 96, 3, 5], align_corners=False, half_pixel_centers=True, channel_last=False)",
         "        waspp_resize1_out_nhwc_cf = _apply_resize(wasppscale2_scale23_cv_out_nhwc_cf, [3, 5], method='bilinear', target_shape=[1, 5, 96, 3], align_corners=False, half_pixel_centers=True, channel_last=False)":
@@ -26179,6 +26191,30 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                     changed = True
                 pidnet_cf_add_sources.add(str(pidnet_cf_add_match.group("lhs")))
                 continue
+        pidnet_cf_pad_match = pidnet_cf_pad_re.match(line)
+        if pidnet_cf_pad_match is not None:
+            input_name = str(pidnet_cf_pad_match.group("input"))
+            current_shape = [
+                int(pidnet_cf_pad_match.group("n")),
+                int(pidnet_cf_pad_match.group("d1")),
+                int(pidnet_cf_pad_match.group("d2")),
+                int(pidnet_cf_pad_match.group("d3")),
+            ]
+            normalized_shape = _normalize_cf_rank4_shape(
+                current_shape,
+                preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
+            )
+            if input_name in pidnet_cf_add_sources and normalized_shape != current_shape:
+                lines[index] = (
+                    f"{pidnet_cf_pad_match.group('indent')}{pidnet_cf_pad_match.group('lhs')} = "
+                    f"F.pad({input_name}, "
+                    f"[{pidnet_cf_pad_match.group('pad_top')}, {pidnet_cf_pad_match.group('pad_bottom')}, "
+                    f"{pidnet_cf_pad_match.group('pad_left')}, {pidnet_cf_pad_match.group('pad_right')}], "
+                    f"mode='constant', value=0.0)"
+                )
+                changed = True
+                pidnet_cf_pad_sources.add(str(pidnet_cf_pad_match.group("lhs")))
+                continue
         pidnet_binary_anchor_match = pidnet_binary_anchor_re.match(line)
         if pidnet_binary_anchor_match is not None:
             input_a = str(pidnet_binary_anchor_match.group("a"))
@@ -26211,6 +26247,22 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                         f"{input_a}, {input_b}, {normalized_shape})"
                     )
                     changed = True
+                continue
+        pidnet_cf_pool_match = pidnet_cf_pool_re.match(line)
+        if pidnet_cf_pool_match is not None:
+            input_name = str(pidnet_cf_pool_match.group("input"))
+            if input_name in pidnet_cf_add_sources or input_name in pidnet_cf_pad_sources:
+                lines[index] = (
+                    f"{pidnet_cf_pool_match.group('indent')}{pidnet_cf_pool_match.group('lhs')} = _apply_pool2d("
+                    f"{input_name}, filter_height={pidnet_cf_pool_match.group('fh')}, "
+                    f"filter_width={pidnet_cf_pool_match.group('fw')}, stride_h={pidnet_cf_pool_match.group('sh')}, "
+                    f"stride_w={pidnet_cf_pool_match.group('sw')}, padding='{pidnet_cf_pool_match.group('padding')}', "
+                    f"target_shape=[{pidnet_cf_pool_match.group('n')}, {pidnet_cf_pool_match.group('d1')}, "
+                    f"{pidnet_cf_pool_match.group('d2')}, {pidnet_cf_pool_match.group('d3')}], "
+                    f"is_max_pool={pidnet_cf_pool_match.group('is_max')}, channel_last=False)"
+                )
+                changed = True
+                pidnet_cf_pool_sources.add(str(pidnet_cf_pool_match.group("lhs")))
                 continue
         pidnet_mul_align_match = pidnet_mul_align_re.match(line)
         if pidnet_mul_align_match is not None:
@@ -26272,6 +26324,94 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             )
             changed = True
             continue
+        pidnet_scale3_anchor_match = pidnet_scale3_anchor_re.match(line)
+        if pidnet_scale3_anchor_match is not None:
+            input_name = str(pidnet_scale3_anchor_match.group("input"))
+            current_shape = [
+                int(pidnet_scale3_anchor_match.group("n")),
+                int(pidnet_scale3_anchor_match.group("d1")),
+                int(pidnet_scale3_anchor_match.group("d2")),
+                int(pidnet_scale3_anchor_match.group("d3")),
+            ]
+            if int(current_shape[2]) == 1 and int(current_shape[1]) == int(current_shape[3]):
+                normalized_shape = [int(current_shape[0]), int(current_shape[1]), 1, 1]
+            else:
+                normalized_shape = _normalize_cf_rank4_shape(
+                    current_shape,
+                    preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
+                )
+            if input_name in pidnet_cf_pool_sources:
+                lines[index] = (
+                    f"{pidnet_scale3_anchor_match.group('indent')}{pidnet_scale3_anchor_match.group('lhs0')}, "
+                    f"{pidnet_scale3_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+                    f"{input_name}, torch.reshape(self.{pidnet_scale3_anchor_match.group('const_attr')}, {normalized_shape}), "
+                    f"{normalized_shape})"
+                )
+                changed = True
+                continue
+        pidnet_cf_mean_match = pidnet_cf_mean_re.match(line)
+        if pidnet_cf_mean_match is not None:
+            input_name = str(pidnet_cf_mean_match.group("input"))
+            if (
+                input_name in pidnet_cf_add_sources
+                or input_name.endswith("_cf")
+                or input_name.endswith("_out_cf")
+            ) and (
+                str(pidnet_cf_mean_match.group("axis0")),
+                str(pidnet_cf_mean_match.group("axis1")),
+            ) == ("1", "2"):
+                lines[index] = (
+                    f"{pidnet_cf_mean_match.group('indent')}{pidnet_cf_mean_match.group('lhs')} = "
+                    f"torch.mean({input_name}, dim=[2, 3], keepdim=True)"
+                )
+                changed = True
+                pidnet_cf_mean_sources.add(str(pidnet_cf_mean_match.group("lhs")))
+                continue
+        pidnet_bn_mul_match = pidnet_bn_mul_re.match(line)
+        if pidnet_bn_mul_match is not None:
+            input_name = str(pidnet_bn_mul_match.group("input"))
+            current_shape = [
+                int(pidnet_bn_mul_match.group("n")),
+                int(pidnet_bn_mul_match.group("d1")),
+                int(pidnet_bn_mul_match.group("d2")),
+                int(pidnet_bn_mul_match.group("d3")),
+            ]
+            normalized_shape = _normalize_cf_rank4_shape(
+                current_shape,
+                preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
+            )
+            if input_name in pidnet_cf_mean_sources or input_name.endswith("_cf") or input_name.endswith("_out_cf"):
+                lines[index] = (
+                    f"{pidnet_bn_mul_match.group('indent')}{pidnet_bn_mul_match.group('lhs')} = "
+                    f"_align_tensor_to_target_shape(torch.mul({input_name}, "
+                    f"torch.reshape(self.{pidnet_bn_mul_match.group('const_attr')}, {normalized_shape})), "
+                    f"{normalized_shape})"
+                )
+                changed = True
+                pidnet_cf_mul_sources.add(str(pidnet_bn_mul_match.group("lhs")))
+                continue
+        pidnet_bn_add_anchor_match = pidnet_bn_add_anchor_re.match(line)
+        if pidnet_bn_add_anchor_match is not None:
+            input_name = str(pidnet_bn_add_anchor_match.group("input"))
+            current_shape = [
+                int(pidnet_bn_add_anchor_match.group("n")),
+                int(pidnet_bn_add_anchor_match.group("d1")),
+                int(pidnet_bn_add_anchor_match.group("d2")),
+                int(pidnet_bn_add_anchor_match.group("d3")),
+            ]
+            normalized_shape = _normalize_cf_rank4_shape(
+                current_shape,
+                preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
+            )
+            if input_name in pidnet_cf_mul_sources or input_name in pidnet_cf_mean_sources:
+                lines[index] = (
+                    f"{pidnet_bn_add_anchor_match.group('indent')}{pidnet_bn_add_anchor_match.group('lhs0')}, "
+                    f"{pidnet_bn_add_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+                    f"{input_name}, torch.reshape(self.{pidnet_bn_add_anchor_match.group('const_attr')}, {normalized_shape}), "
+                    f"{normalized_shape})"
+                )
+                changed = True
+                continue
         replacement = exact_line_rewrites.get(line, None)
         if replacement is not None:
             lines[index] = replacement
