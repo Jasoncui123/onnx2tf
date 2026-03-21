@@ -20472,9 +20472,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"\(?(?P<input>[A-Za-z0-9_]+)\)?\), \[1, 1, (?P<c>\d+), 1\]\)$"
     )
     pidnet_spp_scale4_mul_reshape_variant_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
-        r"torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]+), \[[0-9, ]+\]\)\), "
-        r"\[1, 1, 1, (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\(\(*(?P<input>[A-Za-z0-9_]+)\)*, "
+        r"torch\.reshape\(\(*(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)*, [\[\(][0-9, ]+[\]\)]\)\), "
+        r"[\[\(]1, 1, 1, (?P<c>\d+)[\]\)]\)$"
+    )
+    pidnet_spp_scale4_mul_reshape_variant_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\(torch\.reshape\(\(*(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)*, [\[\(][0-9, ]+[\]\)]\), "
+        r"\(*(?P<input>[A-Za-z0-9_]+)\)*\), [\[\(]1, 1, 1, (?P<c>\d+)[\]\)]\)$"
     )
     pidnet_spp_scale4_add_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \[1, 1, 1, (?P<c>\d+)\]\)$"
@@ -21168,11 +21172,38 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = lines[index]
         pidnet_spp_scale4_mul_reshape_variant_match = pidnet_spp_scale4_mul_reshape_variant_re.match(line)
+        if pidnet_spp_scale4_mul_reshape_variant_match is None:
+            pidnet_spp_scale4_mul_reshape_variant_match = (
+                pidnet_spp_scale4_mul_reshape_variant_reversed_re.match(line)
+            )
         if pidnet_spp_scale4_mul_reshape_variant_match is not None:
+            resolved_const_expr = _resolve_raw_pidnet_const_expr(
+                str(pidnet_spp_scale4_mul_reshape_variant_match.group("const_expr"))
+            )
+            if resolved_const_expr is None:
+                continue
+            const_expr_text, const_attr_name = resolved_const_expr
+            preferred_channels = _infer_cf_channel_count(
+                str(pidnet_spp_scale4_mul_reshape_variant_match.group("input"))
+            )
+            if preferred_channels is None:
+                recent_shape = _find_recent_rank4_shape(
+                    str(pidnet_spp_scale4_mul_reshape_variant_match.group("input")),
+                    index,
+                )
+                if recent_shape is not None and len(recent_shape) == 4:
+                    preferred_channels = int(recent_shape[1])
+            if preferred_channels is None:
+                preferred_channels = _buffer_channel_count(const_attr_name)
+            channel_count = (
+                int(preferred_channels)
+                if preferred_channels is not None
+                else int(pidnet_spp_scale4_mul_reshape_variant_match.group("c"))
+            )
             lines[index] = (
                 f"{pidnet_spp_scale4_mul_reshape_variant_match.group('indent')}{pidnet_spp_scale4_mul_reshape_variant_match.group('lhs')} = "
                 f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_match.group('input')}, "
-                f"torch.reshape(self.{pidnet_spp_scale4_mul_reshape_variant_match.group('const_attr')}, [1, {pidnet_spp_scale4_mul_reshape_variant_match.group('c')}, 1, 1])), [1, {pidnet_spp_scale4_mul_reshape_variant_match.group('c')}, 1, 1])"
+                f"torch.reshape({const_expr_text}, [1, {channel_count}, 1, 1])), [1, {channel_count}, 1, 1])"
             )
             changed = True
             line = lines[index]
@@ -24788,7 +24819,17 @@ def _canonicalize_generated_model_source_for_raw_export(
     for index, line in enumerate(lines):
         pidnet_spp_scale4_mul_reshape_variant_match = pidnet_spp_scale4_mul_reshape_variant_re.match(line)
         if pidnet_spp_scale4_mul_reshape_variant_match is None:
+            pidnet_spp_scale4_mul_reshape_variant_match = (
+                pidnet_spp_scale4_mul_reshape_variant_reversed_re.match(line)
+            )
+        if pidnet_spp_scale4_mul_reshape_variant_match is None:
             continue
+        resolved_const_expr = _resolve_raw_pidnet_const_expr(
+            str(pidnet_spp_scale4_mul_reshape_variant_match.group("const_expr"))
+        )
+        if resolved_const_expr is None:
+            continue
+        const_expr_text, const_attr_name = resolved_const_expr
         preferred_channels = _infer_cf_channel_count(
             str(pidnet_spp_scale4_mul_reshape_variant_match.group("input"))
         )
@@ -24799,6 +24840,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             )
             if recent_shape is not None and len(recent_shape) == 4:
                 preferred_channels = int(recent_shape[1])
+        if preferred_channels is None:
+            preferred_channels = _buffer_channel_count(const_attr_name)
         channel_count = (
             int(preferred_channels)
             if preferred_channels is not None
@@ -24807,7 +24850,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         lines[index] = (
             f"{pidnet_spp_scale4_mul_reshape_variant_match.group('indent')}{pidnet_spp_scale4_mul_reshape_variant_match.group('lhs')} = "
             f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_match.group('input')}, "
-            f"torch.reshape(self.{pidnet_spp_scale4_mul_reshape_variant_match.group('const_attr')}, [1, {channel_count}, 1, 1])), [1, {channel_count}, 1, 1])"
+            f"torch.reshape({const_expr_text}, [1, {channel_count}, 1, 1])), [1, {channel_count}, 1, 1])"
         )
         changed = True
     for index, line in enumerate(lines):

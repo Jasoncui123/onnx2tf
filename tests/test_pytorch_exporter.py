@@ -1265,6 +1265,392 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_through_nest
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_const_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_const_alias_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(spp_global_cf, torch.reshape(scale4_bn_mul, [1, 1, 192, 1])), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_through_typed_const_alias_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_typed_const_alias_chain_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        scale4_bn_mul_alias: torch.Tensor = (scale4_bn_mul)",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(spp_global_cf, torch.reshape(scale4_bn_mul_alias, [1, 1, 192, 1])), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul_alias, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_reversed_const_order(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_reversed_const_order_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(torch.reshape(scale4_bn_mul, [1, 1, 192, 1]), spp_global_cf), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_reversed_const_alias_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_reversed_const_alias_chain_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        scale4_bn_mul_alias: torch.Tensor = (scale4_bn_mul)",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(torch.reshape(scale4_bn_mul_alias, [1, 1, 192, 1]), spp_global_cf), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul_alias, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_parenthesized_const_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_parenthesized_const_alias_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(torch.mul((spp_global_cf), torch.reshape((scale4_bn_mul), [1, 1, 192, 1])), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_nested_parenthesized_const_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_nested_parenthesized_const_alias_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(((spp_global_cf)), torch.reshape(((scale4_bn_mul)), [1, 1, 192, 1])), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_reversed_parenthesized_const_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_reversed_parenthesized_const_alias_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(torch.reshape((scale4_bn_mul), [1, 1, 192, 1]), (spp_global_cf)), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_reversed_nested_parenthesized_const_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_reversed_nested_parenthesized_const_alias_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(torch.reshape(((scale4_bn_mul)), [1, 1, 192, 1]), ((spp_global_cf))), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_tuple_shapes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_tuple_shapes_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(spp_global_cf, torch.reshape(scale4_bn_mul, (1, 1, 192, 1))), (1, 1, 1, 192))",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_reversed_tuple_shapes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_reversed_tuple_shapes_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(torch.reshape(scale4_bn_mul, (1, 1, 192, 1)), spp_global_cf), (1, 1, 1, 192))",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_mismatched_c_uses_input_evidence(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_mismatched_c_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 256, 1, 1])",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(spp_global_cf, torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 1, 7, 1])), [1, 1, 1, 7])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 256, 1, 1])), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_reversed_with_mismatched_c_uses_input_evidence(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_reversed_mismatched_c_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 256, 1, 1])",
+                "        spp_bn_mul_out = torch.reshape(torch.mul(torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 1, 7, 1]), spp_global_cf), [1, 1, 1, 7])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 256, 1, 1])), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_through_wrapped_local_const_pair_alias(
     tmp_path,
 ) -> None:
