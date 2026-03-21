@@ -26580,12 +26580,14 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     pidnet_cf_add_sources: Set[str] = set()
     pidnet_cf_alias_sources: Set[str] = set()
     pidnet_cf_binary_sources: Set[str] = set()
+    pidnet_cf_binary_tuple_sources: Set[str] = set()
     pidnet_cf_mul_sources: Set[str] = set()
     pidnet_cf_reduce_sum_sources: Set[str] = set()
     pidnet_cf_mean_sources: Set[str] = set()
     pidnet_cf_pad_sources: Set[str] = set()
     pidnet_cf_pool_sources: Set[str] = set()
     pidnet_const_alias_sources: Set[str] = set()
+    pidnet_tuple_alias_pairs: Dict[str, tuple[str, str]] = {}
 
     def _pidnet_rank4_preferred_channel_count(
         shape: Sequence[int],
@@ -26623,12 +26625,17 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     pidnet_binary_anchor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), "
+        r"\(*\s*(?P<a>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<b>[A-Za-z0-9_]+)\s*\)*, "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+    pidnet_binary_anchor_tuple_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?P<ann>:\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*_align_binary_inputs_to_anchor\("
+        r"\(*\s*(?P<a>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<b>[A-Za-z0-9_]+)\s*\)*, "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_mul_align_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
-        r"torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), "
+        r"torch\.mul\(\(*\s*(?P<a>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<b>[A-Za-z0-9_]+)\s*\)*\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_reduce_sum_re = re.compile(
@@ -26645,12 +26652,12 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     pidnet_bn_mul_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
-        r"torch\.mul\((?P<input>[A-Za-z0-9_]+), (?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\), "
+        r"torch\.mul\(\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_bn_add_anchor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<input>[A-Za-z0-9_]+), (?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+), "
+        r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_cf_pad_re = re.compile(
@@ -26667,7 +26674,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     pidnet_scale3_anchor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<input>[A-Za-z0-9_]+), (?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+), "
+        r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_permute_conv_re = re.compile(
@@ -26675,6 +26682,18 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     pidnet_plain_alias_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*(?P<input>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*$"
+    )
+    pidnet_tuple_alias_re = re.compile(
+        r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*\)*\s*=\s*"
+        r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*$"
+    )
+    pidnet_tuple_pair_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*"
+        r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*$"
+    )
+    pidnet_tuple_unpack_alias_re = re.compile(
+        r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*,\s*"
+        r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*\(*\s*\(*(?P<input>[A-Za-z0-9_]+)\)*\s*\)*$"
     )
 
     def _pidnet_is_cf_like_name(name: str) -> bool:
@@ -26694,10 +26713,55 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     def _pidnet_is_const_like_expr(expr: str) -> bool:
         return str(expr).startswith("self.") or str(expr) in pidnet_const_alias_sources
 
+    def _pidnet_propagate_alias(lhs_name: str, input_name: str) -> None:
+        if input_name in pidnet_tuple_alias_pairs:
+            pidnet_tuple_alias_pairs[lhs_name] = pidnet_tuple_alias_pairs[input_name]
+        if input_name.startswith("self.") or input_name in pidnet_const_alias_sources:
+            pidnet_const_alias_sources.add(lhs_name)
+        if _pidnet_is_cf_like_name(input_name):
+            pidnet_cf_alias_sources.add(lhs_name)
+        if input_name in pidnet_cf_binary_sources:
+            pidnet_cf_binary_sources.add(lhs_name)
+        if input_name in pidnet_cf_mul_sources:
+            pidnet_cf_mul_sources.add(lhs_name)
+        if input_name in pidnet_cf_reduce_sum_sources:
+            pidnet_cf_reduce_sum_sources.add(lhs_name)
+        if input_name in pidnet_cf_mean_sources:
+            pidnet_cf_mean_sources.add(lhs_name)
+        if input_name in pidnet_cf_pad_sources:
+            pidnet_cf_pad_sources.add(lhs_name)
+        if input_name in pidnet_cf_pool_sources:
+            pidnet_cf_pool_sources.add(lhs_name)
+
     def _pidnet_has_cf_layout_consumer(name: str, *, start_index: int) -> bool:
         tracked_names: Set[str] = {str(name)}
         for lookahead_index in range(start_index + 1, len(lines)):
             future_line = str(lines[lookahead_index])
+            tuple_pair_alias_match = pidnet_tuple_pair_alias_re.match(future_line)
+            if tuple_pair_alias_match is not None:
+                input0_name = str(tuple_pair_alias_match.group("input0"))
+                input1_name = str(tuple_pair_alias_match.group("input1"))
+                if input0_name in tracked_names or input1_name in tracked_names:
+                    tracked_names.add(str(tuple_pair_alias_match.group("lhs")))
+                continue
+            tuple_unpack_alias_match = pidnet_tuple_unpack_alias_re.match(future_line)
+            if (
+                tuple_unpack_alias_match is not None
+                and str(tuple_unpack_alias_match.group("input")) in tracked_names
+            ):
+                tracked_names.add(str(tuple_unpack_alias_match.group("lhs0")))
+                tracked_names.add(str(tuple_unpack_alias_match.group("lhs1")))
+                continue
+            tuple_alias_match = pidnet_tuple_alias_re.match(future_line)
+            if tuple_alias_match is not None:
+                tuple_pairs = (
+                    (str(tuple_alias_match.group("lhs0")), str(tuple_alias_match.group("input0"))),
+                    (str(tuple_alias_match.group("lhs1")), str(tuple_alias_match.group("input1"))),
+                )
+                for lhs_name, input_name in tuple_pairs:
+                    if input_name in tracked_names:
+                        tracked_names.add(lhs_name)
+                continue
             plain_alias_match = pidnet_plain_alias_re.match(future_line)
             if plain_alias_match is not None and str(plain_alias_match.group("input")) in tracked_names:
                 tracked_names.add(str(plain_alias_match.group("lhs")))
@@ -26734,6 +26798,12 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 or str(binary_anchor_match.group("b")) in tracked_names
             ):
                 return True
+            binary_anchor_tuple_match = pidnet_binary_anchor_tuple_re.match(future_line)
+            if binary_anchor_tuple_match is not None and (
+                str(binary_anchor_tuple_match.group("a")) in tracked_names
+                or str(binary_anchor_tuple_match.group("b")) in tracked_names
+            ):
+                return True
             scale3_anchor_match = pidnet_scale3_anchor_re.match(future_line)
             if (
                 scale3_anchor_match is not None
@@ -26764,26 +26834,43 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     }
 
     for index, line in enumerate(lines):
+        pidnet_tuple_pair_alias_match = pidnet_tuple_pair_alias_re.match(line)
+        if pidnet_tuple_pair_alias_match is not None:
+            lhs_name = str(pidnet_tuple_pair_alias_match.group("lhs"))
+            input0_name = str(pidnet_tuple_pair_alias_match.group("input0"))
+            input1_name = str(pidnet_tuple_pair_alias_match.group("input1"))
+            pidnet_tuple_alias_pairs[lhs_name] = (input0_name, input1_name)
+            continue
+        pidnet_tuple_unpack_alias_match = pidnet_tuple_unpack_alias_re.match(line)
+        if pidnet_tuple_unpack_alias_match is not None:
+            input_name = str(pidnet_tuple_unpack_alias_match.group("input"))
+            if input_name in pidnet_tuple_alias_pairs:
+                input0_name, input1_name = pidnet_tuple_alias_pairs[input_name]
+                _pidnet_propagate_alias(str(pidnet_tuple_unpack_alias_match.group("lhs0")), input0_name)
+                _pidnet_propagate_alias(str(pidnet_tuple_unpack_alias_match.group("lhs1")), input1_name)
+                continue
+            if input_name in pidnet_cf_binary_tuple_sources:
+                pidnet_cf_binary_sources.update(
+                    {
+                        str(pidnet_tuple_unpack_alias_match.group("lhs0")),
+                        str(pidnet_tuple_unpack_alias_match.group("lhs1")),
+                    }
+                )
+                continue
+        pidnet_tuple_alias_match = pidnet_tuple_alias_re.match(line)
+        if pidnet_tuple_alias_match is not None:
+            tuple_pairs = (
+                (str(pidnet_tuple_alias_match.group("lhs0")), str(pidnet_tuple_alias_match.group("input0"))),
+                (str(pidnet_tuple_alias_match.group("lhs1")), str(pidnet_tuple_alias_match.group("input1"))),
+            )
+            for lhs_name, input_name in tuple_pairs:
+                _pidnet_propagate_alias(lhs_name, input_name)
+            continue
         pidnet_plain_alias_match = pidnet_plain_alias_re.match(line)
         if pidnet_plain_alias_match is not None:
             input_name = str(pidnet_plain_alias_match.group("input"))
             lhs_name = str(pidnet_plain_alias_match.group("lhs"))
-            if input_name.startswith("self."):
-                pidnet_const_alias_sources.add(lhs_name)
-            if _pidnet_is_cf_like_name(input_name):
-                pidnet_cf_alias_sources.add(lhs_name)
-            if input_name in pidnet_cf_binary_sources:
-                pidnet_cf_binary_sources.add(lhs_name)
-            if input_name in pidnet_cf_mul_sources:
-                pidnet_cf_mul_sources.add(lhs_name)
-            if input_name in pidnet_cf_reduce_sum_sources:
-                pidnet_cf_reduce_sum_sources.add(lhs_name)
-            if input_name in pidnet_cf_mean_sources:
-                pidnet_cf_mean_sources.add(lhs_name)
-            if input_name in pidnet_cf_pad_sources:
-                pidnet_cf_pad_sources.add(lhs_name)
-            if input_name in pidnet_cf_pool_sources:
-                pidnet_cf_pool_sources.add(lhs_name)
+            _pidnet_propagate_alias(lhs_name, input_name)
             continue
         pidnet_cf_resize_match = pidnet_cf_resize_re.match(line)
         if pidnet_cf_resize_match is not None:
@@ -26952,6 +27039,53 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                         changed = True
                     pidnet_cf_binary_sources.update({lhs0_name, lhs1_name})
                     continue
+        pidnet_binary_anchor_tuple_match = pidnet_binary_anchor_tuple_re.match(line)
+        if pidnet_binary_anchor_tuple_match is not None:
+            input_a = str(pidnet_binary_anchor_tuple_match.group("a"))
+            input_b = str(pidnet_binary_anchor_tuple_match.group("b"))
+            lhs_name = str(pidnet_binary_anchor_tuple_match.group("lhs"))
+            if any(_pidnet_is_cf_like_name(input_name) for input_name in (input_a, input_b)):
+                current_shape = [
+                    int(pidnet_binary_anchor_tuple_match.group("n")),
+                    int(pidnet_binary_anchor_tuple_match.group("d1")),
+                    int(pidnet_binary_anchor_tuple_match.group("d2")),
+                    int(pidnet_binary_anchor_tuple_match.group("d3")),
+                ]
+                if _pidnet_is_cf_like_name(input_a) and _pidnet_is_const_like_expr(input_b):
+                    if int(current_shape[2]) == 1:
+                        preferred_channel_count = _pidnet_rank4_preferred_channel_count(current_shape)
+                        normalized_shape = [int(current_shape[0]), int(preferred_channel_count), 1, 1]
+                    else:
+                        normalized_shape = _normalize_cf_rank4_shape(
+                            current_shape,
+                            preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
+                        )
+                    ann = (pidnet_binary_anchor_tuple_match.group("ann") or "").rstrip()
+                    lines[index] = (
+                        f"{pidnet_binary_anchor_tuple_match.group('indent')}{lhs_name}{ann} = _align_binary_inputs_to_anchor("
+                        f"{input_a}, torch.reshape({input_b}, {normalized_shape}), {normalized_shape})"
+                    )
+                    changed = True
+                else:
+                    preferred_channel_count = _pidnet_rank4_preferred_channel_count(
+                        current_shape,
+                        prefer_last_if_nhwc=any(
+                            input_name in pidnet_cf_alias_sources for input_name in (input_a, input_b)
+                        ),
+                    )
+                    normalized_shape = _normalize_cf_rank4_shape(
+                        current_shape,
+                        preferred_channel_count=preferred_channel_count,
+                    )
+                    if normalized_shape != current_shape:
+                        ann = (pidnet_binary_anchor_tuple_match.group("ann") or "").rstrip()
+                        lines[index] = (
+                            f"{pidnet_binary_anchor_tuple_match.group('indent')}{lhs_name}{ann} = _align_binary_inputs_to_anchor("
+                            f"{input_a}, {input_b}, {normalized_shape})"
+                        )
+                        changed = True
+                pidnet_cf_binary_tuple_sources.add(lhs_name)
+                continue
         pidnet_cf_pool_match = pidnet_cf_pool_re.match(line)
         if pidnet_cf_pool_match is not None:
             input_name = str(pidnet_cf_pool_match.group("input"))
