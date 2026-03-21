@@ -27876,13 +27876,13 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     stage7_gather_expr_pattern = r"(?:[A-Za-z0-9_]+|torch\.(?:gather|index_select)\(.+\))"
     stage7_gather_reshape_res = [
         re.compile(
-            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>{stage7_gather_expr_pattern}), _resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P=input), allow_zero=False\)\)$"
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>{stage7_gather_expr_pattern}), _resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<shape_input>{stage7_gather_expr_pattern}), allow_zero=False\)\)$"
         ),
         re.compile(
-            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*input\s*=\s*(?P<input>{stage7_gather_expr_pattern})\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P=input), allow_zero=False\)\s*\)$"
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*input\s*=\s*(?P<input>{stage7_gather_expr_pattern})\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<shape_input>{stage7_gather_expr_pattern}), allow_zero=False\)\s*\)$"
         ),
         re.compile(
-            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<input>{stage7_gather_expr_pattern}), allow_zero=False\)\s*,\s*input\s*=\s*(?P=input)\s*\)$"
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<shape_input>{stage7_gather_expr_pattern}), allow_zero=False\)\s*,\s*input\s*=\s*(?P<input>{stage7_gather_expr_pattern})\s*\)$"
         ),
         re.compile(
             rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>{stage7_gather_expr_pattern}), {stage7_reshape_shape_pattern}\)$"
@@ -27934,12 +27934,71 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
             parts.append(tail)
         return parts
 
+    stage7_anchor_shape_alias_sources: Dict[str, str] = {}
+
+    def _strip_stage7_outer_parentheses(expr: str) -> str:
+        stripped_expr = str(expr).strip()
+        while stripped_expr.startswith("(") and stripped_expr.endswith(")"):
+            depth = 0
+            balanced = True
+            for index, char in enumerate(stripped_expr):
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0 and index != len(stripped_expr) - 1:
+                        balanced = False
+                        break
+                if depth < 0:
+                    balanced = False
+                    break
+            if not balanced or depth != 0:
+                break
+            inner_expr = stripped_expr[1:-1].strip()
+            if not (
+                re.fullmatch(r"[A-Za-z0-9_]+", inner_expr) is not None
+                or (inner_expr.startswith("[") and inner_expr.endswith("]"))
+                or (inner_expr.startswith("(") and inner_expr.endswith(")"))
+            ):
+                break
+            stripped_expr = inner_expr
+        return stripped_expr
+
+    def _resolve_stage7_anchor_target_shape(target_expr: str) -> str:
+        resolved_target = _strip_stage7_outer_parentheses(str(target_expr).strip())
+        seen_targets: Set[str] = set()
+        while (
+            resolved_target in stage7_anchor_shape_alias_sources
+            and resolved_target not in seen_targets
+        ):
+            seen_targets.add(resolved_target)
+            resolved_target = _strip_stage7_outer_parentheses(
+                stage7_anchor_shape_alias_sources[resolved_target]
+            )
+        return resolved_target
+
+    def _parse_stage7_anchor_shape_alias(line: str) -> tuple[str, str] | None:
+        shape_alias_match = re.match(
+            r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*[^=]+)?\s*=\s*(?P<rhs>.+?)\s*$",
+            line,
+        )
+        if shape_alias_match is None:
+            return None
+        rhs_value = _strip_stage7_outer_parentheses(str(shape_alias_match.group("rhs")))
+        if (
+            re.fullmatch(r"(?:\[|\()\s*1\s*,\s*1\s*,\s*1\s*,\s*1\s*(?:\]|\))", rhs_value)
+            is None
+            and rhs_value not in stage7_anchor_shape_alias_sources
+        ):
+            return None
+        return str(shape_alias_match.group("lhs")), rhs_value
+
     def _parse_stage7_singleton_anchor_args(args: str) -> tuple[str, str] | None:
         parts = _split_stage7_top_level_args(args)
         if len(parts) == 3:
             rs_value = parts[0].strip()
             tr_value = parts[1].strip()
-            target_value = parts[2].strip()
+            target_value = _resolve_stage7_anchor_target_shape(parts[2].strip())
             if (
                 re.fullmatch(r"(?:\[|\()\s*1\s*,\s*1\s*,\s*1\s*,\s*1\s*(?:\]|\))", target_value)
                 is not None
@@ -27954,7 +28013,11 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
             keyword_values[key.strip()] = value.strip()
         rs_value = keyword_values.get("input0")
         tr_value = keyword_values.get("input1")
-        target_value = keyword_values.get("target_shape")
+        target_value = (
+            _resolve_stage7_anchor_target_shape(keyword_values["target_shape"])
+            if "target_shape" in keyword_values
+            else None
+        )
         if (
             rs_value is None
             or tr_value is None
@@ -27969,13 +28032,13 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         branch_expr_pattern = r"(?:[A-Za-z0-9_]+|torch\.(?:gather|index_select)\(.+\))"
         inline_patterns = [
             re.compile(
-                rf"^torch\.reshape\({branch_expr_pattern}, _resolve_reshape_shape\({stage7_reshape_shape_pattern}, {branch_expr_pattern}, allow_zero=False\)\)$"
+                rf"^torch\.reshape\((?P<input>{branch_expr_pattern}), _resolve_reshape_shape\({stage7_reshape_shape_pattern}, {branch_expr_pattern}, allow_zero=False\)\)$"
             ),
             re.compile(
-                rf"^torch\.reshape\(\s*input\s*=\s*{branch_expr_pattern}\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, {branch_expr_pattern}, allow_zero=False\)\s*\)$"
+                rf"^torch\.reshape\(\s*input\s*=\s*(?P<input>{branch_expr_pattern})\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, {branch_expr_pattern}, allow_zero=False\)\s*\)$"
             ),
             re.compile(
-                rf"^torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, {branch_expr_pattern}, allow_zero=False\)\s*,\s*input\s*=\s*{branch_expr_pattern}\s*\)$"
+                rf"^torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, {branch_expr_pattern}, allow_zero=False\)\s*,\s*input\s*=\s*(?P<input>{branch_expr_pattern})\s*\)$"
             ),
             re.compile(
                 rf"^torch\.reshape\({branch_expr_pattern}, {stage7_reshape_shape_pattern}\)$"
@@ -28018,6 +28081,9 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     has_stage7_return = False
     for line in lines:
         current_line = str(line)
+        parsed_shape_alias = _parse_stage7_anchor_shape_alias(current_line)
+        if parsed_shape_alias is not None:
+            stage7_anchor_shape_alias_sources[parsed_shape_alias[0]] = parsed_shape_alias[1]
         if stage7_def_re.match(current_line) is not None:
             has_stage7_def = True
             continue
@@ -28145,13 +28211,13 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     stage7_gather_expr_pattern = r"(?:[A-Za-z0-9_]+|torch\.(?:gather|index_select)\(.+\))"
     stage7_gather_reshape_res = [
         re.compile(
-            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>{stage7_gather_expr_pattern}), _resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P=input), allow_zero=False\)\)$"
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>{stage7_gather_expr_pattern}), _resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<shape_input>{stage7_gather_expr_pattern}), allow_zero=False\)\)$"
         ),
         re.compile(
-            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*input\s*=\s*(?P<input>{stage7_gather_expr_pattern})\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P=input), allow_zero=False\)\s*\)$"
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*input\s*=\s*(?P<input>{stage7_gather_expr_pattern})\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<shape_input>{stage7_gather_expr_pattern}), allow_zero=False\)\s*\)$"
         ),
         re.compile(
-            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<input>{stage7_gather_expr_pattern}), allow_zero=False\)\s*,\s*input\s*=\s*(?P=input)\s*\)$"
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<shape_input>{stage7_gather_expr_pattern}), allow_zero=False\)\s*,\s*input\s*=\s*(?P<input>{stage7_gather_expr_pattern})\s*\)$"
         ),
         re.compile(
             rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>{stage7_gather_expr_pattern}), {stage7_reshape_shape_pattern}\)$"
@@ -28197,8 +28263,8 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.add\(\s*other\s*=\s*(?P<input1>[A-Za-z0-9_]+)\s*,\s*input\s*=\s*(?P<input0>[A-Za-z0-9_]+)\s*\)$"
         ),
     ]
-    stage7_shape_tensor_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _shape_tensor\((?P<input>[A-Za-z0-9_]+), dtype=torch\.int32(?:, device=(?P<device_source>[A-Za-z0-9_]+)\.device)?\)$"
+    stage7_shape_tensor_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _shape_tensor\((?P<args>.+)\)$"
     )
     stage7_singleton_anchor_assign_re = re.compile(
         r"^\s*(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<args>.+)\)$"
@@ -28353,7 +28419,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         (index for index in range(stage7_def_index + 1, len(lines)) if lines[index].startswith("    def ")),
         len(lines),
     ) if stage7_def_index is not None else len(lines)
-    stage7_shape_matches: list[tuple[int, re.Match[str]]] = []
+    stage7_shape_matches: list[tuple[int, dict[str, str | None]]] = []
     stage7_singleton_anchor_matches: list[tuple[int, dict[str, str]]] = []
     stage7_descriptor_matches: list[tuple[int, dict[str, str]]] = []
     stage7_gather_reshape_matches: list[tuple[int, re.Match[str]]] = []
@@ -28388,12 +28454,71 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             parts.append(tail)
         return parts
 
+    stage7_anchor_shape_alias_sources: Dict[str, str] = {}
+
+    def _strip_stage7_outer_parentheses(expr: str) -> str:
+        stripped_expr = str(expr).strip()
+        while stripped_expr.startswith("(") and stripped_expr.endswith(")"):
+            depth = 0
+            balanced = True
+            for index, char in enumerate(stripped_expr):
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0 and index != len(stripped_expr) - 1:
+                        balanced = False
+                        break
+                if depth < 0:
+                    balanced = False
+                    break
+            if not balanced or depth != 0:
+                break
+            inner_expr = stripped_expr[1:-1].strip()
+            if not (
+                re.fullmatch(r"[A-Za-z0-9_]+", inner_expr) is not None
+                or (inner_expr.startswith("[") and inner_expr.endswith("]"))
+                or (inner_expr.startswith("(") and inner_expr.endswith(")"))
+            ):
+                break
+            stripped_expr = inner_expr
+        return stripped_expr
+
+    def _resolve_stage7_anchor_target_shape(target_expr: str) -> str:
+        resolved_target = _strip_stage7_outer_parentheses(str(target_expr).strip())
+        seen_targets: Set[str] = set()
+        while (
+            resolved_target in stage7_anchor_shape_alias_sources
+            and resolved_target not in seen_targets
+        ):
+            seen_targets.add(resolved_target)
+            resolved_target = _strip_stage7_outer_parentheses(
+                stage7_anchor_shape_alias_sources[resolved_target]
+            )
+        return resolved_target
+
+    def _parse_stage7_anchor_shape_alias(line: str) -> tuple[str, str] | None:
+        shape_alias_match = re.match(
+            r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*[^=]+)?\s*=\s*(?P<rhs>.+?)\s*$",
+            line,
+        )
+        if shape_alias_match is None:
+            return None
+        rhs_value = _strip_stage7_outer_parentheses(str(shape_alias_match.group("rhs")))
+        if (
+            re.fullmatch(r"(?:\[|\()\s*1\s*,\s*1\s*,\s*1\s*,\s*1\s*(?:\]|\))", rhs_value)
+            is None
+            and rhs_value not in stage7_anchor_shape_alias_sources
+        ):
+            return None
+        return str(shape_alias_match.group("lhs")), rhs_value
+
     def _parse_stage7_singleton_anchor_args(args: str) -> tuple[str, str] | None:
         parts = _split_stage7_top_level_args(args)
         if len(parts) == 3:
             rs_value = parts[0].strip()
             tr_value = parts[1].strip()
-            target_value = parts[2].strip()
+            target_value = _resolve_stage7_anchor_target_shape(parts[2].strip())
             if (
                 re.fullmatch(r"(?:\[|\()\s*1\s*,\s*1\s*,\s*1\s*,\s*1\s*(?:\]|\))", target_value)
                 is not None
@@ -28408,7 +28533,11 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             keyword_values[key.strip()] = value.strip()
         rs_value = keyword_values.get("input0")
         tr_value = keyword_values.get("input1")
-        target_value = keyword_values.get("target_shape")
+        target_value = (
+            _resolve_stage7_anchor_target_shape(keyword_values["target_shape"])
+            if "target_shape" in keyword_values
+            else None
+        )
         if (
             rs_value is None
             or tr_value is None
@@ -28534,6 +28663,34 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             str(keyword_index_match.group("indices")),
         )
 
+    def _parse_stage7_shape_tensor_args(args: str) -> tuple[str, str | None] | None:
+        parts = _split_stage7_top_level_args(args)
+        input_name: str | None = None
+        dtype_value: str | None = None
+        device_source: str | None = None
+        if parts and re.fullmatch(r"[A-Za-z0-9_]+", parts[0].strip()) is not None:
+            input_name = parts[0].strip()
+            parts = parts[1:]
+        for part in parts:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "input":
+                input_name = value
+            elif key == "dtype":
+                dtype_value = value
+            elif key == "device":
+                device_match = re.fullmatch(r"(?P<source>[A-Za-z0-9_]+)\.device", value)
+                if device_match is not None:
+                    device_source = str(device_match.group("source"))
+        if input_name is None or re.fullmatch(r"[A-Za-z0-9_]+", input_name) is None:
+            return None
+        if dtype_value != "torch.int32":
+            return None
+        return input_name, device_source
+
     def _parse_stage7_permute_input(args: str, expected_dims: tuple[int, ...]) -> str | None:
         dims_pattern = stage7_permute_dims_patterns.get(expected_dims)
         if dims_pattern is None:
@@ -28558,6 +28715,9 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
 
     if stage7_def_index is not None:
         for scan_index in range(stage7_def_index + 1, stage7_end_index):
+            parsed_shape_alias = _parse_stage7_anchor_shape_alias(lines[scan_index])
+            if parsed_shape_alias is not None:
+                stage7_anchor_shape_alias_sources[parsed_shape_alias[0]] = parsed_shape_alias[1]
             anchor_pair_match = stage7_anchor_pair_assign_re.match(lines[scan_index])
             if anchor_pair_match is not None:
                 anchor_pair_args = _parse_stage7_singleton_anchor_args(str(anchor_pair_match.group("args")))
@@ -28608,9 +28768,20 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             alias_match = stage7_plain_alias_re.match(lines[scan_index])
             if alias_match is not None:
                 stage7_alias_sources[str(alias_match.group("lhs"))] = str(alias_match.group("rhs"))
-            shape_match = stage7_shape_tensor_re.match(lines[scan_index])
+            shape_match = stage7_shape_tensor_assign_re.match(lines[scan_index])
             if shape_match is not None:
-                stage7_shape_matches.append((scan_index, shape_match))
+                parsed_shape_args = _parse_stage7_shape_tensor_args(str(shape_match.group("args")))
+                if parsed_shape_args is not None:
+                    stage7_shape_matches.append(
+                        (
+                            scan_index,
+                            {
+                                "lhs": str(shape_match.group("lhs")),
+                                "input": parsed_shape_args[0],
+                                "device_source": parsed_shape_args[1],
+                            },
+                        )
+                    )
             permute_match = stage7_permute_assign_re.match(lines[scan_index])
             if permute_match is not None:
                 permute_args = str(permute_match.group("args"))
@@ -28882,7 +29053,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         return None
 
     detected_add_names = [
-        _resolve_stage7_alias(str(match.group("input")))
+        _resolve_stage7_alias(str(match["input"]))
         for _, match in stage7_shape_matches
     ]
     stage7_param_names = re.findall(r"([A-Za-z0-9_]+): torch\.Tensor", lines[stage7_def_index])
@@ -29530,7 +29701,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     relevant_shape_matches = [
         (scan_index, match)
         for scan_index, match in stage7_shape_matches
-        if _resolve_stage7_alias(str(match.group("input"))) in relevant_add_names
+        if _resolve_stage7_alias(str(match["input"])) in relevant_add_names
     ]
     relevant_gather_matches = [
         (scan_index, match)
