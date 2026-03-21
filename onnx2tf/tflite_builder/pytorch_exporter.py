@@ -24855,6 +24855,38 @@ def _normalize_cf_rank4_shape(
     return [n, channel_value, normalized_h, normalized_w]
 
 
+def _normalize_nhwc_rank4_shape(
+    shape: Sequence[int],
+    preferred_channel_count: int | None = None,
+    out_hw: Tuple[int, int] | None = None,
+) -> List[int]:
+    shape_values = [int(value) for value in list(shape)]
+    if len(shape_values) != 4:
+        return shape_values
+    if preferred_channel_count is None:
+        layout_hint = _fast_precanonicalize_rank4_layout_hint(shape_values)
+        if layout_hint == "cf":
+            return [
+                int(shape_values[0]),
+                int(shape_values[2]),
+                int(shape_values[3]),
+                int(shape_values[1]),
+            ]
+    normalized_cf_shape = _normalize_cf_rank4_shape(
+        shape_values,
+        preferred_channel_count=preferred_channel_count,
+        out_hw=out_hw,
+    )
+    if len(normalized_cf_shape) != 4:
+        return shape_values
+    return [
+        int(normalized_cf_shape[0]),
+        int(normalized_cf_shape[2]),
+        int(normalized_cf_shape[3]),
+        int(normalized_cf_shape[1]),
+    ]
+
+
 def _fast_precanonicalize_infer_consumer_layout(
     name: str,
     start_index: int,
@@ -25170,23 +25202,6 @@ def _repair_cf_pool_target_shape(
         dynamic_nhwc_like_names,
         context,
     )
-    if (
-        str(apply_pool2d_match.group("channel_last")) == "True"
-        and _fast_precanonicalize_has_channel_last_spatial_consumer(
-            lhs_name,
-            index,
-            lines,
-            context,
-        )
-    ):
-        return None, None
-    should_repair = (
-        str(apply_pool2d_match.group("channel_last")) == "False"
-        or _fast_precanonicalize_is_cf_like(input_name, dynamic_cf_like_names, context)
-        or consumer_layout == "cf"
-    )
-    if not should_repair:
-        return None, None
     preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
         lhs_name,
         dynamic_cf_like_names,
@@ -25206,6 +25221,31 @@ def _repair_cf_pool_target_shape(
         int(apply_pool2d_match.group("w")),
         int(apply_pool2d_match.group("c")),
     ]
+    if str(apply_pool2d_match.group("channel_last")) == "True":
+        if _fast_precanonicalize_rank4_layout_hint(
+            current_shape,
+            preferred_channel_count=preferred_channel_count,
+        ) == "nhwc":
+            return None, None
+        normalized_shape = _normalize_nhwc_rank4_shape(
+            current_shape,
+            preferred_channel_count=preferred_channel_count,
+        )
+        rewritten = (
+            f"{apply_pool2d_match.group('indent')}{lhs_name} = _apply_pool2d("
+            f"{input_name}, {apply_pool2d_match.group('rest')}, target_shape={repr(normalized_shape)}, "
+            f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=True)"
+        )
+        if rewritten == line:
+            return None, None
+        return rewritten, lhs_name
+    should_repair = (
+        str(apply_pool2d_match.group("channel_last")) == "False"
+        or _fast_precanonicalize_is_cf_like(input_name, dynamic_cf_like_names, context)
+        or consumer_layout == "cf"
+    )
+    if not should_repair:
+        return None, None
     if _fast_precanonicalize_rank4_layout_hint(
         current_shape,
         preferred_channel_count=preferred_channel_count,
@@ -28304,6 +28344,10 @@ def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Pat
     if _has_iat_llie_skip_signature(model_lines):
         return True
     if _has_bread_fast_skip_signature(model_lines):
+        return True
+    if _has_shadowformer_avoid_model_ir_signature(model_lines):
+        return True
+    if _has_shadowformer_fast_repair_signature(model_lines):
         return True
     return False
 

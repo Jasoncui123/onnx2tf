@@ -5023,9 +5023,9 @@ def test_apply_fast_precanonicalize_repairs_keeps_shadowformer_pool_chain_channe
     _apply_fast_precanonicalize_repairs(package_dir)
 
     repaired = model_path.read_text(encoding="utf-8")
-    assert "wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 80, 120], is_max_pool=True, channel_last=True)" in repaired
-    assert "wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 40, 60], is_max_pool=True, channel_last=True)" in repaired
-    assert "wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 20, 30], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 80, 120, 1], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 20, 30, 1], is_max_pool=True, channel_last=True)" in repaired
 
 
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_typed_buffer_alias(
