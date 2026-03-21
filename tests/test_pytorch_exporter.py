@@ -737,6 +737,79 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_with_parenth
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_with_const_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_const_aliases_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 192, 1, 1])",
+                "        spp_bn_mul_out = torch.mul(scale4_bn_mul, spp_global_cf)",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(self.const_demo_add_any, bn_add_in, [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1]))"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(self.const_demo_add_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_with_typed_const_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_typed_const_alias_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul: torch.Tensor = self.const_demo_mul_any",
+                "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 192, 1, 1])",
+                "        spp_bn_mul_out = torch.mul(scale4_bn_mul, spp_global_cf)",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(self.const_demo_add_any, bn_add_in, [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1]))"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_removes_permute_for_singleton_rank4_matmul_conv_input(
     tmp_path,
 ) -> None:
@@ -9354,6 +9427,96 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_spp_scale3_with_par
     assert (
         "_binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(bn_add_in, "
         "torch.reshape(self.const_demo_add_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_spp_scale3_with_const_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale3_const_aliases_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_pool_out: torch.Tensor, spp_mul_in: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        scale3_recip = self.const_demo_recip_any",
+                "        scale3_add = self.const_demo_add_any",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(scale3_recip, spp_pool_out, [1, 192, 1, 17])",
+                "        spp_mul_out = _align_tensor_to_target_shape(torch.mul(scale3_recip, spp_mul_in), [1, 192, 1, 29])",
+                "        _binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(scale3_add, bn_add_in, [1, 192, 1, 31])",
+                "        return spp_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(scale3_recip, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "spp_mul_out = _align_tensor_to_target_shape(torch.mul(spp_mul_in, "
+        "scale3_recip), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(scale3_add, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_spp_scale3_with_compact_typed_const_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale3_compact_typed_const_alias_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_pool_out: torch.Tensor, spp_mul_in: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        scale3_recip:torch.Tensor=self.const_demo_recip_any",
+                "        scale3_add:torch.Tensor=self.const_demo_add_any",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(scale3_recip, spp_pool_out, [1, 192, 1, 17])",
+                "        spp_mul_out = _align_tensor_to_target_shape(torch.mul(scale3_recip, spp_mul_in), [1, 192, 1, 29])",
+                "        _binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(scale3_add, bn_add_in, [1, 192, 1, 31])",
+                "        return spp_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(scale3_recip, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "spp_mul_out = _align_tensor_to_target_shape(torch.mul(spp_mul_in, "
+        "scale3_recip), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(scale3_add, [1, 192, 1, 1]), [1, 192, 1, 1])"
         in rewritten
     )
 
