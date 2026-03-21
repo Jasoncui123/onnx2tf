@@ -28749,19 +28749,48 @@ def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
 def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
     pad_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), "
-        r"\[(?P<p0>\d+), (?P<p1>\d+), (?P<p2>\d+), (?P<p3>\d+)\], mode='constant', value=0\.0\)$"
+        r"[\[\(](?P<p0>\d+), (?P<p1>\d+), (?P<p2>\d+), (?P<p3>\d+)[\]\)], mode='constant', value=0\.0\)$"
     )
     global_mean_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=[\[\(]2, 3[\]\)], keepdim=True\)$"
+    )
+    self_const_alias_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*self\.(?P<const_attr>[A-Za-z0-9_]+)\s*\)*$"
+    )
+    generic_alias_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*$"
+    )
+    tuple_const_alias_re = re.compile(
+        r"^\s*\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*,\s*"
+        r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*"
+        r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*$"
+    )
+    const_pair_alias_re = re.compile(
+        r"^\s*(?P<pair>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*"
+        r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*$"
+    )
+    tuple_const_unpack_re = re.compile(
+        r"^\s*\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*,\s*"
+        r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*$"
     )
     scale4_mul_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.mul\([A-Za-z0-9_]+, torch\.reshape\(self\.[A-Za-z0-9_]+, \[1, \d+, 1, 1\]\)\)$"
+        r"^\s*[A-Za-z0-9_]+ = torch\.mul\(\(*\s*[A-Za-z0-9_]+\s*\)*, "
+        r"torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\)\)$"
+    )
+    scale4_mul_reversed_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.mul\(torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), "
+        r"\(*\s*[A-Za-z0-9_]+\s*\)*\)$"
     )
     scale4_add_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\([A-Za-z0-9_]+, torch\.reshape\(self\.[A-Za-z0-9_]+, \[1, \d+, 1, 1\]\), \[1, \d+, 1, 1\]\)$"
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\(\(*\s*[A-Za-z0-9_]+\s*\)*, "
+        r"torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), [\[\(]1, \d+, 1, 1[\]\)]\)$"
+    )
+    scale4_add_reversed_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\(torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), "
+        r"\(*\s*[A-Za-z0-9_]+\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\)$"
     )
     pag_mul_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[1, \d+, \d+, \d+\]\)$"
+        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\(\(*\s*[A-Za-z0-9_]+\s*\)*, \(*\s*[A-Za-z0-9_]+\s*\)*\), [\[\(]1, \d+, \d+, \d+[\]\)]\)$"
     )
 
     padded_inputs: Set[str] = set()
@@ -28769,6 +28798,19 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
     has_scale4_mul = False
     has_scale4_add = False
     has_pag_mul = False
+    const_alias_sources: Dict[str, str] = {}
+    const_pair_alias_sources: Dict[str, Tuple[str, str]] = {}
+
+    def _resolve_const_expr(expr: str) -> str | None:
+        resolved = str(expr).strip()
+        while True:
+            if resolved.startswith("self."):
+                return resolved[len("self.") :]
+            aliased = const_alias_sources.get(resolved, None)
+            if aliased is None or aliased == resolved:
+                return None
+            resolved = aliased
+
     for line in lines:
         current_line = str(line)
         pad_match = pad_re.match(current_line)
@@ -28786,10 +28828,68 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
         if mean_match is not None:
             mean_inputs.add(str(mean_match.group("input")))
             continue
-        if scale4_mul_re.match(current_line) is not None:
+        self_const_alias_match = self_const_alias_re.match(current_line)
+        if self_const_alias_match is not None:
+            const_alias_sources[str(self_const_alias_match.group("lhs"))] = (
+                f"self.{self_const_alias_match.group('const_attr')}"
+            )
+            continue
+        generic_alias_match = generic_alias_re.match(current_line)
+        if generic_alias_match is not None:
+            aliased_input = str(generic_alias_match.group("input"))
+            aliased_attr = const_alias_sources.get(aliased_input, None)
+            if aliased_attr is not None:
+                const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_attr
+            aliased_pair = const_pair_alias_sources.get(aliased_input, None)
+            if aliased_pair is not None:
+                const_pair_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_pair
+            continue
+        tuple_const_alias_match = tuple_const_alias_re.match(current_line)
+        if tuple_const_alias_match is not None:
+            tuple_pairs = (
+                (str(tuple_const_alias_match.group("lhs0")), str(tuple_const_alias_match.group("input0"))),
+                (str(tuple_const_alias_match.group("lhs1")), str(tuple_const_alias_match.group("input1"))),
+            )
+            for lhs_name, rhs_name in tuple_pairs:
+                resolved_const = _resolve_const_expr(rhs_name)
+                if resolved_const is not None:
+                    const_alias_sources[lhs_name] = f"self.{resolved_const}"
+            continue
+        const_pair_alias_match = const_pair_alias_re.match(current_line)
+        if const_pair_alias_match is not None:
+            input0_name = str(const_pair_alias_match.group("input0"))
+            input1_name = str(const_pair_alias_match.group("input1"))
+            resolved0 = _resolve_const_expr(input0_name)
+            resolved1 = _resolve_const_expr(input1_name)
+            if resolved0 is not None and resolved1 is not None:
+                const_pair_alias_sources[str(const_pair_alias_match.group("pair"))] = (
+                    f"self.{resolved0}",
+                    f"self.{resolved1}",
+                )
+            continue
+        tuple_const_unpack_match = tuple_const_unpack_re.match(current_line)
+        if tuple_const_unpack_match is not None:
+            pair_sources = const_pair_alias_sources.get(str(tuple_const_unpack_match.group("input")), None)
+            if pair_sources is not None:
+                const_alias_sources[str(tuple_const_unpack_match.group("lhs0"))] = str(pair_sources[0])
+                const_alias_sources[str(tuple_const_unpack_match.group("lhs1"))] = str(pair_sources[1])
+            continue
+        scale4_mul_match = scale4_mul_re.match(current_line)
+        if scale4_mul_match is None:
+            scale4_mul_match = scale4_mul_reversed_re.match(current_line)
+        if (
+            scale4_mul_match is not None
+            and _resolve_const_expr(str(scale4_mul_match.group("const_expr"))) is not None
+        ):
             has_scale4_mul = True
             continue
-        if scale4_add_re.match(current_line) is not None:
+        scale4_add_match = scale4_add_re.match(current_line)
+        if scale4_add_match is None:
+            scale4_add_match = scale4_add_reversed_re.match(current_line)
+        if (
+            scale4_add_match is not None
+            and _resolve_const_expr(str(scale4_add_match.group("const_expr"))) is not None
+        ):
             has_scale4_add = True
             continue
         if pag_mul_re.match(current_line) is not None:
