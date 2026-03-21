@@ -200,6 +200,15 @@ def _prepare_native_codegen_state(
     context: _NativeModelFileWriterContext,
 ) -> _NativeCodegenState:
     state = _NativeCodegenState(context=context)
+    cache_bucket = _native_codegen_cache_bucket_for_model_ir(model_ir=context.model_ir)
+    cache_bucket.setdefault(
+        "producer_lookup",
+        {
+            str(output_name): context.model_ir.operators[int(op_index)]
+            for output_name, op_index in context.producer_index.items()
+            if 0 <= int(op_index) < len(context.model_ir.operators)
+        },
+    )
     state.used_local_var_names = set(context.tensor_var_names.values())
     state.public_input_names = {str(name) for name in list(context.model_ir.inputs)}
     state.public_layout_bridge_tensor_names = {
@@ -663,16 +672,84 @@ def _base_target_shape_values_for_model_ir(
     )
 
 
+def _native_codegen_cache_bucket_for_model_ir(
+    *,
+    model_ir: ModelIR,
+) -> Dict[str, Any]:
+    metadata = model_ir.metadata
+    bucket = metadata.get("_native_codegen_cache", None)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        metadata["_native_codegen_cache"] = bucket
+    return cast(Dict[str, Any], bucket)
+
+
+def _native_codegen_producer_lookup_for_model_ir(
+    *,
+    model_ir: ModelIR,
+) -> Dict[str, OperatorIR]:
+    bucket = _native_codegen_cache_bucket_for_model_ir(model_ir=model_ir)
+    cached_lookup = bucket.get("producer_lookup", None)
+    if isinstance(cached_lookup, dict):
+        return cast(Dict[str, OperatorIR], cached_lookup)
+    producer_lookup: Dict[str, OperatorIR] = {}
+    for op in model_ir.operators:
+        for output_name in list(op.outputs):
+            producer_lookup[str(output_name)] = op
+    bucket["producer_lookup"] = producer_lookup
+    return producer_lookup
+
+
+def _native_codegen_expected_channel_dim_cache_for_model_ir(
+    *,
+    model_ir: ModelIR,
+) -> Dict[str, Optional[int]]:
+    bucket = _native_codegen_cache_bucket_for_model_ir(model_ir=model_ir)
+    cached_dims = bucket.get("expected_channel_dims", None)
+    if isinstance(cached_dims, dict):
+        return cast(Dict[str, Optional[int]], cached_dims)
+    candidates_by_tensor_name: Dict[str, Set[int]] = {}
+    for op in model_ir.operators:
+        if str(op.op_type) != "CONV_2D" or len(op.inputs) < 2:
+            continue
+        weight_tensor = model_ir.tensors.get(str(op.inputs[1]), None)
+        if weight_tensor is None or len(list(weight_tensor.shape)) != 4:
+            continue
+        weight_shape = [int(v) for v in list(weight_tensor.shape)]
+        input_name = str(op.inputs[0]) if len(op.inputs) >= 1 else ""
+        output_name = str(op.outputs[0]) if len(op.outputs) >= 1 else ""
+        if input_name != "":
+            input_tensor = model_ir.tensors.get(input_name, None)
+            output_tensor = model_ir.tensors.get(output_name, None) if output_name != "" else None
+            inferred_input_channels, _ = _infer_conv2d_ctor_params_for_codegen(
+                input_shape=None if input_tensor is None else list(input_tensor.shape),
+                output_shape=None if output_tensor is None else list(output_tensor.shape),
+                weight_shape=weight_shape,
+                options=op.options,
+                input_logical_layout=None if input_tensor is None else str(input_tensor.logical_layout),
+                output_logical_layout=None if output_tensor is None else str(output_tensor.logical_layout),
+                depthwise=False,
+            )
+            if int(inferred_input_channels) > 0:
+                candidates_by_tensor_name.setdefault(input_name, set()).add(int(inferred_input_channels))
+        if output_name != "" and int(weight_shape[0]) > 0:
+            candidates_by_tensor_name.setdefault(output_name, set()).add(int(weight_shape[0]))
+    expected_channel_dims = {
+        str(tensor_name): (next(iter(candidates)) if len(candidates) == 1 else None)
+        for tensor_name, candidates in candidates_by_tensor_name.items()
+    }
+    bucket["expected_channel_dims"] = expected_channel_dims
+    return expected_channel_dims
+
+
 def _producer_op_for_model_ir(
     *,
     model_ir: ModelIR,
     tensor_name: str,
 ) -> Optional[OperatorIR]:
-    target_name = str(tensor_name)
-    for op in model_ir.operators:
-        if target_name in {str(v) for v in list(op.outputs)}:
-            return op
-    return None
+    return _native_codegen_producer_lookup_for_model_ir(
+        model_ir=model_ir,
+    ).get(str(tensor_name), None)
 
 
 def _channel_first_shape_values_for_model_ir(
@@ -684,6 +761,18 @@ def _channel_first_shape_values_for_model_ir(
     current_name = str(tensor_name)
     if _seen is None:
         _seen = set()
+    bucket = _native_codegen_cache_bucket_for_model_ir(model_ir=model_ir)
+    cached_shapes = bucket.setdefault("channel_first_shapes", {})
+    in_progress = bucket.setdefault("channel_first_shapes_in_progress", set())
+    if not isinstance(cached_shapes, dict):
+        cached_shapes = {}
+        bucket["channel_first_shapes"] = cached_shapes
+    if not isinstance(in_progress, set):
+        in_progress = set()
+        bucket["channel_first_shapes_in_progress"] = in_progress
+    if current_name in cached_shapes:
+        cached_value = cached_shapes.get(current_name, None)
+        return None if cached_value is None else [int(v) for v in list(cached_value)]
     if current_name in _seen:
         base_shape = _base_target_shape_values_for_model_ir(
             model_ir=model_ir,
@@ -694,6 +783,17 @@ def _channel_first_shape_values_for_model_ir(
             tensor_name=current_name,
             shape_values=base_shape,
         )
+    if current_name in in_progress:
+        base_shape = _base_target_shape_values_for_model_ir(
+            model_ir=model_ir,
+            tensor_name=current_name,
+        )
+        return _to_channel_first_shape_for_model_ir(
+            model_ir=model_ir,
+            tensor_name=current_name,
+            shape_values=base_shape,
+        )
+    in_progress.add(current_name)
     base_shape = _base_target_shape_values_for_model_ir(
         model_ir=model_ir,
         tensor_name=current_name,
@@ -704,18 +804,26 @@ def _channel_first_shape_values_for_model_ir(
         shape_values=base_shape,
     )
     if channel_first_shape is None:
+        cached_shapes[current_name] = None
+        in_progress.discard(current_name)
         return None
     tensor = model_ir.tensors.get(current_name, None)
     if tensor is None:
+        cached_shapes[current_name] = tuple(int(v) for v in list(channel_first_shape))
+        in_progress.discard(current_name)
         return channel_first_shape
     rank = len(channel_first_shape)
     if rank not in {3, 4, 5}:
+        cached_shapes[current_name] = tuple(int(v) for v in list(channel_first_shape))
+        in_progress.discard(current_name)
         return channel_first_shape
     producer_op = _producer_op_for_model_ir(
         model_ir=model_ir,
         tensor_name=current_name,
     )
     if producer_op is None or str(producer_op.op_type) not in {"ADD", "DIV", "MAXIMUM", "MINIMUM", "MUL", "SUB"}:
+        cached_shapes[current_name] = tuple(int(v) for v in list(channel_first_shape))
+        in_progress.discard(current_name)
         return channel_first_shape
     next_seen = set(_seen)
     next_seen.add(current_name)
@@ -723,6 +831,8 @@ def _channel_first_shape_values_for_model_ir(
     for input_name in list(producer_op.inputs)[:2]:
         input_tensor = model_ir.tensors.get(str(input_name), None)
         if input_tensor is None:
+            cached_shapes[current_name] = tuple(int(v) for v in list(channel_first_shape))
+            in_progress.discard(current_name)
             return channel_first_shape
         if isinstance(input_tensor.data, np.ndarray) and int(np.asarray(input_tensor.data).size) == 1:
             continue
@@ -732,6 +842,8 @@ def _channel_first_shape_values_for_model_ir(
             _seen=next_seen,
         )
         if input_shape is None or len(input_shape) != rank:
+            cached_shapes[current_name] = tuple(int(v) for v in list(channel_first_shape))
+            in_progress.discard(current_name)
             return channel_first_shape
         broadcast_shape = (
             [int(v) for v in list(input_shape)]
@@ -739,9 +851,15 @@ def _channel_first_shape_values_for_model_ir(
             else _broadcast_shapes_relaxed(broadcast_shape, input_shape)
         )
         if broadcast_shape is None:
+            cached_shapes[current_name] = tuple(int(v) for v in list(channel_first_shape))
+            in_progress.discard(current_name)
             return channel_first_shape
     if broadcast_shape is not None:
+        cached_shapes[current_name] = tuple(int(v) for v in list(broadcast_shape))
+        in_progress.discard(current_name)
         return [int(v) for v in list(broadcast_shape)]
+    cached_shapes[current_name] = tuple(int(v) for v in list(channel_first_shape))
+    in_progress.discard(current_name)
     return channel_first_shape
 
 
@@ -857,36 +975,10 @@ def _expected_channel_dim_for_tensor_for_codegen(
     model_ir: ModelIR,
     tensor_name: str,
 ) -> Optional[int]:
-    current_name = str(tensor_name)
-    candidates: List[int] = []
-    for op in model_ir.operators:
-        if str(op.op_type) != "CONV_2D" or len(op.inputs) < 2:
-            continue
-        weight_tensor = model_ir.tensors.get(str(op.inputs[1]), None)
-        if weight_tensor is None or len(list(weight_tensor.shape)) != 4:
-            continue
-        weight_shape = [int(v) for v in list(weight_tensor.shape)]
-        candidate: Optional[int] = None
-        if current_name == str(op.inputs[0]):
-            input_tensor = model_ir.tensors.get(current_name, None)
-            output_tensor = model_ir.tensors.get(str(op.outputs[0]), None) if len(op.outputs) >= 1 else None
-            inferred_input_channels, _ = _infer_conv2d_ctor_params_for_codegen(
-                input_shape=None if input_tensor is None else list(input_tensor.shape),
-                output_shape=None if output_tensor is None else list(output_tensor.shape),
-                weight_shape=weight_shape,
-                options=op.options,
-                input_logical_layout=None if input_tensor is None else str(input_tensor.logical_layout),
-                output_logical_layout=None if output_tensor is None else str(output_tensor.logical_layout),
-                depthwise=False,
-            )
-            candidate = int(inferred_input_channels)
-        elif current_name in {str(v) for v in list(op.outputs)}:
-            candidate = int(weight_shape[0])
-        if candidate is not None and int(candidate) > 0 and int(candidate) not in candidates:
-            candidates.append(int(candidate))
-    if len(candidates) == 1:
-        return int(candidates[0])
-    return None
+    expected_channel_dims = _native_codegen_expected_channel_dim_cache_for_model_ir(
+        model_ir=model_ir,
+    )
+    return expected_channel_dims.get(str(tensor_name), None)
 
 
 def _expected_channel_dim_for_channel_last_named_tensor_for_codegen(
@@ -27963,11 +28055,12 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
         aligned_shapes,
         buffer_aligned_shapes,
     )
-    semantic_supported_shapes = (
-        set(buffer_aligned_shapes)
-        if buffer_aligned_shapes
-        else (set() if registered_shapes else set(supported_shapes))
-    )
+    if buffer_aligned_shapes:
+        semantic_supported_shapes = set(buffer_aligned_shapes)
+    elif registered_shapes:
+        semantic_supported_shapes = set(copied_shapes) if not aligned_shapes else set()
+    else:
+        semantic_supported_shapes = set(supported_shapes)
     has_cf_pool = False
     for line in lines:
         current_line = str(line)
