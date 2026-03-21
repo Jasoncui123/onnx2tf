@@ -5395,6 +5395,14 @@ def _binary_output_target_shape_literal_for_codegen(
         return fallback_literal
     if is_channel_first_logical_layout(output_layout):
         return repr([int(v) for v in list(broadcast_cf_shape)])
+    expected_channels = _expected_channel_dim_for_tensor_for_codegen(
+        model_ir=model_ir,
+        tensor_name=str(output_name),
+    )
+    if expected_channels is not None and int(broadcast_cf_shape[1]) == int(expected_channels):
+        return repr([int(v) for v in list(broadcast_cf_shape)])
+    if not _tensor_name_suggests_channel_last_layout_for_codegen(str(output_name)):
+        return repr([int(v) for v in list(broadcast_cf_shape)])
     return fallback_literal
 
 
@@ -22283,13 +22291,27 @@ def _canonicalize_generated_model_source_for_raw_export(
         lhs = str(resize_cf_match.group("lhs"))
         if not _is_known_cf_name(input_name, singleton_cf_vars):
             continue
+        normalized_target_shape = _pidnet_forced_resize_target(
+            lhs_name=lhs,
+            input_name=input_name,
+            current_target_shape=[
+                int(resize_cf_match.group("n")),
+                int(resize_cf_match.group("h")),
+                int(resize_cf_match.group("w")),
+                int(resize_cf_match.group("c")),
+            ],
+            out_h=int(resize_cf_match.group("out_h")),
+            out_w=int(resize_cf_match.group("out_w")),
+        )
+        if normalized_target_shape is None:
+            continue
         indent = str(resize_cf_match.group("indent"))
         out_h = int(resize_cf_match.group("out_h"))
         out_w = int(resize_cf_match.group("out_w"))
         lines[index] = (
             f"{indent}{lhs} = _apply_resize("
             f"{input_name}, [{out_h}, {out_w}], method='{resize_cf_match.group('method')}', "
-            f"target_shape=[_tensor_shape_list({input_name})[0], _tensor_shape_list({input_name})[1], {out_h}, {out_w}]"
+            f"target_shape={normalized_target_shape}"
             f"{resize_cf_match.group('rest')}, channel_last=False)"
         )
         cf_aliases.add(lhs)
@@ -24866,6 +24888,18 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"{singleton_const_anchor_fix_match.group('input')}, "
             f"torch.reshape(self.{singleton_const_anchor_fix_match.group('const_attr')}, [1, {channel_count}, 1, 1]), "
             f"[1, {channel_count}, 1, 1])"
+        )
+        changed = True
+    for index, line in enumerate(lines):
+        pidnet_spp_scale3_mul_out_match = pidnet_spp_scale3_mul_out_re.match(line)
+        if pidnet_spp_scale3_mul_out_match is None:
+            continue
+        if int(pidnet_spp_scale3_mul_out_match.group("d")) == 1:
+            continue
+        lines[index] = (
+            f"{pidnet_spp_scale3_mul_out_match.group('indent')}{pidnet_spp_scale3_mul_out_match.group('lhs')} = "
+            f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_out_match.group('a')}, "
+            f"{pidnet_spp_scale3_mul_out_match.group('b')}), [1, {pidnet_spp_scale3_mul_out_match.group('c')}, 1, 1])"
         )
         changed = True
     for index in range(len(lines) - 1):
@@ -28774,35 +28808,47 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
         r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*$"
     )
     scale4_mul_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.mul\(\(*\s*[A-Za-z0-9_]+\s*\)*, "
+        r"^\s*[A-Za-z0-9_]+ = torch\.mul\(\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, "
         r"torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\)\)$"
     )
     scale4_mul_reversed_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = torch\.mul\(torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), "
-        r"\(*\s*[A-Za-z0-9_]+\s*\)*\)$"
+        r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*\)$"
     )
     scale4_add_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\(\(*\s*[A-Za-z0-9_]+\s*\)*, "
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\(\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, "
         r"torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), [\[\(]1, \d+, 1, 1[\]\)]\)$"
     )
     scale4_add_reversed_re = re.compile(
         r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\(torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), "
-        r"\(*\s*[A-Za-z0-9_]+\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\)$"
+        r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\)$"
     )
     pag_mul_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\(\(*\s*[A-Za-z0-9_]+\s*\)*, \(*\s*[A-Za-z0-9_]+\s*\)*\), [\[\(]1, \d+, \d+, \d+[\]\)]\)$"
+        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\(\(*\s*(?P<a>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<b>[A-Za-z0-9_]+)\s*\)*\), [\[\(]1, \d+, \d+, \d+[\]\)]\)$"
     )
 
     padded_inputs: Set[str] = set()
     mean_inputs: Set[str] = set()
-    has_scale4_mul = False
-    has_scale4_add = False
-    has_pag_mul = False
+    scale4_mul_inputs: Set[str] = set()
+    scale4_add_inputs: Set[str] = set()
+    pag_mul_root_pairs: Set[Tuple[str, str]] = set()
+    local_alias_sources: Dict[str, str] = {}
     const_alias_sources: Dict[str, str] = {}
     const_pair_alias_sources: Dict[str, Tuple[str, str]] = {}
 
-    def _resolve_const_expr(expr: str) -> str | None:
+    def _resolve_local_alias(expr: str) -> str:
         resolved = str(expr).strip()
+        seen: Set[str] = set()
+        while resolved not in seen:
+            seen.add(resolved)
+            aliased = local_alias_sources.get(resolved, None)
+            if aliased is None or aliased == resolved:
+                break
+            resolved = aliased
+        return resolved
+
+    def _resolve_const_expr(expr: str) -> str | None:
+        resolved = _resolve_local_alias(str(expr).strip())
         while True:
             if resolved.startswith("self."):
                 return resolved[len("self.") :]
@@ -28822,11 +28868,11 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
                 int(pad_match.group("p3")),
             ]
             if len(set(pad_values)) == 1 and int(pad_values[0]) > 0:
-                padded_inputs.add(str(pad_match.group("input")))
+                padded_inputs.add(_resolve_local_alias(str(pad_match.group("input"))))
             continue
         mean_match = global_mean_re.match(current_line)
         if mean_match is not None:
-            mean_inputs.add(str(mean_match.group("input")))
+            mean_inputs.add(_resolve_local_alias(str(mean_match.group("input"))))
             continue
         self_const_alias_match = self_const_alias_re.match(current_line)
         if self_const_alias_match is not None:
@@ -28837,6 +28883,8 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
         generic_alias_match = generic_alias_re.match(current_line)
         if generic_alias_match is not None:
             aliased_input = str(generic_alias_match.group("input"))
+            if not aliased_input.startswith("self."):
+                local_alias_sources[str(generic_alias_match.group("lhs"))] = _resolve_local_alias(aliased_input)
             aliased_attr = const_alias_sources.get(aliased_input, None)
             if aliased_attr is not None:
                 const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_attr
@@ -28881,7 +28929,7 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
             scale4_mul_match is not None
             and _resolve_const_expr(str(scale4_mul_match.group("const_expr"))) is not None
         ):
-            has_scale4_mul = True
+            scale4_mul_inputs.add(_resolve_local_alias(str(scale4_mul_match.group("input"))))
             continue
         scale4_add_match = scale4_add_re.match(current_line)
         if scale4_add_match is None:
@@ -28890,11 +28938,19 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
             scale4_add_match is not None
             and _resolve_const_expr(str(scale4_add_match.group("const_expr"))) is not None
         ):
-            has_scale4_add = True
+            scale4_add_inputs.add(_resolve_local_alias(str(scale4_add_match.group("input"))))
             continue
-        if pag_mul_re.match(current_line) is not None:
-            has_pag_mul = True
-    return bool(padded_inputs & mean_inputs) and has_scale4_mul and has_scale4_add and has_pag_mul
+        pag_mul_match = pag_mul_re.match(current_line)
+        if pag_mul_match is not None:
+            lhs_root = _resolve_local_alias(str(pag_mul_match.group("a")))
+            rhs_root = _resolve_local_alias(str(pag_mul_match.group("b")))
+            if lhs_root != rhs_root:
+                pag_mul_root_pairs.add(tuple(sorted((lhs_root, rhs_root))))
+    return (
+        bool(padded_inputs & mean_inputs)
+        and bool(scale4_mul_inputs & scale4_add_inputs)
+        and bool(pag_mul_root_pairs)
+    )
 
 
 def _is_interleaved_channel_pair_indices(indices: Sequence[int]) -> bool:
@@ -29291,6 +29347,11 @@ def _temporarily_rewrite_generated_model_source_for_exported_program(
             model_ir=model_ir,
         )
         _apply_fast_precanonicalize_repairs_until_stable(package_path)
+        from ._pytorch_exporter_native_codegen_pipeline import (
+            _rewrite_native_generated_model_postprocesses,
+        )
+
+        _rewrite_native_generated_model_postprocesses(model_path)
         yield
     finally:
         current_source = model_path.read_text(encoding="utf-8")
@@ -31760,6 +31821,13 @@ def _export_pytorch_package_from_model_ir_impl(
             json.dump(metadata, f, ensure_ascii=False, indent=2)
 
         _apply_fast_precanonicalize_repairs_until_stable(Path(output_folder_path))
+        if native_load_specs is not None:
+            from ._pytorch_exporter_native_codegen_pipeline import (
+                _rewrite_native_generated_model_postprocesses,
+            )
+
+            final_model_path = Path(output_folder_path) / "model.py"
+            _rewrite_native_generated_model_postprocesses(final_model_path)
         if native_load_specs is not None:
             state_dict = _build_native_generated_state_dict(
                 package_path=output_folder_path,

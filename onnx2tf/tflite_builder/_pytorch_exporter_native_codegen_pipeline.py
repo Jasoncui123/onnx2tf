@@ -113,6 +113,390 @@ def _rewrite_public_layout_bridge_binary_align_calls(model_file: Path) -> None:
         model_file.write_text(rewritten, encoding="utf-8")
 
 
+def _rewrite_resize_argmax_channel_first_axis(model_file: Path) -> None:
+    if not model_file.exists():
+        return
+    lines = model_file.read_text(encoding="utf-8").splitlines()
+    resize_cf_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\("
+        r"(?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', "
+        r"target_shape=\[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\], align_corners=(?P<align>True|False), "
+        r"half_pixel_centers=(?P<hpc>True|False), channel_last=False\)$"
+    )
+    alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)$"
+    )
+    argmax_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.argmax\("
+        r"(?P<input>[A-Za-z0-9_]+), dim=_normalize_dim\((?P<axis>-?\d+), (?P=input)\.ndim\), "
+        r"keepdim=(?P<keepdim>True|False)\)\.to\(dtype=torch\.int64\)$"
+    )
+    changed = False
+    for index, line in enumerate(lines):
+        resize_match = resize_cf_re.match(line)
+        if resize_match is None:
+            continue
+        alias_match = (
+            alias_re.match(lines[index + 1])
+            if index + 1 < len(lines)
+            else None
+        )
+        argmax_index = index + 1
+        argmax_input_names = {str(resize_match.group("lhs"))}
+        if alias_match is not None and str(alias_match.group("src")) == str(resize_match.group("lhs")):
+            argmax_index = index + 2
+            argmax_input_names.add(str(alias_match.group("lhs")))
+        if argmax_index >= len(lines):
+            continue
+        argmax_match = argmax_re.match(lines[argmax_index])
+        if (
+            argmax_match is None
+            or int(argmax_match.group("axis")) != 3
+            or str(argmax_match.group("input")) not in argmax_input_names
+        ):
+            continue
+        lines[argmax_index] = (
+            f"{argmax_match.group('indent')}{argmax_match.group('lhs')} = "
+            f"torch.argmax({argmax_match.group('input')}, "
+            f"dim=_normalize_dim(1, {argmax_match.group('input')}.ndim), "
+            f"keepdim={argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+        )
+        changed = True
+    if changed:
+        model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rewrite_binary_aligned_target_shapes(model_file: Path) -> None:
+    if not model_file.exists():
+        return
+    lines = model_file.read_text(encoding="utf-8").splitlines()
+    alias_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)\s*$"
+    )
+    static_shape_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?:_apply_resize\(.+target_shape=|_align_tensor_to_target_shape\(.+, )\[(?P<shape>[0-9,\s]+)\](?:, .+channel_last=False\)|\))\s*$"
+    )
+    binary_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+) = _align_binary_inputs(?:_to_anchor)?\("
+        r"(?P<left>[A-Za-z0-9_]+), (?P<right>[A-Za-z0-9_]+), \[(?P<shape>[0-9,\s]+)\]\)\s*$"
+    )
+    binary_expr_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"(?P<expr>torch\.(?:add|sub|mul|div|maximum|minimum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)), "
+        r"\[(?P<shape>[0-9,\s]+)\]\)\s*$"
+    )
+    alias_source_by_var: dict[str, str] = {}
+    static_shape_by_var: dict[str, list[int]] = {}
+    for line in lines:
+        alias_match = alias_re.match(line)
+        if alias_match is not None:
+            alias_source_by_var[str(alias_match.group("lhs"))] = str(alias_match.group("rhs"))
+        static_shape_match = static_shape_re.match(line)
+        if static_shape_match is None:
+            continue
+        static_shape_by_var[str(static_shape_match.group("lhs"))] = [
+            int(token.strip())
+            for token in str(static_shape_match.group("shape")).split(",")
+            if token.strip()
+        ]
+
+    def _resolve_alias(name: str) -> str:
+        current = str(name)
+        seen: set[str] = set()
+        while current in alias_source_by_var and current not in seen:
+            seen.add(current)
+            current = str(alias_source_by_var[current])
+        return current
+
+    aligned_shape_by_var: dict[str, list[int]] = {}
+    changed = False
+    for index, line in enumerate(lines):
+        align_match = binary_align_re.match(line)
+        if align_match is not None:
+            target_shape = [
+                int(token.strip())
+                for token in str(align_match.group("shape")).split(",")
+                if token.strip()
+            ]
+            candidate_shape: Optional[list[int]] = None
+            left_root = _resolve_alias(str(align_match.group("left")))
+            right_root = _resolve_alias(str(align_match.group("right")))
+            left_shape = static_shape_by_var.get(left_root, None)
+            right_shape = static_shape_by_var.get(right_root, None)
+            if left_shape is not None and right_shape is not None and left_shape == right_shape:
+                candidate_shape = list(left_shape)
+            elif left_shape is not None and str(left_root).endswith("_cf"):
+                candidate_shape = list(left_shape)
+            elif right_shape is not None and str(right_root).endswith("_cf"):
+                candidate_shape = list(right_shape)
+            if candidate_shape is not None and candidate_shape != target_shape:
+                lines[index] = (
+                    f"{align_match.group('indent')}{align_match.group('lhs')}, {align_match.group('rhs')} = "
+                    f"_align_binary_inputs_to_anchor({align_match.group('left')}, {align_match.group('right')}, "
+                    f"{repr([int(v) for v in list(candidate_shape)])})"
+                    if "_align_binary_inputs_to_anchor(" in line
+                    else (
+                        f"{align_match.group('indent')}{align_match.group('lhs')}, {align_match.group('rhs')} = "
+                        f"_align_binary_inputs({align_match.group('left')}, {align_match.group('right')}, "
+                        f"{repr([int(v) for v in list(candidate_shape)])})"
+                    )
+                )
+                target_shape = list(candidate_shape)
+                changed = True
+            aligned_shape_by_var[str(align_match.group("lhs"))] = list(target_shape)
+            aligned_shape_by_var[str(align_match.group("rhs"))] = list(target_shape)
+            continue
+        expr_match = binary_expr_re.match(line)
+        if expr_match is None:
+            continue
+        lhs_shape = aligned_shape_by_var.get(str(expr_match.group("a")), None)
+        rhs_shape = aligned_shape_by_var.get(str(expr_match.group("b")), None)
+        if lhs_shape is None or rhs_shape is None or lhs_shape != rhs_shape:
+            continue
+        current_shape = [
+            int(token.strip())
+            for token in str(expr_match.group("shape")).split(",")
+            if token.strip()
+        ]
+        if current_shape == lhs_shape:
+            continue
+        lines[index] = (
+            f"{expr_match.group('indent')}{expr_match.group('lhs')} = _align_tensor_to_target_shape("
+            f"{expr_match.group('expr')}, "
+            f"{repr([int(v) for v in list(lhs_shape)])})"
+        )
+        changed = True
+    if changed:
+        model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rewrite_binary_conv_bridge_target_shapes(model_file: Path) -> None:
+    if not model_file.exists():
+        return
+    lines = model_file.read_text(encoding="utf-8").splitlines()
+    conv_block_start_re = re.compile(
+        r"^\s*self\.(?P<attr>[A-Za-z0-9_]+) = _Conv2dBlock\($"
+    )
+    in_channels_re = re.compile(r"^\s*in_channels=(?P<value>\d+),$")
+    binary_align_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"(?P<expr>torch\.(?:add|sub|mul|div|maximum|minimum)\((?P<anchor>[A-Za-z0-9_]+), (?P<other>[A-Za-z0-9_]+)\)), "
+        r"\[(?P<shape>[0-9,\s]+)\]\)$"
+    )
+    consumer_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<attr>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)\s*$"
+    )
+    conv_in_channels: dict[str, int] = {}
+    for index, line in enumerate(lines):
+        start_match = conv_block_start_re.match(line)
+        if start_match is None:
+            continue
+        for lookahead in range(index + 1, min(len(lines), index + 12)):
+            in_channels_match = in_channels_re.match(lines[lookahead])
+            if in_channels_match is not None:
+                conv_in_channels[str(start_match.group("attr"))] = int(in_channels_match.group("value"))
+                break
+            if lines[lookahead].strip() == ")":
+                break
+    if len(conv_in_channels) == 0:
+        return
+    changed = False
+    for index, line in enumerate(lines):
+        binary_match = binary_align_re.match(line)
+        if binary_match is None:
+            continue
+        target_shape = [
+            int(token.strip())
+            for token in str(binary_match.group("shape")).split(",")
+            if token.strip()
+        ]
+        if len(target_shape) != 4:
+            continue
+        consumer_channels: set[int] = set()
+        lhs_name = str(binary_match.group("lhs"))
+        for lookahead in range(index + 1, min(len(lines), index + 6)):
+            candidate = str(lines[lookahead]).strip()
+            if candidate == "":
+                continue
+            if re.match(
+                rf"^{re.escape(lhs_name)} = (?:torch|F)\.[A-Za-z0-9_]+\({re.escape(lhs_name)}(?:,.*)?\)$",
+                candidate,
+            ):
+                continue
+            consumer_match = consumer_re.match(candidate)
+            if (
+                consumer_match is not None
+                and str(consumer_match.group("input")) == lhs_name
+                and str(consumer_match.group("attr")) in conv_in_channels
+            ):
+                consumer_channels.add(conv_in_channels[str(consumer_match.group("attr"))])
+                continue
+            break
+        if len(consumer_channels) != 1:
+            continue
+        in_channels = next(iter(consumer_channels))
+        if target_shape[1] == in_channels or in_channels not in target_shape[2:]:
+            continue
+        anchor_name = str(binary_match.group("anchor"))
+        lines[index] = (
+            f"{binary_match.group('indent')}{lhs_name} = _align_tensor_to_target_shape("
+            f"{binary_match.group('expr')}, "
+            f"[int({anchor_name}.shape[0]), {in_channels}, int({anchor_name}.shape[2]), int({anchor_name}.shape[3])])"
+        )
+        changed = True
+    if changed:
+        model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rewrite_invalid_constant_reshape_targets(model_file: Path) -> None:
+    if not model_file.exists():
+        return
+    lines = model_file.read_text(encoding="utf-8").splitlines()
+    register_buffer_re = re.compile(
+        r'^\s*self\.register_buffer\(\'(?P<attr>[A-Za-z0-9_]+)\', torch\.zeros\(\[(?P<shape>[0-9,\s]+)\]'
+    )
+    reshape_re = re.compile(
+        r"torch\.reshape\(self\.(?P<attr>[A-Za-z0-9_]+), \[(?P<shape>[0-9,\s]+)\]\)"
+    )
+    registered_shapes: dict[str, list[int]] = {}
+    for line in lines:
+        register_match = register_buffer_re.match(line)
+        if register_match is None:
+            continue
+        registered_shapes[str(register_match.group("attr"))] = [
+            int(token.strip())
+            for token in str(register_match.group("shape")).split(",")
+            if token.strip()
+        ]
+
+    def _numel(shape: list[int]) -> int:
+        total = 1
+        for value in shape:
+            total *= int(value)
+        return int(total)
+
+    changed = False
+    for index, line in enumerate(lines):
+        reshape_match = reshape_re.search(line)
+        if reshape_match is None:
+            continue
+        registered_shape = registered_shapes.get(str(reshape_match.group("attr")), None)
+        if registered_shape is None:
+            continue
+        target_shape = [
+            int(token.strip())
+            for token in str(reshape_match.group("shape")).split(",")
+            if token.strip()
+        ]
+        if _numel(target_shape) == _numel(registered_shape):
+            continue
+        lines[index] = (
+            line[: reshape_match.start()]
+            + f"torch.reshape(self.{reshape_match.group('attr')}, {repr([int(v) for v in list(registered_shape)])})"
+            + line[reshape_match.end() :]
+        )
+        changed = True
+    if changed:
+        model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rewrite_channel_first_pool_target_shapes(model_file: Path) -> None:
+    if not model_file.exists():
+        return
+    lines = model_file.read_text(encoding="utf-8").splitlines()
+    static_shape_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?:_align_tensor_to_target_shape\([^,\n]+,\s*|\s*_apply_resize\([^,\n]+,\s*\[[^\]]+\], [^,\n]+, target_shape=)\[(?P<shape>[0-9,\s]+)\](?:\)|, .+\))$"
+    )
+    pool_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<args>.+), target_shape=\[(?P<shape>[0-9,\s]+)\], is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
+    )
+    binary_consumer_re = re.compile(
+        r"^\s*_binary_lhs_(?P<index>\d+), _binary_rhs_(?P=index)\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[^,\n]+), \[(?P<shape>[0-9,\s]+)\]\)$"
+    )
+    binary_target_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.(?:mul|add|sub|div|max|min)\(_binary_lhs_(?P<index>\d+), _binary_rhs_(?P=index)\), \[(?P<shape>[0-9,\s]+)\]\)$"
+    )
+    static_shape_by_var: dict[str, list[int]] = {}
+    changed = False
+
+    for index, line in enumerate(lines):
+        static_shape_match = static_shape_re.match(line)
+        if static_shape_match is not None:
+            static_shape_by_var[str(static_shape_match.group("lhs"))] = [
+                int(token.strip())
+                for token in str(static_shape_match.group("shape")).split(",")
+                if token.strip()
+            ]
+
+        pool_match = pool_re.match(line)
+        if pool_match is None:
+            continue
+        input_shape = static_shape_by_var.get(str(pool_match.group("input")), None)
+        target_shape = [
+            int(token.strip())
+            for token in str(pool_match.group("shape")).split(",")
+            if token.strip()
+        ]
+        if len(target_shape) != 4:
+            continue
+        expected_shape: list[int] | None = None
+        pool_lhs = str(pool_match.group("lhs"))
+        for future_index in range(index + 1, len(lines)):
+            binary_consumer_match = binary_consumer_re.match(lines[future_index])
+            if binary_consumer_match is None or str(binary_consumer_match.group("lhs")) != pool_lhs:
+                continue
+            binary_index = str(binary_consumer_match.group("index"))
+            for body_index in range(future_index + 1, min(len(lines), future_index + 5)):
+                binary_target_match = binary_target_re.match(lines[body_index])
+                if (
+                    binary_target_match is None
+                    or str(binary_target_match.group("index")) != binary_index
+                ):
+                    continue
+                expected_shape = [
+                    int(token.strip())
+                    for token in str(binary_target_match.group("shape")).split(",")
+                    if token.strip()
+                ]
+                break
+            if expected_shape is not None:
+                break
+        if expected_shape is None:
+            channel_dim = int(input_shape[1]) if input_shape is not None and len(input_shape) == 4 else -1
+            if channel_dim > 0 and target_shape[3] == channel_dim and target_shape[1] != channel_dim:
+                expected_shape = [
+                    int(target_shape[0]),
+                    channel_dim,
+                    int(target_shape[1]),
+                    int(target_shape[2]),
+                ]
+        if expected_shape is None or len(expected_shape) != 4:
+            static_shape_by_var[str(pool_match.group("lhs"))] = list(target_shape)
+            continue
+        if expected_shape == target_shape:
+            static_shape_by_var[str(pool_match.group("lhs"))] = list(target_shape)
+            continue
+        lines[index] = (
+            f"{pool_match.group('indent')}{pool_match.group('lhs')} = _apply_pool2d("
+            f"{pool_match.group('input')}, {pool_match.group('args')}, "
+            f"target_shape={repr(expected_shape)}, is_max_pool={pool_match.group('is_max')}, channel_last=False)"
+        )
+        static_shape_by_var[str(pool_match.group("lhs"))] = list(expected_shape)
+        changed = True
+
+    if changed:
+        model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rewrite_native_generated_model_postprocesses(model_file: Path) -> None:
+    _rewrite_public_layout_bridge_binary_align_calls(model_file)
+    _rewrite_resize_argmax_channel_first_axis(model_file)
+    _rewrite_channel_first_pool_target_shapes(model_file)
+    _rewrite_binary_aligned_target_shapes(model_file)
+    _rewrite_binary_conv_bridge_target_shapes(model_file)
+    _rewrite_invalid_constant_reshape_targets(model_file)
+
+
 def _resolve_static_split_axis(
     input_shape: list[int],
     output_shapes: list[list[int]],
@@ -342,6 +726,18 @@ def assemble_and_write_model_phase(
             model_ir=state.context.model_ir,
         )
     _rewrite_public_layout_bridge_binary_align_calls(
+        state.context.package_dir / "model.py"
+    )
+    _rewrite_resize_argmax_channel_first_axis(
+        state.context.package_dir / "model.py"
+    )
+    _rewrite_binary_aligned_target_shapes(
+        state.context.package_dir / "model.py"
+    )
+    _rewrite_binary_conv_bridge_target_shapes(
+        state.context.package_dir / "model.py"
+    )
+    _rewrite_invalid_constant_reshape_targets(
         state.context.package_dir / "model.py"
     )
     _rewrite_split_axes_from_static_shapes(
