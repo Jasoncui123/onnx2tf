@@ -20213,8 +20213,16 @@ def _canonicalize_generated_model_source_for_raw_export(
     self_const_alias_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*=\s*\(?\s*self\.(?P<attr>[A-Za-z0-9_]+)\s*\)?$"
     )
+    raw_const_pair_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<pair>[A-Za-z0-9_]+)"
+        r"(?::\s*(?:(?:typing\.)?Tuple\[[^\]]+\]|tuple\[[^\]]+\]))?"
+        r"\s*=\s*\(\s*\(?\s*(?P<rhs0>[A-Za-z0-9_\.]+)\s*\)?\s*,\s*\(?\s*(?P<rhs1>[A-Za-z0-9_\.]+)\s*\)?\s*\)$"
+    )
     raw_tuple_const_alias_re = re.compile(
-        r"^(?P<indent>\s*)\(?\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)?\s*=\s*\(?\s*(?P<rhs0>[A-Za-z0-9_\.]+)\s*,\s*(?P<rhs1>[A-Za-z0-9_\.]+)\s*\)?$"
+        r"^(?P<indent>\s*)\(?\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)?\s*=\s*\(?\s*\(?\s*(?P<rhs0>[A-Za-z0-9_\.]+)\s*\)?\s*,\s*\(?\s*(?P<rhs1>[A-Za-z0-9_\.]+)\s*\)?\s*\)?$"
+    )
+    raw_tuple_const_unpack_re = re.compile(
+        r"^(?P<indent>\s*)\(?\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)?\s*=\s*(?P<pair>[A-Za-z0-9_]+)$"
     )
     transposed_const_use_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>.*torch\.matmul\(.+, (?P<temp>[A-Za-z0-9_]+)\.transpose\(-1, -2\)\).*)$"
@@ -20888,6 +20896,7 @@ def _canonicalize_generated_model_source_for_raw_export(
     inline_const_buffer_specs: Dict[str, Tuple[str, str]] = {}
     inline_const_buffer_cache: Dict[Tuple[str, str], str] = {}
     raw_pidnet_const_alias_sources: Dict[str, str] = {}
+    raw_pidnet_const_pair_alias_sources: Dict[str, Tuple[str, str]] = {}
 
     def _buffer_channel_count(const_attr: str) -> int | None:
         buffer_spec = buffer_specs.get(str(const_attr), None)
@@ -21258,6 +21267,25 @@ def _canonicalize_generated_model_source_for_raw_export(
                 str(self_const_alias_match.group("lhs")),
             )
             continue
+        raw_const_pair_alias_match = raw_const_pair_alias_re.match(line)
+        if raw_const_pair_alias_match is not None:
+            resolved_attrs: List[str] = []
+            for rhs_group in ("rhs0", "rhs1"):
+                rhs_name = str(raw_const_pair_alias_match.group(rhs_group))
+                if rhs_name.startswith("self."):
+                    resolved_attrs.append(rhs_name[len("self.") :])
+                    continue
+                aliased_attr = raw_pidnet_const_alias_sources.get(rhs_name, None)
+                if aliased_attr is None:
+                    resolved_attrs = []
+                    break
+                resolved_attrs.append(aliased_attr)
+            if len(resolved_attrs) == 2:
+                raw_pidnet_const_pair_alias_sources[str(raw_const_pair_alias_match.group("pair"))] = (
+                    resolved_attrs[0],
+                    resolved_attrs[1],
+                )
+            continue
         raw_tuple_const_alias_match = raw_tuple_const_alias_re.match(line)
         if raw_tuple_const_alias_match is not None:
             for lhs_group, rhs_group in (("lhs0", "rhs0"), ("lhs1", "rhs1")):
@@ -21269,12 +21297,29 @@ def _canonicalize_generated_model_source_for_raw_export(
                 if aliased_attr is not None:
                     raw_pidnet_const_alias_sources[str(raw_tuple_const_alias_match.group(lhs_group))] = aliased_attr
             continue
+        raw_tuple_const_unpack_match = raw_tuple_const_unpack_re.match(line)
+        if raw_tuple_const_unpack_match is not None:
+            pair_sources = raw_pidnet_const_pair_alias_sources.get(
+                str(raw_tuple_const_unpack_match.group("pair")),
+                None,
+            )
+            if pair_sources is not None:
+                raw_pidnet_const_alias_sources[str(raw_tuple_const_unpack_match.group("lhs0"))] = str(
+                    pair_sources[0]
+                )
+                raw_pidnet_const_alias_sources[str(raw_tuple_const_unpack_match.group("lhs1"))] = str(
+                    pair_sources[1]
+                )
+            continue
         generic_alias_match = generic_alias_re.match(line)
         if generic_alias_match is not None:
             rhs_name = str(generic_alias_match.group("rhs"))
             aliased_attr = raw_pidnet_const_alias_sources.get(rhs_name, None)
             if aliased_attr is not None:
                 raw_pidnet_const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_attr
+            aliased_pair = raw_pidnet_const_pair_alias_sources.get(rhs_name, None)
+            if aliased_pair is not None:
+                raw_pidnet_const_pair_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_pair
         transposed_const_use_match = transposed_const_use_re.match(line)
         if transposed_const_use_match is None:
             continue
