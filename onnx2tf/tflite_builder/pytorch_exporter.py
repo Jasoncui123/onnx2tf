@@ -9723,9 +9723,10 @@ def _collect_feature_last_sequence_tensor_names(model_ir: ModelIR) -> Set[str]:
 def _apply_feature_last_sequence_layouts(
     model_ir: ModelIR,
     preserve_channel_last_tensor_names: Set[str],
-) -> None:
+) -> bool:
     if len(preserve_channel_last_tensor_names) == 0:
-        return
+        return False
+    any_changed = False
     producers: Dict[str, int] = {}
     consumers: Dict[str, List[int]] = {}
     for op_idx, op in enumerate(model_ir.operators):
@@ -9746,6 +9747,7 @@ def _apply_feature_last_sequence_layouts(
         ):
             continue
         tensor.logical_layout = LOGICAL_LAYOUT_UNKNOWN
+        any_changed = True
 
     for op in model_ir.operators:
         output_name = str(op.outputs[0]) if len(op.outputs) == 1 else None
@@ -9762,7 +9764,10 @@ def _apply_feature_last_sequence_layouts(
         if op_type == "TRANSPOSE":
             perm = _read_transpose_perm(model_ir, op)
             if output_name in preserve_channel_last_tensor_names and rank == 3 and perm == [1, 0, 2]:
-                output_tensor.logical_layout = channel_last_logical_layout(rank)
+                target_layout = channel_last_logical_layout(rank)
+                if normalize_logical_layout(output_tensor.logical_layout) != target_layout:
+                    output_tensor.logical_layout = target_layout
+                    any_changed = True
                 continue
             if perm == _perm_cf_to_cl(rank):
                 input_layout = normalize_logical_layout(
@@ -9774,11 +9779,17 @@ def _apply_feature_last_sequence_layouts(
                     and output_name not in preserve_channel_last_tensor_names
                     and is_channel_last_logical_layout(input_layout)
                 ):
-                    output_tensor.logical_layout = channel_first_logical_layout(rank)
+                    target_layout = channel_first_logical_layout(rank)
                 else:
-                    output_tensor.logical_layout = channel_last_logical_layout(rank)
+                    target_layout = channel_last_logical_layout(rank)
+                if normalize_logical_layout(output_tensor.logical_layout) != target_layout:
+                    output_tensor.logical_layout = target_layout
+                    any_changed = True
             elif rank in {4, 5}:
-                output_tensor.logical_layout = channel_last_logical_layout(rank)
+                target_layout = channel_last_logical_layout(rank)
+                if normalize_logical_layout(output_tensor.logical_layout) != target_layout:
+                    output_tensor.logical_layout = target_layout
+                    any_changed = True
             elif (
                 input_tensor is not None
                 and is_channel_last_logical_layout(normalize_logical_layout(input_tensor.logical_layout))
@@ -9788,7 +9799,10 @@ def _apply_feature_last_sequence_layouts(
                 and int(perm[0]) == 0
                 and int(perm[-1]) == rank - 1
             ):
-                output_tensor.logical_layout = channel_last_logical_layout(rank)
+                target_layout = channel_last_logical_layout(rank)
+                if normalize_logical_layout(output_tensor.logical_layout) != target_layout:
+                    output_tensor.logical_layout = target_layout
+                    any_changed = True
             continue
         if op_type == "RESHAPE":
             should_mark_channel_last = False
@@ -9826,7 +9840,10 @@ def _apply_feature_last_sequence_layouts(
             ):
                 should_mark_channel_last = True
             if should_mark_channel_last:
-                output_tensor.logical_layout = channel_last_logical_layout(rank)
+                target_layout = channel_last_logical_layout(rank)
+                if normalize_logical_layout(output_tensor.logical_layout) != target_layout:
+                    output_tensor.logical_layout = target_layout
+                    any_changed = True
             continue
 
     safe_passthrough_ops = {
@@ -9900,6 +9917,7 @@ def _apply_feature_last_sequence_layouts(
                 if normalize_logical_layout(output_tensor.logical_layout) != target_layout:
                     output_tensor.logical_layout = target_layout
                     changed = True
+                    any_changed = True
     for op in model_ir.operators:
         if str(op.op_type) != "RESHAPE" or len(op.outputs) != 1:
             continue
@@ -9931,6 +9949,8 @@ def _apply_feature_last_sequence_layouts(
                 shape_tensor.data = np.asarray(raw_shape_values, dtype=dtype)
                 shape_tensor.shape = [int(len(raw_shape_values))]
                 shape_tensor.shape_signature = [int(len(raw_shape_values))]
+        any_changed = True
+    return any_changed
 
 
 def _rewrite_layout_sensitive_ops(
@@ -10939,15 +10959,25 @@ def normalize_model_ir_for_pytorch_channel_first(model_ir: ModelIR) -> ModelIR:
         )
     infer_model_ir_logical_layouts(normalized)
     preserve_channel_last_tensor_names = _collect_feature_last_sequence_tensor_names(normalized)
-    _apply_feature_last_sequence_layouts(normalized, preserve_channel_last_tensor_names)
-    if len(preserve_channel_last_tensor_names) > 0:
-        infer_model_ir_logical_layouts(normalized)
-    preserve_channel_last_tensor_names = _shrink_preserved_channel_last_regions_for_pytorch(
+    feature_last_changed = _apply_feature_last_sequence_layouts(
         normalized,
         preserve_channel_last_tensor_names,
     )
-    _apply_feature_last_sequence_layouts(normalized, preserve_channel_last_tensor_names)
-    if len(preserve_channel_last_tensor_names) > 0:
+    if feature_last_changed:
+        infer_model_ir_logical_layouts(normalized)
+    shrunken_preserve_channel_last_tensor_names = _shrink_preserved_channel_last_regions_for_pytorch(
+        normalized,
+        preserve_channel_last_tensor_names,
+    )
+    preserve_names_changed = (
+        shrunken_preserve_channel_last_tensor_names != preserve_channel_last_tensor_names
+    )
+    preserve_channel_last_tensor_names = shrunken_preserve_channel_last_tensor_names
+    feature_last_changed = _apply_feature_last_sequence_layouts(
+        normalized,
+        preserve_channel_last_tensor_names,
+    )
+    if preserve_names_changed or feature_last_changed:
         infer_model_ir_logical_layouts(normalized)
     annotation_problems = validate_model_ir_layout_annotations(normalized)
     if len(annotation_problems) > 0:
