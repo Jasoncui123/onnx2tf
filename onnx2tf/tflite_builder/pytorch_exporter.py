@@ -20211,18 +20211,23 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)self\.register_buffer\('(?P<name>[A-Za-z0-9_]+)', torch\.zeros\(\[(?P<shape>[0-9, ]+)\], dtype=torch\.(?P<dtype>[A-Za-z0-9_]+)\), persistent=(?P<persistent>True|False)\)$"
     )
     self_const_alias_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*=\s*\(?\s*self\.(?P<attr>[A-Za-z0-9_]+)\s*\)?$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*=\s*\(*\s*self\.(?P<attr>[A-Za-z0-9_]+)\s*\)*$"
     )
     raw_const_pair_alias_re = re.compile(
         r"^(?P<indent>\s*)(?P<pair>[A-Za-z0-9_]+)"
         r"(?::\s*(?:(?:typing\.)?Tuple\[[^\]]+\]|tuple\[[^\]]+\]))?"
-        r"\s*=\s*\(\s*\(?\s*(?P<rhs0>[A-Za-z0-9_\.]+)\s*\)?\s*,\s*\(?\s*(?P<rhs1>[A-Za-z0-9_\.]+)\s*\)?\s*\)$"
+        r"\s*=\s*\(?\s*\(\s*\(?\s*(?P<rhs0>[A-Za-z0-9_\.]+)\s*\)?\s*,\s*\(?\s*(?P<rhs1>[A-Za-z0-9_\.]+)\s*\)?\s*\)\s*\)?$"
     )
     raw_tuple_const_alias_re = re.compile(
         r"^(?P<indent>\s*)\(?\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)?\s*=\s*\(?\s*\(?\s*(?P<rhs0>[A-Za-z0-9_\.]+)\s*\)?\s*,\s*\(?\s*(?P<rhs1>[A-Za-z0-9_\.]+)\s*\)?\s*\)?$"
     )
     raw_tuple_const_unpack_re = re.compile(
-        r"^(?P<indent>\s*)\(?\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)?\s*=\s*(?P<pair>[A-Za-z0-9_]+)$"
+        r"^(?P<indent>\s*)\(?\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)?\s*=\s*\(*\s*(?P<pair>[A-Za-z0-9_]+)\s*\)*$"
+    )
+    raw_generic_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)"
+        r"(?::\s*(?:torch\.Tensor|(?:typing\.)?Tuple\[[^\]]+\]|tuple\[[^\]]+\]))?"
+        r"\s*=\s*\(*\s*(?P<rhs>[A-Za-z0-9_]+)\s*\)*$"
     )
     transposed_const_use_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>.*torch\.matmul\(.+, (?P<temp>[A-Za-z0-9_]+)\.transpose\(-1, -2\)\).*)$"
@@ -21311,15 +21316,15 @@ def _canonicalize_generated_model_source_for_raw_export(
                     pair_sources[1]
                 )
             continue
-        generic_alias_match = generic_alias_re.match(line)
-        if generic_alias_match is not None:
-            rhs_name = str(generic_alias_match.group("rhs"))
+        raw_generic_alias_match = raw_generic_alias_re.match(line)
+        if raw_generic_alias_match is not None:
+            rhs_name = str(raw_generic_alias_match.group("rhs"))
             aliased_attr = raw_pidnet_const_alias_sources.get(rhs_name, None)
             if aliased_attr is not None:
-                raw_pidnet_const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_attr
+                raw_pidnet_const_alias_sources[str(raw_generic_alias_match.group("lhs"))] = aliased_attr
             aliased_pair = raw_pidnet_const_pair_alias_sources.get(rhs_name, None)
             if aliased_pair is not None:
-                raw_pidnet_const_pair_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_pair
+                raw_pidnet_const_pair_alias_sources[str(raw_generic_alias_match.group("lhs"))] = aliased_pair
         transposed_const_use_match = transposed_const_use_re.match(line)
         if transposed_const_use_match is None:
             continue
