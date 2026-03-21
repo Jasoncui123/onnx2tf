@@ -27089,17 +27089,18 @@ _SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN = (
     r")"
 )
 _SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
-    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?:(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?P<src_fn>.+?),\s*{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
+    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?:(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?(?P<src_fn>.+?),\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
 )
 _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
-    rf"^(?:.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\(.+?,\s*{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?$"
+    rf"^(?:.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?.+?,\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?$"
 )
 _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
-    r"^\s*self\.register_buffer\((?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote),\s*"
-    r"torch\.zeros\((?:size=)?(?:\[|\()\s*1\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)\s*(?:\]|\))"
+    r"^\s*self\.register_buffer\((?P<name_kw>name\s*=\s*)?(?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote),\s*"
+    r"(?P<tensor_kw>tensor\s*=\s*)?torch\.zeros\((?:size=)?(?:\[|\()\s*1\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)\s*(?:\]|\))"
     r"(?P<zeros_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)"
     r"(?:,\s*persistent=(?P<persistent>True|False))?\)$"
 )
+_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN = r"[^,]+"
 
 
 def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
@@ -27140,11 +27141,11 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
     }
     binary_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+,\s*[A-Za-z0-9_\.]+,\s*(?:\[|\())"
-        r"(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
+        rf"(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
     )
     mul_align_shape_re = re.compile(
         r"^(?P<indent>\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*(?:\[|\())"
-        r"(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
+        rf"(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
     )
 
     for index, line in enumerate(lines):
@@ -27170,7 +27171,9 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
                 zeros_expr += zeros_kwargs
             zeros_expr += ")"
             quote = register_match.group("quote")
-            rewritten = f"        self.register_buffer({quote}{register_match.group('buffer')}{quote}, {zeros_expr}"
+            tensor_kw = str(register_match.group("tensor_kw") or "")
+            name_kw = str(register_match.group("name_kw") or "")
+            rewritten = f"        self.register_buffer({name_kw}{quote}{register_match.group('buffer')}{quote}, {tensor_kw}{zeros_expr}"
             if register_match.group("persistent") is not None:
                 rewritten += f", persistent={register_match.group('persistent')}"
             rewritten += ")"
@@ -27200,7 +27203,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
                 continue
             heads, height, width = inferred_shape
             rewritten = (
-                f"{binary_match.group('indent')}{binary_match.group('batch')}, "
+                f"{binary_match.group('indent')}{str(binary_match.group('batch')).strip()}, "
                 f"{heads}, {height}, {width}{binary_match.group('suffix')}"
             )
             if rewritten != current_line:
@@ -27218,7 +27221,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             if inferred_shape is not None:
                 heads, height, width = inferred_shape
                 rewritten = (
-                    f"{mul_match.group('indent')}{mul_match.group('batch')}, "
+                    f"{mul_match.group('indent')}{str(mul_match.group('batch')).strip()}, "
                     f"{heads}, {height}, {width}{mul_match.group('suffix')}"
                 )
                 if rewritten != current_line:
@@ -27682,10 +27685,10 @@ def _collect_shadowformer_fast_repair_facts(
         r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+?)(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*\)$"
     )
     binary_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+),\s*(?P<rhs>[A-Za-z0-9_\.]+),\s*(?:\[|\()(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
+        rf"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+),\s*(?P<rhs>[A-Za-z0-9_\.]+),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
     mul_align_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*(?:\[|\()(?P<batch>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
+        rf"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
 
     raw_buffer_dims: Dict[str, Tuple[int, int, int]] = {}
@@ -27765,12 +27768,12 @@ def _collect_shadowformer_fast_repair_facts(
     )
 
 
-def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int, int, int, int]]:
+def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[str, int, int, int]]:
     axis_re = re.compile(r"(?:^|[,(])\s*axis\s*=\s*(?:3|-1)(?:$|[,)])")
     target_shape_re = re.compile(
-        r"target_shape=(?:\[|\()\s*(?P<batches>\d+)\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\s*(?:\]|\))"
+        rf"target_shape=(?:\[|\()\s*(?P<batches>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\s*(?:\]|\))"
     )
-    softmax_shapes: List[Tuple[int, int, int, int]] = []
+    softmax_shapes: List[Tuple[str, int, int, int]] = []
     for line in lines:
         current_line = str(line)
         if "_apply_softmax(" not in current_line:
@@ -27781,11 +27784,11 @@ def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[int
         if softmax_match is None:
             continue
         softmax_shapes.append(
-            (
-                int(softmax_match.group("batches")),
-                int(softmax_match.group("heads")),
-                int(softmax_match.group("height")),
-                int(softmax_match.group("width")),
+                (
+                    str(softmax_match.group("batches")).strip(),
+                    int(softmax_match.group("heads")),
+                    int(softmax_match.group("height")),
+                    int(softmax_match.group("width")),
             )
         )
     return softmax_shapes
