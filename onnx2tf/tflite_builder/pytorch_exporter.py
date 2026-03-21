@@ -20421,23 +20421,39 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
     pidnet_spp_scale3_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+    )
+    pidnet_spp_scale3_mul_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\(\(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale3_anchor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+    )
+    pidnet_spp_scale3_anchor_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\(\(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?, \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale3_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
+    )
+    pidnet_spp_scale3_add_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\(\(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?, \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale3_mul_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
     )
     pidnet_spp_scale4_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?\)$"
+    )
+    pidnet_spp_scale4_mul_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\(\(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?\)$"
     )
     pidnet_spp_scale4_mul_reshape_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
-        r"self\.(?P<const_attr>[A-Za-z0-9_]+)\), \[1, 1, (?P<c>\d+), 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\(\(?(?P<input>[A-Za-z0-9_]+)\)?, "
+        r"\(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?\), \[1, 1, (?P<c>\d+), 1\]\)$"
+    )
+    pidnet_spp_scale4_mul_reshape_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\(\(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, "
+        r"\(?(?P<input>[A-Za-z0-9_]+)\)?\), \[1, 1, (?P<c>\d+), 1\]\)$"
     )
     pidnet_spp_scale4_mul_reshape_variant_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.mul\((?P<input>[A-Za-z0-9_]+), "
@@ -20445,7 +20461,10 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"\[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     pidnet_spp_scale4_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 1, 1, (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, \[1, 1, 1, (?P<c>\d+)\]\)$"
+    )
+    pidnet_spp_scale4_add_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\(\(?self\.(?P<const_attr>[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?, \[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     pidnet_pag4_mul2_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
@@ -20979,7 +20998,11 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = scalar_as_tensor_replaced
         pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_re.match(line)
+        if pidnet_spp_scale3_mul_match is None:
+            pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_reversed_re.match(line)
         pidnet_spp_scale3_anchor_match = pidnet_spp_scale3_anchor_re.match(line)
+        if pidnet_spp_scale3_anchor_match is None:
+            pidnet_spp_scale3_anchor_match = pidnet_spp_scale3_anchor_reversed_re.match(line)
         if pidnet_spp_scale3_anchor_match is not None:
             lines[index] = (
                 f"{pidnet_spp_scale3_anchor_match.group('indent')}{pidnet_spp_scale3_anchor_match.group('lhs0')}, "
@@ -20991,6 +21014,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = lines[index]
         pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_re.match(line)
+        if pidnet_spp_scale3_mul_match is None:
+            pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_reversed_re.match(line)
         if pidnet_spp_scale3_mul_match is not None:
             lines[index] = (
                 f"{pidnet_spp_scale3_mul_match.group('indent')}{pidnet_spp_scale3_mul_match.group('lhs')} = "
@@ -21000,6 +21025,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = lines[index]
         pidnet_spp_scale3_add_match = pidnet_spp_scale3_add_re.match(line)
+        if pidnet_spp_scale3_add_match is None:
+            pidnet_spp_scale3_add_match = pidnet_spp_scale3_add_reversed_re.match(line)
         if (
             pidnet_spp_scale3_add_match is not None
             and int(pidnet_spp_scale3_add_match.group("c")) != 1
@@ -21023,6 +21050,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = lines[index]
         pidnet_spp_scale4_mul_match = pidnet_spp_scale4_mul_re.match(line)
+        if pidnet_spp_scale4_mul_match is None:
+            pidnet_spp_scale4_mul_match = pidnet_spp_scale4_mul_reversed_re.match(line)
         if pidnet_spp_scale4_mul_match is not None:
             preferred_channels = _infer_cf_channel_count(str(pidnet_spp_scale4_mul_match.group("input")))
             if preferred_channels is None:
@@ -21044,6 +21073,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = lines[index]
         pidnet_spp_scale4_mul_reshape_match = pidnet_spp_scale4_mul_reshape_re.match(line)
+        if pidnet_spp_scale4_mul_reshape_match is None:
+            pidnet_spp_scale4_mul_reshape_match = pidnet_spp_scale4_mul_reshape_reversed_re.match(line)
         if pidnet_spp_scale4_mul_reshape_match is not None:
             lines[index] = (
                 f"{pidnet_spp_scale4_mul_reshape_match.group('indent')}{pidnet_spp_scale4_mul_reshape_match.group('lhs')} = "
@@ -21062,6 +21093,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             changed = True
             line = lines[index]
         pidnet_spp_scale4_add_match = pidnet_spp_scale4_add_re.match(line)
+        if pidnet_spp_scale4_add_match is None:
+            pidnet_spp_scale4_add_match = pidnet_spp_scale4_add_reversed_re.match(line)
         if pidnet_spp_scale4_add_match is not None:
             lines[index] = (
                 f"{pidnet_spp_scale4_add_match.group('indent')}{pidnet_spp_scale4_add_match.group('lhs0')}, "
@@ -26655,9 +26688,19 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"torch\.mul\(\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
+    pidnet_bn_mul_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"torch\.mul\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*\), "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
     pidnet_bn_add_anchor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
         r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+    pidnet_bn_add_anchor_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_cf_pad_re = re.compile(
@@ -26677,6 +26720,11 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
+    pidnet_scale3_anchor_reversed_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, "
+        r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
     pidnet_permute_conv_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
@@ -26684,7 +26732,8 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*(?P<input>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*$"
     )
     pidnet_tuple_alias_re = re.compile(
-        r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*\)*\s*=\s*"
+        r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*,\s*"
+        r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*"
         r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*$"
     )
     pidnet_tuple_pair_alias_re = re.compile(
@@ -26716,6 +26765,8 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     def _pidnet_propagate_alias(lhs_name: str, input_name: str) -> None:
         if input_name in pidnet_tuple_alias_pairs:
             pidnet_tuple_alias_pairs[lhs_name] = pidnet_tuple_alias_pairs[input_name]
+        if input_name in pidnet_cf_binary_tuple_sources:
+            pidnet_cf_binary_tuple_sources.add(lhs_name)
         if input_name.startswith("self.") or input_name in pidnet_const_alias_sources:
             pidnet_const_alias_sources.add(lhs_name)
         if _pidnet_is_cf_like_name(input_name):
@@ -26805,18 +26856,33 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             ):
                 return True
             scale3_anchor_match = pidnet_scale3_anchor_re.match(future_line)
+            scale3_anchor_reversed_match = pidnet_scale3_anchor_reversed_re.match(future_line)
             if (
-                scale3_anchor_match is not None
-                and str(scale3_anchor_match.group("input")) in tracked_names
+                (scale3_anchor_match is not None and str(scale3_anchor_match.group("input")) in tracked_names)
+                or (
+                    scale3_anchor_reversed_match is not None
+                    and str(scale3_anchor_reversed_match.group("input")) in tracked_names
+                )
             ):
                 return True
             bn_mul_match = pidnet_bn_mul_re.match(future_line)
-            if bn_mul_match is not None and str(bn_mul_match.group("input")) in tracked_names:
+            bn_mul_reversed_match = pidnet_bn_mul_reversed_re.match(future_line)
+            if (
+                (bn_mul_match is not None and str(bn_mul_match.group("input")) in tracked_names)
+                or (
+                    bn_mul_reversed_match is not None
+                    and str(bn_mul_reversed_match.group("input")) in tracked_names
+                )
+            ):
                 return True
             bn_add_anchor_match = pidnet_bn_add_anchor_re.match(future_line)
+            bn_add_anchor_reversed_match = pidnet_bn_add_anchor_reversed_re.match(future_line)
             if (
-                bn_add_anchor_match is not None
-                and str(bn_add_anchor_match.group("input")) in tracked_names
+                (bn_add_anchor_match is not None and str(bn_add_anchor_match.group("input")) in tracked_names)
+                or (
+                    bn_add_anchor_reversed_match is not None
+                    and str(bn_add_anchor_reversed_match.group("input")) in tracked_names
+                )
             ):
                 return True
             mul_align_match = pidnet_mul_align_re.match(future_line)
@@ -27004,13 +27070,25 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             lhs1_name = str(pidnet_binary_anchor_match.group("lhs1"))
             if any(_pidnet_is_cf_like_name(input_name) for input_name in (input_a, input_b)):
                 scale3_anchor_match = pidnet_scale3_anchor_re.match(line)
+                scale3_anchor_reversed_match = pidnet_scale3_anchor_reversed_re.match(line)
                 bn_add_anchor_match = pidnet_bn_add_anchor_re.match(line)
+                bn_add_anchor_reversed_match = pidnet_bn_add_anchor_reversed_re.match(line)
                 if (
-                    scale3_anchor_match is not None
-                    and _pidnet_is_const_like_expr(str(scale3_anchor_match.group("const_expr")))
+                    (
+                        scale3_anchor_match is not None
+                        and _pidnet_is_const_like_expr(str(scale3_anchor_match.group("const_expr")))
+                    ) or (
+                        scale3_anchor_reversed_match is not None
+                        and _pidnet_is_const_like_expr(str(scale3_anchor_reversed_match.group("const_expr")))
+                    )
                 ) or (
-                    bn_add_anchor_match is not None
-                    and _pidnet_is_const_like_expr(str(bn_add_anchor_match.group("const_expr")))
+                    (
+                        bn_add_anchor_match is not None
+                        and _pidnet_is_const_like_expr(str(bn_add_anchor_match.group("const_expr")))
+                    ) or (
+                        bn_add_anchor_reversed_match is not None
+                        and _pidnet_is_const_like_expr(str(bn_add_anchor_reversed_match.group("const_expr")))
+                    )
                 ):
                     pass
                 else:
@@ -27051,7 +27129,13 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                     int(pidnet_binary_anchor_tuple_match.group("d2")),
                     int(pidnet_binary_anchor_tuple_match.group("d3")),
                 ]
-                if _pidnet_is_cf_like_name(input_a) and _pidnet_is_const_like_expr(input_b):
+                if (
+                    _pidnet_is_cf_like_name(input_a) and _pidnet_is_const_like_expr(input_b)
+                ) or (
+                    _pidnet_is_cf_like_name(input_b) and _pidnet_is_const_like_expr(input_a)
+                ):
+                    cf_input_name = input_a if _pidnet_is_cf_like_name(input_a) else input_b
+                    const_expr = input_b if cf_input_name == input_a else input_a
                     if int(current_shape[2]) == 1:
                         preferred_channel_count = _pidnet_rank4_preferred_channel_count(current_shape)
                         normalized_shape = [int(current_shape[0]), int(preferred_channel_count), 1, 1]
@@ -27063,7 +27147,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                     ann = (pidnet_binary_anchor_tuple_match.group("ann") or "").rstrip()
                     lines[index] = (
                         f"{pidnet_binary_anchor_tuple_match.group('indent')}{lhs_name}{ann} = _align_binary_inputs_to_anchor("
-                        f"{input_a}, torch.reshape({input_b}, {normalized_shape}), {normalized_shape})"
+                        f"{cf_input_name}, torch.reshape({const_expr}, {normalized_shape}), {normalized_shape})"
                     )
                     changed = True
                 else:
@@ -27115,9 +27199,15 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 or _pidnet_is_cf_like_name(input_b)
             ):
                 bn_mul_match = pidnet_bn_mul_re.match(line)
+                bn_mul_reversed_match = pidnet_bn_mul_reversed_re.match(line)
                 if (
-                    bn_mul_match is not None
-                    and _pidnet_is_const_like_expr(str(bn_mul_match.group("const_expr")))
+                    (
+                        bn_mul_match is not None
+                        and _pidnet_is_const_like_expr(str(bn_mul_match.group("const_expr")))
+                    ) or (
+                        bn_mul_reversed_match is not None
+                        and _pidnet_is_const_like_expr(str(bn_mul_reversed_match.group("const_expr")))
+                    )
                 ):
                     pass
                 else:
@@ -27172,6 +27262,12 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             changed = True
             continue
         pidnet_scale3_anchor_match = pidnet_scale3_anchor_re.match(line)
+        pidnet_scale3_anchor_reversed_match = pidnet_scale3_anchor_reversed_re.match(line)
+        if (
+            pidnet_scale3_anchor_reversed_match is not None
+            and _pidnet_is_const_like_expr(str(pidnet_scale3_anchor_reversed_match.group("const_expr")))
+        ):
+            pidnet_scale3_anchor_match = pidnet_scale3_anchor_reversed_match
         if pidnet_scale3_anchor_match is not None:
             input_name = str(pidnet_scale3_anchor_match.group("input"))
             const_expr = str(pidnet_scale3_anchor_match.group("const_expr"))
@@ -27217,6 +27313,12 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 pidnet_cf_mean_sources.add(lhs_name)
                 continue
         pidnet_bn_mul_match = pidnet_bn_mul_re.match(line)
+        pidnet_bn_mul_reversed_match = pidnet_bn_mul_reversed_re.match(line)
+        if (
+            pidnet_bn_mul_reversed_match is not None
+            and _pidnet_is_const_like_expr(str(pidnet_bn_mul_reversed_match.group("const_expr")))
+        ):
+            pidnet_bn_mul_match = pidnet_bn_mul_reversed_match
         if pidnet_bn_mul_match is not None:
             input_name = str(pidnet_bn_mul_match.group("input"))
             const_expr = str(pidnet_bn_mul_match.group("const_expr"))
@@ -27243,6 +27345,12 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 pidnet_cf_mul_sources.add(str(pidnet_bn_mul_match.group("lhs")))
                 continue
         pidnet_bn_add_anchor_match = pidnet_bn_add_anchor_re.match(line)
+        pidnet_bn_add_anchor_reversed_match = pidnet_bn_add_anchor_reversed_re.match(line)
+        if (
+            pidnet_bn_add_anchor_reversed_match is not None
+            and _pidnet_is_const_like_expr(str(pidnet_bn_add_anchor_reversed_match.group("const_expr")))
+        ):
+            pidnet_bn_add_anchor_match = pidnet_bn_add_anchor_reversed_match
         if pidnet_bn_add_anchor_match is not None:
             input_name = str(pidnet_bn_add_anchor_match.group("input"))
             const_expr = str(pidnet_bn_add_anchor_match.group("const_expr"))

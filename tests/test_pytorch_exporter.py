@@ -661,6 +661,82 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_with_fully_g
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_with_reversed_const_order(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reversed_const_order_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 192, 1, 1])",
+                "        spp_bn_mul_out = torch.mul(self.const_demo_mul_any, spp_global_cf)",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(self.const_demo_add_any, bn_add_in, [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_mul_any, [1, 192, 1, 1]))"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(self.const_demo_add_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_with_parenthesized_const_operands(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_parenthesized_const_operands_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 192, 1, 1])",
+                "        spp_bn_mul_out = torch.mul((self.const_demo_mul_any), (spp_global_cf))",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor((self.const_demo_add_any), (bn_add_in), [1, 1, 1, 192])",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_mul_any, [1, 192, 1, 1]))"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(self.const_demo_add_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_removes_permute_for_singleton_rank4_matmul_conv_input(
     tmp_path,
 ) -> None:
@@ -7297,6 +7373,88 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_through_tu
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_through_typed_tuple_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_pag_typed_tuple_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, lowres_feature: torch.Tensor, skip_feature: torch.Tensor) -> torch.Tensor:",
+                "        pag_resize_out = _apply_resize(lowres_feature, [24, 40], method='bilinear', target_shape=[1, 24, 40, 32], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        pag_alias = _align_tensor_to_target_shape(pag_resize_out.permute(0, 2, 3, 1).contiguous(), [1, 24, 40, 32])",
+                "        pag_bridge: torch.Tensor, skip_bridge: torch.Tensor = pag_alias, skip_feature",
+                "        pag_left, pag_right = _align_binary_inputs_to_anchor(pag_bridge, skip_bridge, [1, 24, 40, 32])",
+                "        pag_mul_out = _align_tensor_to_target_shape(torch.mul(pag_left, pag_right), [1, 24, 40, 32])",
+                "        pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([3], pag_mul_out.ndim), True)",
+                "        pag_sig_out = torch.reshape(torch.sigmoid(pag_reduce_sum_out), [1, 1, 24, 40])",
+                "        return pag_sig_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "pag_bridge: torch.Tensor, skip_bridge: torch.Tensor = pag_alias, skip_feature" in rewritten
+    assert (
+        "pag_left, pag_right = _align_binary_inputs_to_anchor(pag_bridge, skip_bridge, [1, 32, 24, 40])"
+        in rewritten
+    )
+    assert (
+        "pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([1], pag_mul_out.ndim), True)"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_through_compact_typed_tuple_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_pag_compact_typed_tuple_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, lowres_feature: torch.Tensor, skip_feature: torch.Tensor) -> torch.Tensor:",
+                "        pag_resize_out = _apply_resize(lowres_feature, [24, 40], method='bilinear', target_shape=[1, 24, 40, 32], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        pag_alias = _align_tensor_to_target_shape(pag_resize_out.permute(0, 2, 3, 1).contiguous(), [1, 24, 40, 32])",
+                "        pag_bridge:torch.Tensor,skip_bridge:torch.Tensor=pag_alias,skip_feature",
+                "        pag_left, pag_right = _align_binary_inputs_to_anchor(pag_bridge, skip_bridge, [1, 24, 40, 32])",
+                "        pag_mul_out = _align_tensor_to_target_shape(torch.mul(pag_left, pag_right), [1, 24, 40, 32])",
+                "        pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([3], pag_mul_out.ndim), True)",
+                "        pag_sig_out = torch.reshape(torch.sigmoid(pag_reduce_sum_out), [1, 1, 24, 40])",
+                "        return pag_sig_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "pag_bridge:torch.Tensor,skip_bridge:torch.Tensor=pag_alias,skip_feature" in rewritten
+    assert (
+        "pag_left, pag_right = _align_binary_inputs_to_anchor(pag_bridge, skip_bridge, [1, 32, 24, 40])"
+        in rewritten
+    )
+    assert (
+        "pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([1], pag_mul_out.ndim), True)"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_through_tuple_pair_unpack(
     tmp_path,
 ) -> None:
@@ -7508,6 +7666,53 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_through_ty
         in rewritten
     )
     assert "(pag_left: torch.Tensor, pag_right: torch.Tensor) = (pag_pair)" in rewritten
+    assert (
+        "pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([1], pag_mul_out.ndim), True)"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_pag_chain_through_anchor_pair_alias_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_pag_anchor_pair_alias_chain_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, lowres_feature: torch.Tensor, skip_feature: torch.Tensor) -> torch.Tensor:",
+                "        pag_resize_out = _apply_resize(lowres_feature, [24, 40], method='bilinear', target_shape=[1, 24, 40, 32], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        pag_alias = _align_tensor_to_target_shape(pag_resize_out.permute(0, 2, 3, 1).contiguous(), [1, 24, 40, 32])",
+                "        pag_pair = _align_binary_inputs_to_anchor(pag_alias, skip_feature, [1, 24, 40, 32])",
+                "        pag_pair_bridge = pag_pair",
+                "        pag_left, pag_right = pag_pair_bridge",
+                "        pag_mul_out = _align_tensor_to_target_shape(torch.mul(pag_left, pag_right), [1, 24, 40, 32])",
+                "        pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([3], pag_mul_out.ndim), True)",
+                "        pag_sig_out = torch.reshape(torch.sigmoid(pag_reduce_sum_out), [1, 1, 24, 40])",
+                "        return pag_sig_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "pag_pair = _align_binary_inputs_to_anchor(pag_alias, skip_feature, [1, 32, 24, 40])"
+        in rewritten
+    )
+    assert "pag_pair_bridge = pag_pair" in rewritten
+    assert "pag_left, pag_right = pag_pair_bridge" in rewritten
+    assert (
+        "pag_mul_out = _align_tensor_to_target_shape(torch.mul(pag_left, pag_right), [1, 32, 24, 40])"
+        in rewritten
+    )
     assert (
         "pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([1], pag_mul_out.ndim), True)"
         in rewritten
@@ -7806,6 +8011,86 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_tupl
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_typed_tuple_const_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale4_typed_tuple_const_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul: torch.Tensor, scale4_bn_add: torch.Tensor = self.const_demo_scale4_mul_any, self.const_demo_scale4_add_any",
+                "        spp_global_cf = torch.mean(generic_stage_input, dim=[1, 2], keepdim=True)",
+                "        spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, scale4_bn_mul), [1, 256, 1, 1])",
+                "        _binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, scale4_bn_add, [1, 1, 1, 256])",
+                "        return _binary_lhs_11",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "scale4_bn_mul: torch.Tensor, scale4_bn_add: torch.Tensor = self.const_demo_scale4_mul_any, self.const_demo_scale4_add_any" in rewritten
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 256, 1, 1])), [1, 256, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
+        "torch.reshape(scale4_bn_add, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_compact_typed_tuple_const_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale4_compact_typed_tuple_const_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul:torch.Tensor,scale4_bn_add:torch.Tensor=self.const_demo_scale4_mul_any,self.const_demo_scale4_add_any",
+                "        spp_global_cf = torch.mean(generic_stage_input, dim=[1, 2], keepdim=True)",
+                "        spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, scale4_bn_mul), [1, 256, 1, 1])",
+                "        _binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, scale4_bn_add, [1, 1, 1, 256])",
+                "        return _binary_lhs_11",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "scale4_bn_mul:torch.Tensor,scale4_bn_add:torch.Tensor=self.const_demo_scale4_mul_any,self.const_demo_scale4_add_any" in rewritten
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 256, 1, 1])), [1, 256, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
+        "torch.reshape(scale4_bn_add, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_through_const_alias_chain(
     tmp_path,
 ) -> None:
@@ -7973,6 +8258,45 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_pare
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_reversed_const_order(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale4_reversed_const_order_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_add = self.const_demo_scale4_add_any",
+                "        spp_global_cf = torch.mean(generic_stage_input, dim=[1, 2], keepdim=True)",
+                "        spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(self.const_demo_scale4_mul_any, spp_global_cf), [1, 256, 1, 1])",
+                "        _binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(scale4_bn_add, spp_bn_mul_out, [1, 1, 1, 256])",
+                "        return _binary_lhs_11",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_mul_any, [1, 256, 1, 1])), [1, 256, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
+        "torch.reshape(scale4_bn_add, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_through_tuple_pair_unpack(
     tmp_path,
 ) -> None:
@@ -8043,6 +8367,44 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_through_t
         in rewritten
     )
     assert "(_binary_lhs_11: torch.Tensor, _binary_rhs_11: torch.Tensor) = (bn_pair)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_through_anchor_pair_alias_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale4_anchor_pair_alias_chain_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_add = self.const_demo_scale4_add_any",
+                "        spp_global_cf = torch.mean(generic_stage_input, dim=[1, 2], keepdim=True)",
+                "        spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, self.const_demo_scale4_mul_any), [1, 256, 1, 1])",
+                "        bn_pair = _align_binary_inputs_to_anchor(spp_bn_mul_out, scale4_bn_add, [1, 1, 1, 256])",
+                "        bn_pair_bridge = bn_pair",
+                "        _binary_lhs_11, _binary_rhs_11 = bn_pair_bridge",
+                "        return _binary_lhs_11",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "bn_pair = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
+        "torch.reshape(scale4_bn_add, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+    assert "bn_pair_bridge = bn_pair" in rewritten
+    assert "_binary_lhs_11, _binary_rhs_11 = bn_pair_bridge" in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale3_pad_pool_anchor_with_generic_names(
@@ -8579,6 +8941,44 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_pool_anchor_with
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_pool_anchor_with_reversed_const_order(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_pool_reversed_const_order_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        scale3_anchor = self.const_demo_scale3_any",
+                "        spp_pool_out = _apply_pool2d(generic_stage_input, filter_height=17, filter_width=17, stride_h=8, stride_w=8, padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=True)",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(scale3_anchor, spp_pool_out, [1, 256, 1, 13])",
+                "        return _binary_lhs_21",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_pool_out = _apply_pool2d(generic_stage_input, filter_height=17, filter_width=17, stride_h=8, stride_w=8, "
+        "padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=False)"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(scale3_anchor, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_pool_anchor_through_tuple_pair_unpack(
     tmp_path,
 ) -> None:
@@ -8657,6 +9057,48 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_pool_anchor_thro
         in rewritten
     )
     assert "(_binary_lhs_21: torch.Tensor, _binary_rhs_21: torch.Tensor) = (spp_pair)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_pool_anchor_through_anchor_pair_alias_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_pool_anchor_pair_alias_chain_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, generic_stage_input: torch.Tensor) -> torch.Tensor:",
+                "        scale3_anchor = self.const_demo_scale3_any",
+                "        spp_pool_out = _apply_pool2d(generic_stage_input, filter_height=17, filter_width=17, stride_h=8, stride_w=8, padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=True)",
+                "        spp_pair = _align_binary_inputs_to_anchor(spp_pool_out, scale3_anchor, [1, 256, 1, 13])",
+                "        spp_pair_bridge = spp_pair",
+                "        _binary_lhs_21, _binary_rhs_21 = spp_pair_bridge",
+                "        return _binary_lhs_21",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_pool_out = _apply_pool2d(generic_stage_input, filter_height=17, filter_width=17, stride_h=8, stride_w=8, "
+        "padding='VALID', target_shape=[1, 256, 1, 1], is_max_pool=False, channel_last=False)"
+        in rewritten
+    )
+    assert (
+        "spp_pair = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(scale3_anchor, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+    assert "spp_pair_bridge = spp_pair" in rewritten
+    assert "_binary_lhs_21, _binary_rhs_21 = spp_pair_bridge" in rewritten
 
 
 
@@ -8803,6 +9245,92 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_spp_scale3_with_ful
                 "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, self.const_demo_recip_any, [1, 192, 1, 17])",
                 "        spp_mul_out = _align_tensor_to_target_shape(torch.mul(spp_mul_in, self.const_demo_recip_any), [1, 192, 1, 29])",
                 "        _binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(bn_add_in, self.const_demo_add_any, [1, 192, 1, 31])",
+                "        return spp_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(self.const_demo_recip_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "spp_mul_out = _align_tensor_to_target_shape(torch.mul(spp_mul_in, "
+        "self.const_demo_recip_any), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(self.const_demo_add_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_spp_scale3_with_reversed_const_order(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale3_reversed_const_order_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_pool_out: torch.Tensor, spp_mul_in: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(self.const_demo_recip_any, spp_pool_out, [1, 192, 1, 17])",
+                "        spp_mul_out = _align_tensor_to_target_shape(torch.mul(self.const_demo_recip_any, spp_mul_in), [1, 192, 1, 29])",
+                "        _binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(self.const_demo_add_any, bn_add_in, [1, 192, 1, 31])",
+                "        return spp_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(spp_pool_out, "
+        "torch.reshape(self.const_demo_recip_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "spp_mul_out = _align_tensor_to_target_shape(torch.mul(spp_mul_in, "
+        "self.const_demo_recip_any), [1, 192, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(bn_add_in, "
+        "torch.reshape(self.const_demo_add_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_spp_scale3_with_parenthesized_const_operands(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale3_parenthesized_const_operands_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_pool_out: torch.Tensor, spp_mul_in: torch.Tensor, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor((self.const_demo_recip_any), (spp_pool_out), [1, 192, 1, 17])",
+                "        spp_mul_out = _align_tensor_to_target_shape(torch.mul((self.const_demo_recip_any), (spp_mul_in)), [1, 192, 1, 29])",
+                "        _binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor((self.const_demo_add_any), (bn_add_in), [1, 192, 1, 31])",
                 "        return spp_mul_out",
                 "",
             ]
