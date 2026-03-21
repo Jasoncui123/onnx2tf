@@ -4987,6 +4987,45 @@ def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes
     assert "[12, 6, 48, 64]" in repaired
 
 
+def test_apply_fast_precanonicalize_repairs_keeps_shadowformer_pool_chain_channel_last_for_space_to_depth(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_pool_chain_space_to_depth_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, mask_public_layout_bridge):",
+                "        wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 80, 120, 1], is_max_pool=True, channel_last=True)",
+                "        wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=True)",
+                "        wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 20, 30, 1], is_max_pool=True, channel_last=True)",
+                "        waencoderlayer2_blocks1_slice28_out0 = wa_max_p1_out_nhwc[:1, 5:40, :60, :1]",
+                "        waencoderlayer2_blocks1_slice29_out0 = wa_max_p1_out_nhwc[:1, :5, :60, :1]",
+                "        _space_to_depth_x_12 = wa_max_p1_out_nhwc",
+                "        _space_to_depth_n_12, _space_to_depth_h_12, _space_to_depth_w_12, _space_to_depth_c_12 = _space_to_depth_x_12.shape",
+                "        waencoderlayer2_blocks0_tr2_out0 = _space_to_depth_x_12.reshape(_space_to_depth_n_12, _space_to_depth_h_12 // 10, 10, _space_to_depth_w_12 // 10, 10, _space_to_depth_c_12).permute(0, 1, 3, 2, 4, 5).reshape(_space_to_depth_n_12, _space_to_depth_h_12 // 10, _space_to_depth_w_12 // 10, _space_to_depth_c_12 * 100)",
+                "        waconvblocks1_slice28_out0 = wa_max_p2_out_nhwc[:1, 5:20, :30, :1]",
+                "        waconvblocks1_slice29_out0 = wa_max_p2_out_nhwc[:1, :5, :30, :1]",
+                "        _space_to_depth_x_20 = wa_max_p2_out_nhwc",
+                "        _space_to_depth_n_20, _space_to_depth_h_20, _space_to_depth_w_20, _space_to_depth_c_20 = _space_to_depth_x_20.shape",
+                "        waconvblocks0_tr2_out0 = _space_to_depth_x_20.reshape(_space_to_depth_n_20, _space_to_depth_h_20 // 10, 10, _space_to_depth_w_20 // 10, 10, _space_to_depth_c_20).permute(0, 1, 3, 2, 4, 5).reshape(_space_to_depth_n_20, _space_to_depth_h_20 // 10, _space_to_depth_w_20 // 10, _space_to_depth_c_20 * 100)",
+                "        return waencoderlayer2_blocks0_tr2_out0, waconvblocks0_tr2_out0, waencoderlayer2_blocks1_slice28_out0, waconvblocks1_slice28_out0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 20, 30, 1], is_max_pool=True, channel_last=True)" in repaired
+
+
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_typed_buffer_alias(
     tmp_path,
 ) -> None:

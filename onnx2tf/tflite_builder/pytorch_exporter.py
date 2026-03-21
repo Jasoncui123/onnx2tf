@@ -20397,6 +20397,27 @@ def _canonicalize_generated_model_source_for_raw_export(
             return lrn_match is not None and str(lrn_match.group("input")) == name
         return False
 
+    def _has_nearby_channel_last_spatial_consumer(name: str, line_index: int) -> bool:
+        function_end = _function_end_index(line_index)
+        slice_re = re.compile(
+            rf"^\s*[A-Za-z0-9_]+ = {re.escape(name)}\[[^,\]]+, [^,\]]+, [^,\]]+, [^,\]]+\]$"
+        )
+        alias_re = re.compile(
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = {re.escape(name)}$"
+        )
+        for future_index in range(line_index + 1, min(function_end, line_index + 10)):
+            future_line = lines[future_index].strip()
+            if future_line == "":
+                continue
+            if slice_re.match(future_line) is not None:
+                return True
+            alias_match = alias_re.match(future_line)
+            if alias_match is not None:
+                alias_name = str(alias_match.group("lhs"))
+                if alias_name.startswith("_space_to_depth_x_") or alias_name.startswith("_depth_to_space_x_"):
+                    return True
+        return False
+
     def _find_stage_boundary_cat_consumer(name: str, line_index: int) -> Optional[re.Match[str]]:
         stage_return_index = None
         for lookahead_index in range(line_index + 1, min(line_index + 8, len(lines))):
@@ -21185,6 +21206,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 str(generic_pool2d_match.group("channel_last")) == "True"
                 and not _declares_channel_last_name(lhs)
                 and not _has_nearby_local_response_norm_consumer(lhs, index)
+                and not _has_nearby_channel_last_spatial_consumer(lhs, index)
                 and (
                     (
                         _is_known_cf_name(input_name, singleton_cf_seeds)
