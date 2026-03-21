@@ -9723,18 +9723,13 @@ def _collect_feature_last_sequence_tensor_names(model_ir: ModelIR) -> Set[str]:
 def _apply_feature_last_sequence_layouts(
     model_ir: ModelIR,
     preserve_channel_last_tensor_names: Set[str],
+    consumers: Optional[Dict[str, List[int]]] = None,
 ) -> bool:
     if len(preserve_channel_last_tensor_names) == 0:
         return False
     any_changed = False
-    producers: Dict[str, int] = {}
-    consumers: Dict[str, List[int]] = {}
-    for op_idx, op in enumerate(model_ir.operators):
-        for output_name in op.outputs:
-            producers[str(output_name)] = int(op_idx)
-    for op_idx, op in enumerate(model_ir.operators):
-        for input_name in op.inputs:
-            consumers.setdefault(str(input_name), []).append(int(op_idx))
+    if consumers is None:
+        _, consumers = _build_model_ir_producer_consumer_index(model_ir)
     for tensor_name in preserve_channel_last_tensor_names:
         tensor = model_ir.tensors.get(str(tensor_name), None)
         if tensor is None:
@@ -10405,15 +10400,14 @@ def _repair_orphan_recurrent_step_tensors(model_ir: ModelIR) -> None:
 def _reject_residual_layout_transposes(
     model_ir: ModelIR,
     preserve_channel_last_tensor_names: Set[str],
+    consumers: Optional[Dict[str, List[int]]] = None,
 ) -> None:
-    consumers: Dict[str, List[int]] = {}
     public_layout_bridge_tensor_names = model_ir.metadata.get("public_layout_bridge_tensor_names", [])
     if not isinstance(public_layout_bridge_tensor_names, list):
         public_layout_bridge_tensor_names = []
     public_layout_bridge_tensor_name_set = {str(name) for name in public_layout_bridge_tensor_names}
-    for op_idx, op in enumerate(model_ir.operators):
-        for input_name in op.inputs:
-            consumers.setdefault(str(input_name), []).append(int(op_idx))
+    if consumers is None:
+        _, consumers = _build_model_ir_producer_consumer_index(model_ir)
 
     for op in model_ir.operators:
         if str(op.op_type) != "TRANSPOSE":
@@ -10513,13 +10507,6 @@ def _align_public_boundary_shapes_to_onnx_contract(model_ir: ModelIR) -> None:
         boundary_map = {}
     if not isinstance(public_layout_map, dict):
         public_layout_map = {}
-    producer_index: Dict[str, int] = {}
-    consumers: Dict[str, List[int]] = {}
-    for op_idx, op in enumerate(model_ir.operators):
-        for output_name in op.outputs:
-            producer_index[str(output_name)] = int(op_idx)
-        for input_name in op.inputs:
-            consumers.setdefault(str(input_name), []).append(int(op_idx))
     recurrent_sequence_context = _has_recurrent_sequence_context(model_ir)
     for tensor_name in list(model_ir.inputs) + list(model_ir.outputs):
         tensor = model_ir.tensors.get(str(tensor_name), None)
@@ -10873,18 +10860,15 @@ def _is_pytorch_preserved_channel_last_rank4_or_rank5_model_island(
 def _shrink_preserved_channel_last_regions_for_pytorch(
     model_ir: ModelIR,
     preserve_channel_last_tensor_names: Set[str],
+    producer_index: Optional[Dict[str, int]] = None,
+    consumers: Optional[Dict[str, List[int]]] = None,
 ) -> Set[str]:
     if len(preserve_channel_last_tensor_names) == 0:
         return set()
     if _is_pytorch_preserved_channel_last_rank4_or_rank5_model_island(model_ir):
         return {str(name) for name in preserve_channel_last_tensor_names}
-    producers: Dict[str, int] = {}
-    consumers: Dict[str, List[int]] = {}
-    for op_idx, op in enumerate(model_ir.operators):
-        for output_name in op.outputs:
-            producers[str(output_name)] = int(op_idx)
-        for input_name in op.inputs:
-            consumers.setdefault(str(input_name), []).append(int(op_idx))
+    if producer_index is None or consumers is None:
+        producer_index, consumers = _build_model_ir_producer_consumer_index(model_ir)
 
     public_boundary_names = {str(name) for name in list(model_ir.inputs) + list(model_ir.outputs)}
     shrunken_preserve_names: Set[str] = {
@@ -10896,7 +10880,7 @@ def _shrink_preserved_channel_last_regions_for_pytorch(
             continue
         if str(tensor_name) in public_boundary_names:
             continue
-        producer_idx = producers.get(str(tensor_name), None)
+        producer_idx = producer_index.get(str(tensor_name), None)
         if producer_idx is None:
             continue
         producer_op = model_ir.operators[int(producer_idx)]
@@ -10958,16 +10942,20 @@ def normalize_model_ir_for_pytorch_channel_first(model_ir: ModelIR) -> ModelIR:
             tensor.logical_layout
         )
     infer_model_ir_logical_layouts(normalized)
+    producer_index, consumer_index = _build_model_ir_producer_consumer_index(normalized)
     preserve_channel_last_tensor_names = _collect_feature_last_sequence_tensor_names(normalized)
     feature_last_changed = _apply_feature_last_sequence_layouts(
         normalized,
         preserve_channel_last_tensor_names,
+        consumers=consumer_index,
     )
     if feature_last_changed:
         infer_model_ir_logical_layouts(normalized)
     shrunken_preserve_channel_last_tensor_names = _shrink_preserved_channel_last_regions_for_pytorch(
         normalized,
         preserve_channel_last_tensor_names,
+        producer_index=producer_index,
+        consumers=consumer_index,
     )
     preserve_names_changed = (
         shrunken_preserve_channel_last_tensor_names != preserve_channel_last_tensor_names
@@ -10976,6 +10964,7 @@ def normalize_model_ir_for_pytorch_channel_first(model_ir: ModelIR) -> ModelIR:
     feature_last_changed = _apply_feature_last_sequence_layouts(
         normalized,
         preserve_channel_last_tensor_names,
+        consumers=consumer_index,
     )
     if preserve_names_changed or feature_last_changed:
         infer_model_ir_logical_layouts(normalized)
@@ -11065,9 +11054,14 @@ def normalize_model_ir_for_pytorch_channel_first(model_ir: ModelIR) -> ModelIR:
                 continue
             if is_channel_last_logical_layout(normalize_logical_layout(input_tensor.logical_layout)):
                 public_layout_map[output_name] = channel_first_logical_layout(output_rank)
+    _, post_bridge_consumer_index = _build_model_ir_producer_consumer_index(normalized)
     _align_public_boundary_shapes_to_onnx_contract(normalized)
     normalized.metadata["assume_channel_last_layout_tensor_names"] = []
-    _reject_residual_layout_transposes(normalized, preserve_channel_last_tensor_names)
+    _reject_residual_layout_transposes(
+        normalized,
+        preserve_channel_last_tensor_names,
+        consumers=post_bridge_consumer_index,
+    )
     validate_channel_first_exportability(normalized, preserve_channel_last_tensor_names)
     return normalized
 

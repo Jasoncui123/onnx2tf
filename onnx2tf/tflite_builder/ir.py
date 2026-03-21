@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -828,6 +829,19 @@ def _boundary_current_layout(
     return normalize_logical_layout(tensor.logical_layout)
 
 
+def _build_model_ir_producer_consumer_index(
+    model_ir: ModelIR,
+) -> Tuple[Dict[str, int], Dict[str, List[int]]]:
+    producer_index: Dict[str, int] = {}
+    consumers: Dict[str, List[int]] = {}
+    for op_idx, op in enumerate(model_ir.operators):
+        for output_name in op.outputs:
+            producer_index[str(output_name)] = int(op_idx)
+        for input_name in op.inputs:
+            consumers.setdefault(str(input_name), []).append(int(op_idx))
+    return producer_index, consumers
+
+
 def infer_model_ir_logical_layouts(model_ir: ModelIR) -> Dict[str, str]:
     boundary_map = model_ir.metadata.get("onnx_boundary_shape_signature_map", {})
     if not isinstance(boundary_map, dict):
@@ -842,7 +856,6 @@ def infer_model_ir_logical_layouts(model_ir: ModelIR) -> Dict[str, str]:
     }
     input_names = {str(v) for v in model_ir.inputs}
     output_names = {str(v) for v in model_ir.outputs}
-    public_boundary_names = input_names | output_names
     recurrent_public_boundary_context = any(
         str(op.op_type) in {
             "GRU",
@@ -860,25 +873,7 @@ def infer_model_ir_logical_layouts(model_ir: ModelIR) -> Dict[str, str]:
     }
     tensor_layouts: Dict[str, str] = {}
 
-    def _set_tensor_layout(tensor_name: str, layout: str) -> bool:
-        target_name = str(tensor_name)
-        target_tensor = model_ir.tensors.get(target_name, None)
-        if target_tensor is None:
-            return False
-        normalized_layout = normalize_logical_layout(layout)
-        if tensor_layouts.get(target_name, LOGICAL_LAYOUT_UNKNOWN) == normalized_layout:
-            return False
-        target_tensor.logical_layout = normalized_layout
-        tensor_layouts[target_name] = normalized_layout
-        return True
-
-    producer_index: Dict[str, int] = {}
-    consumers: Dict[str, List[int]] = {}
-    for op_idx, op in enumerate(model_ir.operators):
-        for output_name in op.outputs:
-            producer_index[str(output_name)] = int(op_idx)
-        for input_name in op.inputs:
-            consumers.setdefault(str(input_name), []).append(int(op_idx))
+    producer_index, consumers = _build_model_ir_producer_consumer_index(model_ir)
     public_layout_map: Dict[str, str] = {}
     for tensor_name in list(model_ir.inputs) + list(model_ir.outputs):
         tensor = model_ir.tensors.get(str(tensor_name), None)
@@ -998,10 +993,39 @@ def infer_model_ir_logical_layouts(model_ir: ModelIR) -> Dict[str, str]:
         "WHERE",
     }
 
+    next_pending_ops: Set[int] = set()
+
+    def _queue_tensor_neighbors(tensor_name: str) -> None:
+        resolved_name = str(tensor_name)
+        producer_op_idx = producer_index.get(resolved_name, None)
+        if producer_op_idx is not None:
+            next_pending_ops.add(int(producer_op_idx))
+        for consumer_op_idx in consumers.get(resolved_name, []):
+            next_pending_ops.add(int(consumer_op_idx))
+
+    def _set_tensor_layout(tensor_name: str, layout: str) -> bool:
+        target_name = str(tensor_name)
+        target_tensor = model_ir.tensors.get(target_name, None)
+        if target_tensor is None:
+            return False
+        normalized_layout = normalize_logical_layout(layout)
+        if tensor_layouts.get(target_name, LOGICAL_LAYOUT_UNKNOWN) == normalized_layout:
+            return False
+        target_tensor.logical_layout = normalized_layout
+        tensor_layouts[target_name] = normalized_layout
+        _queue_tensor_neighbors(target_name)
+        return True
+
     max_iter = max(1, int(len(model_ir.operators)) * 4)
+    pending_ops: Set[int] = set(range(len(model_ir.operators)))
     for _ in range(max_iter):
+        if len(pending_ops) == 0:
+            break
         changed = False
-        for op in model_ir.operators:
+        next_pending_ops = set()
+        op_queue = deque(sorted(int(v) for v in pending_ops))
+        while len(op_queue) > 0:
+            op = model_ir.operators[int(op_queue.popleft())]
             op_type = str(op.op_type)
             output_names = [str(v) for v in list(op.outputs)]
             input_names = [str(v) for v in list(op.inputs)]
@@ -1138,6 +1162,7 @@ def infer_model_ir_logical_layouts(model_ir: ModelIR) -> Dict[str, str]:
                             changed = _set_tensor_layout(str(output_name), target_layout) or changed
         if not changed:
             break
+        pending_ops = set(next_pending_ops)
 
     return dict(tensor_layouts)
 
