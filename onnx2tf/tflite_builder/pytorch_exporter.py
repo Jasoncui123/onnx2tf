@@ -27873,6 +27873,9 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     stage7_permute_assign_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<args>.+)\)$"
     )
+    stage7_shape_tensor_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _shape_tensor\((?P<args>.+)\)$"
+    )
     stage7_gather_assign_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.gather\((?P<args>.+)\)$"
     )
@@ -27941,6 +27944,9 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
             r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\(\s*other\s*=\s*(?P<input1>[A-Za-z0-9_]+)\s*,\s*input\s*=\s*(?P<input0>[A-Za-z0-9_]+)\s*\)$"
         ),
     ]
+    stage7_permute_dims_patterns = {
+        (1, 0): r"(?:\[\s*1\s*,\s*0\s*\]|\(\s*1\s*,\s*0\s*\))",
+    }
     def _split_stage7_top_level_args(args: str) -> list[str]:
         parts: list[str] = []
         current: list[str] = []
@@ -28238,19 +28244,24 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         return input_name, indices_name
 
     has_stage7_def = False
+    stage7_param_names: list[str] = []
     has_forward_call = False
     packed_forward_names: Set[str] = set()
     packed_forward_indices: Dict[str, Set[str]] = {}
     gather_reshape_count = 0
     singleton_anchor_count = 0
+    stage7_shape_tensor_count = 0
+    has_descriptor_permute = False
     has_stage7_return = False
     for line in lines:
         current_line = str(line)
         parsed_shape_alias = _parse_stage7_anchor_shape_alias(current_line)
         if parsed_shape_alias is not None:
             stage7_anchor_shape_alias_sources[parsed_shape_alias[0]] = parsed_shape_alias[1]
-        if stage7_def_re.match(current_line) is not None:
+        stage7_def_match = stage7_def_re.match(current_line)
+        if stage7_def_match is not None:
             has_stage7_def = True
+            stage7_param_names = re.findall(r"([A-Za-z0-9_]+): torch\.Tensor", current_line)
             continue
         if forward_unpack_re.match(current_line) is not None:
             has_forward_call = True
@@ -28312,6 +28323,19 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
                 str(stage7_take_along_dim_method_assign_match.group("args")),
             ) is not None:
                 continue
+        if stage7_shape_tensor_assign_re.match(current_line) is not None:
+            stage7_shape_tensor_count += 1
+            continue
+        stage7_permute_match = stage7_permute_assign_re.match(current_line)
+        if stage7_permute_match is not None:
+            permute_args = str(stage7_permute_match.group("args"))
+            descriptor_patterns = stage7_permute_dims_patterns[(1, 0)]
+            if re.match(
+                rf"^(?P<input>.+?),\s*(?:perm\s*=\s*|dims\s*=\s*)?{descriptor_patterns}$",
+                permute_args,
+            ) is not None:
+                has_descriptor_permute = True
+                continue
         stage7_mul_assign_match = re.match(
             r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.mul\((?P<args>.+)\)$",
             current_line,
@@ -28340,11 +28364,16 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
                 continue
         if stage7_return_re.match(current_line) is not None:
             has_stage7_return = True
+    fallback_branch_count = min(
+        stage7_shape_tensor_count,
+        max(0, len(stage7_param_names) - 2),
+    )
+    structural_fallback_ready = has_descriptor_permute and fallback_branch_count >= 1
     return (
         has_stage7_def
         and has_forward_call
-        and gather_reshape_count >= 1
-        and singleton_anchor_count >= 1
+        and (gather_reshape_count >= 1 or structural_fallback_ready)
+        and (singleton_anchor_count >= 1 or structural_fallback_ready)
         and has_stage7_return
     )
 
@@ -29973,6 +30002,20 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         _resolve_stage7_alias(str(match["input"]))
         for _, match in stage7_shape_matches
     ]
+    stage7_shape_matches_by_index = {
+        scan_index: match
+        for scan_index, match in stage7_shape_matches
+    }
+    structural_fallback_add_names: list[str] = []
+    if stage7_shape_matches:
+        next_shape_index = min(stage7_shape_matches_by_index)
+        while next_shape_index in stage7_shape_matches_by_index:
+            fallback_add_name = _resolve_stage7_alias(
+                str(stage7_shape_matches_by_index[next_shape_index]["input"])
+            )
+            if fallback_add_name not in structural_fallback_add_names:
+                structural_fallback_add_names.append(fallback_add_name)
+            next_shape_index += 1
     stage7_param_names = re.findall(r"([A-Za-z0-9_]+): torch\.Tensor", lines[stage7_def_index])
     detected_tr_names = [
         _unwrap_stage7_passthrough_expr(str(match["tr"]))
@@ -30039,6 +30082,42 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         stage7_param_names[descriptor_param_index + 1 :]
         if descriptor_param_index is not None
         else stage7_param_names
+    )
+    branch_tr_param_names = set(
+        post_descriptor_params[:-1]
+        if len(post_descriptor_params) >= 2
+        else post_descriptor_params
+    )
+    if branch_tr_param_names:
+        stage7_branch_mul_pairs = {
+            add_name: tr_name
+            for add_name, tr_name in stage7_branch_mul_pairs.items()
+            if tr_name in branch_tr_param_names
+        }
+        detected_tr_names = [
+            tr_name
+            for tr_name in detected_tr_names
+            if tr_name in branch_tr_param_names
+        ]
+        detected_tr_names.extend(
+            tr_name
+            for _, tr_name in stage7_branch_mul_pairs.items()
+            if tr_name not in detected_tr_names
+        )
+    if (
+        not detected_tr_names
+        and not stage7_gather_reshape_matches
+        and not stage7_branch_mul_pairs
+        and (structural_fallback_add_names or detected_add_names)
+        and len(post_descriptor_params) >= len((structural_fallback_add_names or detected_add_names)) + 1
+    ):
+        detected_add_names = structural_fallback_add_names or detected_add_names
+        detected_tr_names = list(post_descriptor_params[: len(detected_add_names)])
+        covered_stage7_branch_count = max(covered_stage7_branch_count, len(detected_add_names))
+    structural_fallback_tr_names = (
+        list(post_descriptor_params[: len(structural_fallback_add_names)])
+        if structural_fallback_add_names
+        else []
     )
     ordered_add_names = [
         param_name
@@ -30114,9 +30193,87 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             ),
         )
 
+    def _parse_stage7_forward_call_arg_names(line: str) -> list[str]:
+        stage7_call_match = re.search(r"self\._forward_stage_7\((?P<args>.*)\)\s*$", line)
+        if stage7_call_match is None:
+            return []
+        arg_names: list[str] = []
+        for raw_arg in _split_stage7_top_level_args(str(stage7_call_match.group("args"))):
+            arg_expr = raw_arg.strip()
+            if "=" in arg_expr:
+                _, arg_expr = arg_expr.split("=", 1)
+                arg_expr = arg_expr.strip()
+            if re.fullmatch(r"[A-Za-z0-9_]+", arg_expr) is not None:
+                arg_names.append(arg_expr)
+        return arg_names
+
+    def _infer_stage7_score_map_name_from_forward_scope() -> str | None:
+        if forward_call_index is None:
+            return None
+        forward_call_line = lines[forward_call_index]
+        call_arg_names = set(_parse_stage7_forward_call_arg_names(forward_call_line))
+        forward_unpack_match = forward_unpack_re.match(forward_call_line)
+        descriptor_lhs_name = (
+            str(forward_unpack_match.group("descriptors"))
+            if forward_unpack_match is not None
+            else None
+        )
+        score_lhs_name = (
+            str(forward_unpack_match.group("score"))
+            if forward_unpack_match is not None
+            else None
+        )
+        forward_end_index = next(
+            (
+                index
+                for index in range(forward_call_index + 1, len(lines))
+                if lines[index].startswith("    def ")
+            ),
+            len(lines),
+        )
+        if descriptor_lhs_name is not None and score_lhs_name is not None:
+            for scan_index in range(forward_call_index + 1, forward_end_index):
+                return_match = re.match(r"^\s*return\s+\(?(?P<values>.+?)\)?\s*$", lines[scan_index])
+                if return_match is None:
+                    continue
+                return_values = [
+                    value
+                    for value in _split_stage7_top_level_args(str(return_match.group("values")))
+                    if re.fullmatch(r"[A-Za-z0-9_]+", value) is not None
+                ]
+                extra_return_values = [
+                    value
+                    for value in return_values
+                    if value not in {descriptor_lhs_name, score_lhs_name}
+                ]
+                if extra_return_values:
+                    return extra_return_values[-1]
+        forward_def_index = next(
+            (
+                index
+                for index in range(forward_call_index, -1, -1)
+                if lines[index].startswith("    def forward(")
+            ),
+            None,
+        )
+        if forward_def_index is None:
+            return None
+        forward_param_names = re.findall(
+            r"([A-Za-z0-9_]+): torch\.Tensor",
+            lines[forward_def_index],
+        )
+        fallback_param_names = [
+            param_name
+            for param_name in forward_param_names
+            if param_name not in call_arg_names
+            and param_name not in {descriptor_lhs_name, score_lhs_name}
+        ]
+        return fallback_param_names[0] if fallback_param_names else None
+
     gather_input_roots = set(gather_input_root_order)
     preferred_stage7_gather_root = next(iter(_rank_stage7_gather_roots(gather_input_roots)), None)
-    stage7_score_map_name = preferred_stage7_gather_root or "scores_map"
+    inferred_stage7_score_map_name = _infer_stage7_score_map_name_from_forward_scope()
+    stage7_score_map_name = preferred_stage7_gather_root or inferred_stage7_score_map_name or "scores_map"
     raw_stage7_branch_pairs = [
         (add_name, tr_name)
         for _, match in stage7_gather_reshape_matches
@@ -30153,6 +30310,26 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         for add_name, tr_name in stage7_branch_mul_pairs.items()
         if (add_name, tr_name) not in raw_stage7_branch_pairs
     )
+    if (
+        not raw_stage7_branch_pairs
+        and len(stage7_singleton_anchor_matches) <= 1
+        and structural_fallback_add_names
+        and len(structural_fallback_tr_names) >= len(structural_fallback_add_names)
+    ):
+        raw_stage7_branch_pairs.extend(
+            (add_name, tr_name)
+            for add_name, tr_name in zip(structural_fallback_add_names, structural_fallback_tr_names)
+        )
+    elif (
+        not raw_stage7_branch_pairs
+        and not stage7_gather_reshape_matches
+        and add_names
+        and tr_names
+    ):
+        raw_stage7_branch_pairs.extend(
+            (add_name, tr_name)
+            for add_name, tr_name in zip(add_names, tr_names)
+        )
     if not raw_stage7_branch_pairs and stage7_singleton_anchor_matches:
         raw_stage7_branch_pairs.extend(
             (add_name, _unwrap_stage7_passthrough_expr(str(match["tr"])))
@@ -30610,14 +30787,28 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 if branch_pair is not None
                 and str(match["lhs"]) in final_stage7_mul_leaves
             ]
+        if raw_stage7_branch_pairs:
+            constrained_branch_pairs = [
+                branch_pair
+                for branch_pair in constrained_branch_pairs
+                if branch_pair in raw_stage7_branch_pairs
+            ]
         if constrained_branch_pairs:
             stage7_branch_pairs = constrained_branch_pairs
     elif final_stage7_branch_pair_leaves:
-        stage7_branch_pairs = [
+        constrained_branch_pairs = [
             branch_pair
             for branch_pair in raw_stage7_branch_pairs
             if branch_pair in final_stage7_branch_pair_leaves
-        ] or final_stage7_branch_pair_leaves
+        ]
+        if not constrained_branch_pairs:
+            constrained_branch_pairs = [
+                branch_pair
+                for branch_pair in final_stage7_branch_pair_leaves
+                if branch_pair in raw_stage7_branch_pairs
+            ]
+        if constrained_branch_pairs:
+            stage7_branch_pairs = constrained_branch_pairs
 
     def _stage7_branch_mul_match(add_name: str, tr_name: str) -> dict[str, str] | None:
         return next(
@@ -30712,7 +30903,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                     or branch_gather_root_name == preferred_stage7_gather_root
                 )
             ]
-    stage7_score_map_name = preferred_stage7_gather_root or "scores_map"
+    stage7_score_map_name = preferred_stage7_gather_root or inferred_stage7_score_map_name or "scores_map"
     if f"{stage7_score_map_name}: torch.Tensor" not in lines[stage7_def_index]:
         if "->" in lines[stage7_def_index]:
             lines[stage7_def_index] = re.sub(

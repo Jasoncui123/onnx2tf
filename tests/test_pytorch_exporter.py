@@ -4179,28 +4179,47 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_br
 def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_branch_reshape_resolved_shape(
     tmp_path,
 ) -> None:
-    lines = [
-        "class Model(torch.nn.Module):",
-        "    def _forward_stage_7(self, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
-        "        desc_out = _torch_permute(score_div, [1, 0])",
-        "        shape_a = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)",
-        "        shape_b = _shape_tensor(add_b, dtype=torch.int32, device=add_b.device)",
-        "        gather_a = torch.gather(index=add_a, input=scores_map_buf, dim=0)",
-        "        gather_b = scores_map_buf.index_select(0, add_b)",
-        "        mul0 = torch.mul(gather_a.reshape(_resolve_reshape_shape((-1, 1), gather_a, allow_zero=False)), tr_b)",
-        "        mul1 = torch.mul(input=gather_b.reshape(_resolve_reshape_shape([-1, 1], gather_b, allow_zero=False)), other=tr_a)",
-        "        score_add0 = torch.add(mul0, mul1)",
-        "        score_tr14 = _torch_permute(score_add0, [0, 1, 3, 2])",
-        "        final_pair_lhs, final_pair_rhs = _align_binary_inputs_to_anchor(score_tr14, score_cast, [1, 1, 1, 1])",
-        "        score_mul = torch.mul(final_pair_lhs, final_pair_rhs)",
-        "        out_scores = torch.reshape(score_mul, (([1]) + ([1])))",
-        "        return desc_out, out_scores",
-        "    def forward(self, scores_map_buf: torch.Tensor, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor):",
-        "        final_desc, final_scores = self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast)",
-        "        return final_desc, final_scores",
-    ]
+    package_dir = tmp_path / "fast_precanon_alike_full_method_branch_reshape_resolved_shape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_7(self, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        desc_out = _torch_permute(score_div, [1, 0])",
+                "        shape_a = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)",
+                "        shape_b = _shape_tensor(add_b, dtype=torch.int32, device=add_b.device)",
+                "        gather_a = torch.gather(index=add_a, input=scores_map_buf, dim=0)",
+                "        gather_b = scores_map_buf.index_select(0, add_b)",
+                "        mul0 = torch.mul(gather_a.reshape(_resolve_reshape_shape((-1, 1), gather_a, allow_zero=False)), tr_b)",
+                "        mul1 = torch.mul(input=gather_b.reshape(_resolve_reshape_shape([-1, 1], gather_b, allow_zero=False)), other=tr_a)",
+                "        score_add0 = torch.add(mul0, mul1)",
+                "        score_tr14 = _torch_permute(score_add0, [0, 1, 3, 2])",
+                "        final_pair_lhs, final_pair_rhs = _align_binary_inputs_to_anchor(score_tr14, score_cast, [1, 1, 1, 1])",
+                "        score_mul = torch.mul(final_pair_lhs, final_pair_rhs)",
+                "        out_scores = torch.reshape(score_mul, (([1]) + ([1])))",
+                "        return desc_out, out_scores",
+                "    def forward(self, scores_map_buf: torch.Tensor, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor):",
+                "        final_desc, final_scores = self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast)",
+                "        return final_desc, final_scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
-    assert _has_alike_fast_repair_signature(lines) is True
+    _apply_alike_fast_precanonicalize_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
+    assert "final_desc, final_scores = self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map_buf)" in rewritten
+    assert "out_scores_stage7_mul0_out0 = torch.mul(out_scores_stage7_rs_fixed_0, tr_b)" in rewritten
+    assert "out_scores_stage7_mul1_out0 = torch.mul(out_scores_stage7_rs_fixed_1, tr_a)" in rewritten
+    assert "mul0 = torch.mul(gather_a.reshape(_resolve_reshape_shape((-1, 1), gather_a, allow_zero=False)), tr_b)" not in rewritten
+    assert "mul1 = torch.mul(input=gather_b.reshape(_resolve_reshape_shape([-1, 1], gather_b, allow_zero=False)), other=tr_a)" not in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_branch_reshape_resolved_shape_passthrough_sources(
@@ -4248,6 +4267,75 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_br
     assert "out_scores_stage7_mul1_out0 = torch.mul(out_scores_stage7_rs_fixed_1, tr_a)" in rewritten
     assert "mul0 = gather_a.reshape(_resolve_reshape_shape((-1, 1), gather_a, allow_zero=False)).mul(tr_b)" not in rewritten
     assert "mul1 = gather_b.reshape(_resolve_reshape_shape([-1, 1], gather_b, allow_zero=False)).mul(other=tr_a)" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_split_stage7_shape_and_tr_fallback(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alike_full_split_stage7_shape_tr_fallback_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_7(self, branch_offset: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        add3_out0 = _align_tensor_to_target_shape(torch.add(branch_offset, add_a), [1, 1, 1])",
+                "        add8_out0 = _align_tensor_to_target_shape(torch.add(branch_offset, add_b), [1, 1, 1])",
+                "        descriptors = _torch_permute(score_div, [1, 0])",
+                "        shape13_out0 = _shape_tensor(add3_out0, dtype=torch.int32, device=add3_out0.device)",
+                "        shape17_out0 = _shape_tensor(add8_out0, dtype=torch.int32, device=add8_out0.device)",
+                "        rs13_out0 = torch.reshape(gather7_out0, _resolve_reshape_shape([-1, 1], gather7_out0, allow_zero=False))",
+                "        concat17_out0 = _apply_concat([self.const_inline_literal_5, shape13_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        rs17_out0 = torch.reshape(gather15_out0, _resolve_reshape_shape([-1, 1], gather15_out0, allow_zero=False))",
+                "        concat21_out0 = _apply_concat([self.const_inline_literal_5, shape17_out0], axis=0, target_shape=[4], fused='NONE')",
+                "        tr7_out0 = _torch_permute(rs13_out0, [1, 0])",
+                "        tr11_out0 = _torch_permute(rs17_out0, [1, 0])",
+                "        rs14_out0_rs_shape_dim0 = concat17_out0.reshape(-1)[:1]",
+                "        rs14_out0_rs_in_shape = _shape_tensor(tr7_out0, dtype=torch.int32, device=tr7_out0.device)",
+                "        rs14_out0_rs_in_dim0 = rs14_out0_rs_in_shape.reshape(-1)[:1]",
+                "        rs14_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(rs14_out0_rs_shape_dim0, 0), [1])",
+                "        rs14_out0_rs_shape_dim0_fixed = torch.where(rs14_out0_rs_shape_dim0_is_zero, rs14_out0_rs_in_dim0, rs14_out0_rs_shape_dim0)",
+                "        rs14_out0_rs_shape_tail = concat17_out0.reshape(-1)[1:]",
+                "        rs14_out0_rs_shape_fixed = _apply_concat([rs14_out0_rs_shape_dim0_fixed, rs14_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        rs14_out0 = torch.reshape(tr7_out0, _shape_list(_resolve_reshape_shape_tensor(rs14_out0_rs_shape_fixed, tr7_out0, allow_zero=False)))",
+                "        rs18_out0_rs_shape_dim0 = concat21_out0.reshape(-1)[:1]",
+                "        rs18_out0_rs_in_shape = _shape_tensor(tr11_out0, dtype=torch.int32, device=tr11_out0.device)",
+                "        rs18_out0_rs_in_dim0 = rs18_out0_rs_in_shape.reshape(-1)[:1]",
+                "        rs18_out0_rs_shape_dim0_is_zero = _align_tensor_to_target_shape(torch.eq(rs18_out0_rs_shape_dim0, 0), [1])",
+                "        rs18_out0_rs_shape_dim0_fixed = torch.where(rs18_out0_rs_shape_dim0_is_zero, rs18_out0_rs_in_dim0, rs18_out0_rs_shape_dim0)",
+                "        rs18_out0_rs_shape_tail = concat21_out0.reshape(-1)[1:]",
+                "        rs18_out0_rs_shape_fixed = _apply_concat([rs18_out0_rs_shape_dim0_fixed, rs18_out0_rs_shape_tail], axis=0, target_shape=[4], fused='NONE')",
+                "        rs18_out0 = torch.reshape(tr11_out0, _shape_list(_resolve_reshape_shape_tensor(rs18_out0_rs_shape_fixed, tr11_out0, allow_zero=False)))",
+                "        mul0_out0 = torch.mul(rs14_out0, tr_a)",
+                "        mul1_out0 = torch.mul(rs18_out0, tr_b)",
+                "        score_add0 = torch.add(mul0_out0, mul1_out0)",
+                "        score_tr14 = _torch_permute(score_add0, [0, 1, 3, 2])",
+                "        final_pair_lhs, final_pair_rhs = _align_binary_inputs_to_anchor(score_tr14, score_cast, [1, 1, 1, 1])",
+                "        score_mul = torch.mul(final_pair_lhs, final_pair_rhs)",
+                "        score_squeeze = torch.squeeze(score_mul)",
+                "        out_scores = torch.reshape(score_squeeze, (([1]) + ([1])))",
+                "        return descriptors, out_scores",
+                "    def forward(self, scores_map_buf: torch.Tensor, branch_offset: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor):",
+                "        final_desc, final_scores = self._forward_stage_7(branch_offset, add_a, add_b, score_div, tr_a, tr_b, score_cast)",
+                "        return final_desc, final_scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_alike_fast_precanonicalize_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
+    assert "final_desc, final_scores = self._forward_stage_7(branch_offset, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map_buf)" in rewritten
+    assert "out_scores_stage7_mul0_out0 = torch.mul(out_scores_stage7_rs_fixed_0, tr_a)" in rewritten
+    assert "out_scores_stage7_mul1_out0 = torch.mul(out_scores_stage7_rs_fixed_1, tr_b)" in rewritten
+    assert "rs13_out0 = torch.reshape(gather7_out0, _resolve_reshape_shape([-1, 1], gather7_out0, allow_zero=False))" not in rewritten
+    assert "rs17_out0 = torch.reshape(gather15_out0, _resolve_reshape_shape([-1, 1], gather15_out0, allow_zero=False))" not in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_score_tail(
