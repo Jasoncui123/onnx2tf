@@ -126,6 +126,24 @@ def _should_resize_as_channel_last(
     return False
 
 
+def _normalize_channel_last_pool_target_shape(
+    value: torch.Tensor,
+    target_shape: Optional[Sequence[int]],
+) -> Optional[List[int]]:
+    if target_shape is None:
+        return None
+    target = [int(v) for v in list(target_shape)]
+    if value.ndim != 4 or len(target) != 4:
+        return target
+    actual_shape = [int(v) for v in list(value.shape)]
+    if int(target[0]) != int(actual_shape[0]):
+        return target
+    actual_channels = int(actual_shape[-1])
+    if int(target[-1]) == actual_channels or int(target[1]) != actual_channels:
+        return target
+    return [int(target[0]), int(target[2]), int(target[3]), int(target[1])]
+
+
 def _align_tensor_to_target_shape(
     value: torch.Tensor,
     target_shape: Optional[Sequence[int]],
@@ -1621,6 +1639,7 @@ def _kernel_pool2d(is_max_pool: bool) -> Callable[[_GraphExecutor, Dict[str, Any
         if x.ndim == 4 and _should_resize_as_channel_last(executor, op, x, target_shape):
             channel_last = True
             pool_input = x.permute(0, 3, 1, 2).contiguous()
+            target_shape = _normalize_channel_last_pool_target_shape(x, target_shape)
         if is_max_pool:
             y = F.max_pool2d(pool_input, kernel_size=kernel_size, stride=stride, padding=padding)
         else:
