@@ -15319,6 +15319,7 @@ def _run_generated_package_export_child(
     child_payload: Dict[str, Any],
     child_args: Optional[List[str]] = None,
     temp_prefix: str,
+    timeout_sec: int = 0,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     try:
         import torch
@@ -15334,21 +15335,32 @@ def _run_generated_package_export_child(
         payload = dict(child_payload)
         payload["inputs"] = tuple(example_inputs)
         torch.save(payload, serialized_inputs_path)
-        child_result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                child_script,
-                str(package_path),
-                str(serialized_inputs_path),
-                str(artifact_path),
-                *[str(v) for v in child_args],
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
+        child_run_kwargs: Dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "check": False,
+        }
+        if int(timeout_sec) > 0:
+            child_run_kwargs["timeout"] = float(timeout_sec)
+        try:
+            child_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    child_script,
+                    str(package_path),
+                    str(serialized_inputs_path),
+                    str(artifact_path),
+                    *[str(v) for v in child_args],
+                ],
+                **child_run_kwargs,
+            )
+        except subprocess.TimeoutExpired:
+            return None, (
+                "timed out after "
+                f"{int(timeout_sec)}s while exporting generated PyTorch package child artifact."
+            )
     if child_result.returncode == 0:
         try:
             return json.loads(child_result.stdout.strip() or "{}"), ""
@@ -15368,6 +15380,7 @@ def export_torchscript_from_generated_package(
     custom_input_op_name_np_data_path: Optional[List[Any]] = None,
     shape_hints: Optional[List[str]] = None,
     test_data_nhwc_path: Optional[str] = None,
+    native_package_generation_timeout_sec: Optional[int] = 0,
     raise_on_failure: bool = True,
 ) -> Optional[str]:
     try:
@@ -15508,6 +15521,7 @@ print(json.dumps({"trace_mode": mode}))
 """
     trace_mode = ""
     last_error_message = ""
+    timeout_sec = int(native_package_generation_timeout_sec or 0)
     for candidate_mode in ("trace", "script"):
         child_payload, last_error_message = _run_generated_package_export_child(
             example_inputs=example_inputs,
@@ -15517,6 +15531,7 @@ print(json.dumps({"trace_mode": mode}))
             child_payload={},
             child_args=[candidate_mode],
             temp_prefix="onnx2tf_torchscript_",
+            timeout_sec=timeout_sec,
         )
         if child_payload is not None:
             trace_mode = str(child_payload.get("trace_mode", candidate_mode))
@@ -15525,6 +15540,16 @@ print(json.dumps({"trace_mode": mode}))
             last_error_message = f"mode={candidate_mode} {last_error_message}"
     if trace_mode == "":
         _remove_generated_package_artifact_if_exists(torchscript_path)
+        extra_fields = {
+            "trace_mode": None,
+        }
+        if timeout_sec > 0 and "timed out after" in str(last_error_message):
+            extra_fields.update(
+                {
+                    "timed_out": True,
+                    "timeout_sec": int(timeout_sec),
+                }
+            )
         _write_generated_package_export_metadata(
             metadata_path=metadata_path,
             metadata=metadata,
@@ -15533,9 +15558,7 @@ print(json.dumps({"trace_mode": mode}))
             example_input_shapes=example_input_shapes,
             dynamic_inputs_present=dynamic_inputs_present,
             error=last_error_message,
-            extra_fields={
-                "trace_mode": None,
-            },
+            extra_fields=extra_fields,
         )
         if raise_on_failure:
             raise ModelIRPyTorchExportError(
@@ -15563,6 +15586,7 @@ def export_dynamo_onnx_from_generated_package(
     custom_input_op_name_np_data_path: Optional[List[Any]] = None,
     shape_hints: Optional[List[str]] = None,
     test_data_nhwc_path: Optional[str] = None,
+    native_package_generation_timeout_sec: Optional[int] = 0,
     raise_on_failure: bool = True,
 ) -> Optional[str]:
     try:
@@ -15634,6 +15658,7 @@ def export_dynamo_onnx_from_generated_package(
     )
     dynamo_onnx_file_name = f"{file_stem}_dynamo.onnx"
     dynamo_onnx_path = package_path / dynamo_onnx_file_name
+    timeout_sec = int(native_package_generation_timeout_sec or 0)
     child_script = """
 import hashlib
 import importlib
@@ -15702,9 +15727,16 @@ print(json.dumps({"file_name": dynamo_onnx_path.name}))
             "output_names": [str(v) for v in list(metadata.get("outputs", []))],
         },
         temp_prefix="onnx2tf_dynamo_onnx_",
+        timeout_sec=timeout_sec,
     )
     if child_payload is None or not dynamo_onnx_path.exists():
         _remove_generated_package_artifact_if_exists(dynamo_onnx_path)
+        extra_fields = None
+        if timeout_sec > 0 and "timed out after" in str(last_error_message):
+            extra_fields = {
+                "timed_out": True,
+                "timeout_sec": int(timeout_sec),
+            }
         _write_generated_package_export_metadata(
             metadata_path=metadata_path,
             metadata=metadata,
@@ -15713,6 +15745,7 @@ print(json.dumps({"file_name": dynamo_onnx_path.name}))
             example_input_shapes=example_input_shapes,
             dynamic_inputs_present=dynamic_inputs_present,
             error=last_error_message or "dynamo=True ONNX export did not produce an artifact.",
+            extra_fields=extra_fields,
         )
         if raise_on_failure:
             raise ModelIRPyTorchExportError(
@@ -15756,6 +15789,7 @@ def export_exported_program_from_generated_package(
     custom_input_op_name_np_data_path: Optional[List[Any]] = None,
     shape_hints: Optional[List[str]] = None,
     test_data_nhwc_path: Optional[str] = None,
+    native_package_generation_timeout_sec: Optional[int] = 0,
     raise_on_failure: bool = True,
 ) -> Optional[str]:
     try:
@@ -15827,6 +15861,7 @@ def export_exported_program_from_generated_package(
     )
     exported_program_file_name = f"{file_stem}_ep.pt2"
     exported_program_path = package_path / exported_program_file_name
+    timeout_sec = int(native_package_generation_timeout_sec or 0)
     child_script = """
 import hashlib
 import importlib.util
@@ -17647,9 +17682,16 @@ print(json.dumps({"file_name": exported_program_path.name}))
         artifact_path=exported_program_path,
         child_payload={},
         temp_prefix="onnx2tf_exported_program_",
+        timeout_sec=timeout_sec,
     )
     if child_payload is None or not exported_program_path.exists():
         _remove_generated_package_artifact_if_exists(exported_program_path)
+        extra_fields = None
+        if timeout_sec > 0 and "timed out after" in str(last_error_message):
+            extra_fields = {
+                "timed_out": True,
+                "timeout_sec": int(timeout_sec),
+            }
         _write_generated_package_export_metadata(
             metadata_path=metadata_path,
             metadata=metadata,
@@ -17658,6 +17700,7 @@ print(json.dumps({"file_name": exported_program_path.name}))
             example_input_shapes=example_input_shapes,
             dynamic_inputs_present=dynamic_inputs_present,
             error=last_error_message or "torch.export.save did not produce an artifact.",
+            extra_fields=extra_fields,
         )
         if raise_on_failure:
             raise ModelIRPyTorchExportError(
@@ -20397,7 +20440,16 @@ def _canonicalize_generated_model_source_for_raw_export(
             return lrn_match is not None and str(lrn_match.group("input")) == name
         return False
 
-    def _has_nearby_channel_last_spatial_consumer(name: str, line_index: int) -> bool:
+    def _has_nearby_channel_last_spatial_consumer(
+        name: str,
+        line_index: int,
+        visited_names: Set[str] | None = None,
+    ) -> bool:
+        if visited_names is None:
+            visited_names = set()
+        if name in visited_names:
+            return False
+        visited_names.add(name)
         function_end = _function_end_index(line_index)
         slice_re = re.compile(
             rf"^\s*[A-Za-z0-9_]+ = {re.escape(name)}\[[^,\]]+, [^,\]]+, [^,\]]+, [^,\]]+\]$"
@@ -20416,6 +20468,17 @@ def _canonicalize_generated_model_source_for_raw_export(
                 alias_name = str(alias_match.group("lhs"))
                 if alias_name.startswith("_space_to_depth_x_") or alias_name.startswith("_depth_to_space_x_"):
                     return True
+            future_pool_match = apply_pool2d_re.match(lines[future_index])
+            if (
+                future_pool_match is not None
+                and str(future_pool_match.group("input")) == name
+                and _has_nearby_channel_last_spatial_consumer(
+                    str(future_pool_match.group("lhs")),
+                    future_index,
+                    visited_names,
+                )
+            ):
+                return True
         return False
 
     def _find_stage_boundary_cat_consumer(name: str, line_index: int) -> Optional[re.Match[str]]:
@@ -24763,6 +24826,58 @@ def _fast_precanonicalize_infer_consumer_layout(
     return None
 
 
+def _fast_precanonicalize_has_channel_last_spatial_consumer(
+    name: str,
+    start_index: int,
+    lines: Sequence[str],
+    context: _FastPrecanonicalizeRepairContext,
+    visited_names: Set[str] | None = None,
+) -> bool:
+    if visited_names is None:
+        visited_names = set()
+    if name in visited_names:
+        return False
+    visited_names.add(name)
+    resolved_name = _fast_precanonicalize_resolve_alias(str(name), context.aliases)
+    consumer_indexes = context.consumers.get(resolved_name, [])
+    direct_slice_re = re.compile(
+        rf"^\s*[A-Za-z0-9_]+ = {re.escape(name)}\[[^,\]]+, [^,\]]+, [^,\]]+, [^,\]]+\]$"
+    )
+    direct_alias_re = re.compile(
+        rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = {re.escape(name)}$"
+    )
+    apply_pool2d_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+    )
+    for consumer_index in consumer_indexes:
+        if consumer_index <= start_index:
+            continue
+        consumer_line = str(lines[consumer_index]).strip()
+        if consumer_line == "":
+            continue
+        if direct_slice_re.match(consumer_line) is not None:
+            return True
+        direct_alias_match = direct_alias_re.match(consumer_line)
+        if direct_alias_match is not None:
+            alias_name = str(direct_alias_match.group("lhs"))
+            if alias_name.startswith("_space_to_depth_x_") or alias_name.startswith("_depth_to_space_x_"):
+                return True
+        direct_pool_match = apply_pool2d_re.match(consumer_line)
+        if (
+            direct_pool_match is not None
+            and str(direct_pool_match.group("input")) == name
+            and _fast_precanonicalize_has_channel_last_spatial_consumer(
+                str(direct_pool_match.group("lhs")),
+                consumer_index,
+                lines,
+                context,
+                visited_names,
+            )
+        ):
+            return True
+    return False
+
+
 def _repair_split_axis_from_consumers(
     line: str,
     index: int,
@@ -24939,6 +25054,16 @@ def _repair_cf_pool_target_shape(
         dynamic_nhwc_like_names,
         context,
     )
+    if (
+        str(apply_pool2d_match.group("channel_last")) == "True"
+        and _fast_precanonicalize_has_channel_last_spatial_consumer(
+            lhs_name,
+            index,
+            lines,
+            context,
+        )
+    ):
+        return None, None
     should_repair = (
         str(apply_pool2d_match.group("channel_last")) == "False"
         or _fast_precanonicalize_is_cf_like(input_name, dynamic_cf_like_names, context)
@@ -24982,6 +25107,41 @@ def _repair_cf_pool_target_shape(
     if rewritten == line:
         return None, lhs_name
     return rewritten, lhs_name
+
+
+def _restore_channel_last_spatial_pool_chains(model_path: Path) -> None:
+    if not model_path.exists():
+        return
+    lines = model_path.read_text(encoding="utf-8").splitlines()
+    context = _build_fast_precanonicalize_repair_context(lines)
+    apply_pool2d_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+    )
+    changed = False
+    for index, line in enumerate(lines):
+        apply_pool2d_match = apply_pool2d_re.match(str(line))
+        if (
+            apply_pool2d_match is None
+            or str(apply_pool2d_match.group("channel_last")) != "False"
+            or str(apply_pool2d_match.group("is_max")) != "True"
+            or not _fast_precanonicalize_has_channel_last_spatial_consumer(
+                str(apply_pool2d_match.group("lhs")),
+                index,
+                lines,
+                context,
+            )
+        ):
+            continue
+        lines[index] = (
+            f"{apply_pool2d_match.group('indent')}{apply_pool2d_match.group('lhs')} = _apply_pool2d("
+            f"{apply_pool2d_match.group('input')}, {apply_pool2d_match.group('rest')}, "
+            f"target_shape=[{apply_pool2d_match.group('n')}, {apply_pool2d_match.group('h')}, "
+            f"{apply_pool2d_match.group('w')}, {apply_pool2d_match.group('c')}], "
+            f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=True)"
+        )
+        changed = True
+    if changed:
+        model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _repair_binary_alignment_layout(
@@ -25517,6 +25677,28 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 changed = True
         apply_pool2d_match = apply_pool2d_re.match(line)
         if apply_pool2d_match is not None:
+            if (
+                str(apply_pool2d_match.group("channel_last")) == "False"
+                and str(apply_pool2d_match.group("is_max")) == "True"
+                and _fast_precanonicalize_has_channel_last_spatial_consumer(
+                    str(apply_pool2d_match.group("lhs")),
+                    index,
+                    lines,
+                    repair_context,
+                )
+            ):
+                lines[index] = (
+                    f"{apply_pool2d_match.group('indent')}{apply_pool2d_match.group('lhs')} = _apply_pool2d("
+                    f"{apply_pool2d_match.group('input')}, {apply_pool2d_match.group('rest')}, "
+                    f"target_shape=[{apply_pool2d_match.group('n')}, {apply_pool2d_match.group('h')}, "
+                    f"{apply_pool2d_match.group('w')}, {apply_pool2d_match.group('c')}], "
+                    f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=True)"
+                )
+                nhwc_like_names.add(str(apply_pool2d_match.group("lhs")))
+                changed = True
+                line = lines[index]
+                apply_pool2d_match = apply_pool2d_re.match(line)
+        if apply_pool2d_match is not None:
             rewritten_pool_line, pool_lhs = _repair_cf_pool_target_shape(
                 line,
                 index,
@@ -25941,6 +26123,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     _apply_humanseg_fast_precanonicalize_repairs(model_path)
     _apply_alike_fast_precanonicalize_repairs(model_path)
     _apply_shadowformer_fast_precanonicalize_repairs(model_path)
+    _restore_channel_last_spatial_pool_chains(model_path)
 
 
 def _apply_fast_precanonicalize_repairs_until_stable(

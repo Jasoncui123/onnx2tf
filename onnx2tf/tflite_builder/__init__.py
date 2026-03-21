@@ -919,13 +919,17 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                     )
                 except NativePyTorchGenerationTimeoutError as ex:
                     pytorch_package_path = None
-                    warn(str(ex))
+                    _progress_write(
+                        message=f"PyTorch package generation skipped. {ex}",
+                        enabled=bool(flatbuffer_direct_show_progress),
+                    )
                 if pytorch_package_path is not None and output_torchscript_from_model_ir:
                     pytorch_torchscript_path = export_torchscript_from_generated_package(
                         package_dir=str(pytorch_package_path),
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
                         shape_hints=shape_hints,
                         test_data_nhwc_path=test_data_nhwc_path,
+                        native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
                         raise_on_failure=False,
                     )
                 if pytorch_package_path is not None and output_dynamo_onnx_from_model_ir:
@@ -934,6 +938,7 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
                         shape_hints=shape_hints,
                         test_data_nhwc_path=test_data_nhwc_path,
+                        native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
                         raise_on_failure=False,
                     )
                 if pytorch_package_path is not None and output_exported_program_from_model_ir:
@@ -942,6 +947,7 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
                         shape_hints=shape_hints,
                         test_data_nhwc_path=test_data_nhwc_path,
+                        native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
                         raise_on_failure=False,
                     )
             _advance_export_progress()

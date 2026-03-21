@@ -4559,6 +4559,7 @@ def convert(
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
                         shape_hints=shape_hints,
                         test_data_nhwc_path=test_data_nhwc_path,
+                        native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
                         raise_on_failure=False,
                     )
                 if pytorch_package_path is not None and flatbuffer_direct_output_dynamo_onnx:
@@ -4567,6 +4568,7 @@ def convert(
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
                         shape_hints=shape_hints,
                         test_data_nhwc_path=test_data_nhwc_path,
+                        native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
                         raise_on_failure=False,
                     )
                 if pytorch_package_path is not None and flatbuffer_direct_output_exported_program:
@@ -4575,6 +4577,7 @@ def convert(
                         custom_input_op_name_np_data_path=custom_input_op_name_np_data_path,
                         shape_hints=shape_hints,
                         test_data_nhwc_path=test_data_nhwc_path,
+                        native_package_generation_timeout_sec=native_pytorch_generation_timeout_sec,
                         raise_on_failure=False,
                     )
         except Exception as ex:

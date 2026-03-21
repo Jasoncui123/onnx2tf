@@ -85,6 +85,7 @@ def export_split_pytorch_packages(
                 custom_input_op_name_np_data_path=filtered_custom_inputs,
                 shape_hints=shape_hints,
                 test_data_nhwc_path=test_data_nhwc_path,
+                native_package_generation_timeout_sec=native_package_generation_timeout_sec,
                 raise_on_failure=False,
             )
             if torchscript_path is not None:
@@ -96,6 +97,7 @@ def export_split_pytorch_packages(
                 custom_input_op_name_np_data_path=filtered_custom_inputs,
                 shape_hints=shape_hints,
                 test_data_nhwc_path=test_data_nhwc_path,
+                native_package_generation_timeout_sec=native_package_generation_timeout_sec,
                 raise_on_failure=False,
             )
             if dynamo_onnx_path is not None:
@@ -107,6 +109,7 @@ def export_split_pytorch_packages(
                 custom_input_op_name_np_data_path=filtered_custom_inputs,
                 shape_hints=shape_hints,
                 test_data_nhwc_path=test_data_nhwc_path,
+                native_package_generation_timeout_sec=native_package_generation_timeout_sec,
                 raise_on_failure=False,
             )
             if exported_program_path is not None:

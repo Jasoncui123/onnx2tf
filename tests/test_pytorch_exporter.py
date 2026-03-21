@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import zipfile
@@ -4999,9 +5000,9 @@ def test_apply_fast_precanonicalize_repairs_keeps_shadowformer_pool_chain_channe
                 "import torch",
                 "class Model(torch.nn.Module):",
                 "    def forward(self, mask_public_layout_bridge):",
-                "        wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 80, 120, 1], is_max_pool=True, channel_last=True)",
-                "        wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=True)",
-                "        wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 20, 30, 1], is_max_pool=True, channel_last=True)",
+                "        wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 80, 120], is_max_pool=True, channel_last=True)",
+                "        wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 40, 60], is_max_pool=True, channel_last=True)",
+                "        wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 20, 30], is_max_pool=True, channel_last=True)",
                 "        waencoderlayer2_blocks1_slice28_out0 = wa_max_p1_out_nhwc[:1, 5:40, :60, :1]",
                 "        waencoderlayer2_blocks1_slice29_out0 = wa_max_p1_out_nhwc[:1, :5, :60, :1]",
                 "        _space_to_depth_x_12 = wa_max_p1_out_nhwc",
@@ -5022,8 +5023,9 @@ def test_apply_fast_precanonicalize_repairs_keeps_shadowformer_pool_chain_channe
     _apply_fast_precanonicalize_repairs(package_dir)
 
     repaired = model_path.read_text(encoding="utf-8")
-    assert "wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=True)" in repaired
-    assert "wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 20, 30, 1], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 80, 120], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 40, 60], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 20, 30], is_max_pool=True, channel_last=True)" in repaired
 
 
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_typed_buffer_alias(
@@ -17259,6 +17261,106 @@ def test_export_pytorch_package_from_model_ir_timeout_delegates_to_impl_when_fas
     assert package_path == str(output_dir)
 
 
+def test_generated_package_child_export_timeout_records_metadata_for_all_artifacts(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=_make_add_model_ir(),
+        output_folder_path=str(tmp_path / "child_export_timeout_pkg"),
+    )
+
+    def _fake_run(cmd, stdout=None, stderr=None, text=None, check=None, timeout=None):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+    monkeypatch.setattr(
+        "onnx2tf.tflite_builder.pytorch_exporter.subprocess.run",
+        _fake_run,
+    )
+
+    torchscript_path = export_torchscript_from_generated_package(
+        package_dir=package_path,
+        native_package_generation_timeout_sec=7,
+        raise_on_failure=False,
+    )
+    dynamo_onnx_path = export_dynamo_onnx_from_generated_package(
+        package_dir=package_path,
+        native_package_generation_timeout_sec=7,
+        raise_on_failure=False,
+    )
+    exported_program_path = export_exported_program_from_generated_package(
+        package_dir=package_path,
+        native_package_generation_timeout_sec=7,
+        raise_on_failure=False,
+    )
+
+    assert torchscript_path is None
+    assert dynamo_onnx_path is None
+    assert exported_program_path is None
+
+    metadata = json.loads((Path(package_path) / "metadata.json").read_text(encoding="utf-8"))
+    for key in ("torchscript", "dynamo_onnx", "exported_program"):
+        assert metadata[key]["file_name"] is None
+        assert metadata[key]["timed_out"] is True
+        assert metadata[key]["timeout_sec"] == 7
+        assert "timed out after 7s" in metadata[key]["error"]
+
+
+def test_convert_flatbuffer_direct_passes_native_timeout_to_child_exports(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    model_path = tmp_path / "add_timeout_passthrough.onnx"
+    onnx.save(_make_add_model(), str(model_path))
+    output_dir = tmp_path / "out_timeout_passthrough"
+    seen: list[tuple[str, int]] = []
+
+    def _fake_torchscript(*, native_package_generation_timeout_sec=0, **kwargs):
+        seen.append(("torchscript", int(native_package_generation_timeout_sec)))
+        return None
+
+    def _fake_dynamo(*, native_package_generation_timeout_sec=0, **kwargs):
+        seen.append(("dynamo_onnx", int(native_package_generation_timeout_sec)))
+        return None
+
+    def _fake_exported_program(*, native_package_generation_timeout_sec=0, **kwargs):
+        seen.append(("exported_program", int(native_package_generation_timeout_sec)))
+        return None
+
+    monkeypatch.setattr(
+        "onnx2tf.tflite_builder.pytorch_exporter.export_torchscript_from_generated_package",
+        _fake_torchscript,
+    )
+    monkeypatch.setattr(
+        "onnx2tf.tflite_builder.pytorch_exporter.export_dynamo_onnx_from_generated_package",
+        _fake_dynamo,
+    )
+    monkeypatch.setattr(
+        "onnx2tf.tflite_builder.pytorch_exporter.export_exported_program_from_generated_package",
+        _fake_exported_program,
+    )
+
+    onnx2tf.convert(
+        input_onnx_file_path=str(model_path),
+        output_folder_path=str(output_dir),
+        tflite_backend="flatbuffer_direct",
+        flatbuffer_direct_output_torchscript=True,
+        flatbuffer_direct_output_dynamo_onnx=True,
+        flatbuffer_direct_output_exported_program=True,
+        native_pytorch_generation_timeout_sec=11,
+        disable_model_save=True,
+        output_signaturedefs=False,
+        non_verbose=True,
+        verbosity="error",
+    )
+
+    assert seen == [
+        ("torchscript", 11),
+        ("dynamo_onnx", 11),
+        ("exported_program", 11),
+    ]
+
+
 def test_export_pytorch_package_nhwc_same_depthwise_conv_preserves_spatial_padding_axes(tmp_path) -> None:
     model_ir = _make_nhwc_same_depthwise_conv_model_ir()
     package_path = export_pytorch_package_from_model_ir(
@@ -19143,6 +19245,36 @@ def test_convert_input_tflite_outputs_pytorch_package(tmp_path) -> None:
     x = torch.tensor([[0.5, 1.5, 2.5]], dtype=torch.float32)
     y = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
     assert torch.allclose(model(x, y), x + y)
+
+
+def test_convert_flatbuffer_direct_pytorch_timeout_does_not_crash(tmp_path, monkeypatch) -> None:
+    model_path = tmp_path / "add_timeout.onnx"
+    onnx.save(_make_add_model(), str(model_path))
+    output_dir = tmp_path / "out_timeout"
+
+    def _fake_export_pytorch_package_from_model_ir(**kwargs):
+        raise NativePyTorchGenerationTimeoutError(
+            "Native PyTorch package generation timed out after 1s. Treating this as recursion explosion."
+        )
+
+    monkeypatch.setattr(
+        "onnx2tf.tflite_builder.pytorch_exporter.export_pytorch_package_from_model_ir",
+        _fake_export_pytorch_package_from_model_ir,
+    )
+
+    onnx2tf.convert(
+        input_onnx_file_path=str(model_path),
+        output_folder_path=str(output_dir),
+        tflite_backend="flatbuffer_direct",
+        flatbuffer_direct_output_pytorch=True,
+        native_pytorch_generation_timeout_sec=1,
+        disable_model_save=True,
+        output_signaturedefs=False,
+        non_verbose=True,
+        verbosity="error",
+    )
+
+    assert not (output_dir / "add_timeout_pytorch").exists()
 
 
 def test_convert_flatbuffer_direct_outputs_dynamo_onnx_and_autogenerates_package(tmp_path) -> None:
