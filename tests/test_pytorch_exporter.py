@@ -78,6 +78,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _should_prefer_tflite_backed_package,
     _target_shape_values_for_model_ir,
     _tensor_exact_static_shape_list_for_model_ir,
+    _temporarily_rewrite_generated_model_source_for_exported_program,
     _try_export_native_package_from_tflite_import,
     _write_native_model_file,
     export_dynamo_onnx_from_generated_package,
@@ -100,6 +101,19 @@ def _import_generated_package(package_path: str):
         if package_name in sys.modules:
             del sys.modules[package_name]
         return importlib.import_module(package_name)
+    finally:
+        if sys.path[0] == parent:
+            sys.path.pop(0)
+
+
+def _import_generated_runtime_module(package_path: str):
+    parent = str(Path(package_path).parent)
+    package_name = Path(package_path).name
+    sys.path.insert(0, parent)
+    try:
+        sys.modules.pop(f"{package_name}.runtime", None)
+        sys.modules.pop(package_name, None)
+        return importlib.import_module(f"{package_name}.runtime")
     finally:
         if sys.path[0] == parent:
             sys.path.pop(0)
@@ -914,6 +928,39 @@ def test_rewrite_generated_model_source_for_exported_program_keeps_cf_add_target
         in rewritten
     )
     assert "[1, 80, 32, 48]" not in rewritten
+
+
+def test_temporarily_rewrite_generated_model_source_for_exported_program_restores_original_source(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "exported_program_temporary_rewrite_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    original_source = "\n".join(
+        [
+            "import torch",
+            "class Model(torch.nn.Module):",
+            "    def forward(self, mask_public_layout_bridge):",
+            "        wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 80, 120], is_max_pool=True, channel_last=True)",
+            "        wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 40, 60], is_max_pool=True, channel_last=True)",
+            "        _space_to_depth_x_12 = wa_max_p1_out_nhwc",
+            "        _space_to_depth_n_12, _space_to_depth_h_12, _space_to_depth_w_12, _space_to_depth_c_12 = _space_to_depth_x_12.shape",
+            "        waencoderlayer2_blocks0_tr2_out0 = _space_to_depth_x_12.reshape(_space_to_depth_n_12, _space_to_depth_h_12 // 10, 10, _space_to_depth_w_12 // 10, 10, _space_to_depth_c_12).permute(0, 1, 3, 2, 4, 5).reshape(_space_to_depth_n_12, _space_to_depth_h_12 // 10, _space_to_depth_w_12 // 10, _space_to_depth_c_12 * 100)",
+            "        return waencoderlayer2_blocks0_tr2_out0",
+            "",
+        ]
+    )
+    model_path.write_text(original_source, encoding="utf-8")
+
+    with _temporarily_rewrite_generated_model_source_for_exported_program(
+        package_dir,
+        model_ir=None,
+    ):
+        rewritten = model_path.read_text(encoding="utf-8")
+        assert "target_shape=[1, 80, 120, 1]" in rewritten
+        assert "channel_last=True" in rewritten
+
+    assert model_path.read_text(encoding="utf-8") == original_source
 
 
 def test_canonicalize_generated_model_source_rewrites_cf_softmax_axis3_to_axis1_when_target_shape_is_cf(
@@ -5021,6 +5068,39 @@ def test_apply_fast_precanonicalize_repairs_keeps_shadowformer_pool_chain_channe
     )
 
     _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 80, 120], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 40, 60], is_max_pool=True, channel_last=True)" in repaired
+    assert "wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 20, 30], is_max_pool=True, channel_last=True)" in repaired
+
+
+def test_rewrite_generated_model_source_for_exported_program_repairs_channel_last_pool_targets(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_exported_program_pool_chain_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, mask_public_layout_bridge):",
+                "        wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 80, 120], is_max_pool=True, channel_last=True)",
+                "        wa_max_p1_out_nhwc = _apply_pool2d(wa_max_p_out, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 40, 60], is_max_pool=True, channel_last=True)",
+                "        wa_max_p2_out_nhwc = _apply_pool2d(wa_max_p1_out_nhwc, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 1, 20, 30], is_max_pool=True, channel_last=True)",
+                "        _space_to_depth_x_20 = wa_max_p2_out_nhwc",
+                "        _space_to_depth_n_20, _space_to_depth_h_20, _space_to_depth_w_20, _space_to_depth_c_20 = _space_to_depth_x_20.shape",
+                "        waconvblocks0_tr2_out0 = _space_to_depth_x_20.reshape(_space_to_depth_n_20, _space_to_depth_h_20 // 10, 10, _space_to_depth_w_20 // 10, 10, _space_to_depth_c_20).permute(0, 1, 3, 2, 4, 5).reshape(_space_to_depth_n_20, _space_to_depth_h_20 // 10, _space_to_depth_w_20 // 10, _space_to_depth_c_20 * 100)",
+                "        return waconvblocks0_tr2_out0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _rewrite_generated_model_source_for_exported_program(package_dir, model_ir=None)
 
     repaired = model_path.read_text(encoding="utf-8")
     assert "wa_max_p_out = _apply_pool2d(mask_public_layout_bridge, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 80, 120, 1], is_max_pool=True, channel_last=True)" in repaired
@@ -11819,6 +11899,85 @@ def _make_boundary_wrapped_conv_add_conv_model_ir() -> ModelIR:
     return model_ir
 
 
+def _make_conv_nhwc_flatten_rank3_model_ir() -> ModelIR:
+    model_ir = ModelIR(name="conv_nhwc_flatten_rank3")
+    model_ir.inputs = ["input_cf"]
+    model_ir.outputs = ["y"]
+    model_ir.metadata["onnx_boundary_shape_signature_map"] = {
+        "input_cf": [1, 64, 80, 120],
+        "y": [1, 2400, 128],
+    }
+    model_ir.tensors["input_cf"] = TensorIR(
+        name="input_cf",
+        dtype="FLOAT32",
+        shape=[1, 64, 80, 120],
+        shape_signature=[1, 64, 80, 120],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["w"] = TensorIR(
+        name="w",
+        dtype="FLOAT32",
+        shape=[128, 64, 4, 4],
+        shape_signature=[128, 64, 4, 4],
+        data=(
+            np.arange(128 * 64 * 4 * 4, dtype=np.float32).reshape(128, 64, 4, 4)
+            * np.float32(0.0001)
+        ),
+    )
+    model_ir.tensors["b"] = TensorIR(
+        name="b",
+        dtype="FLOAT32",
+        shape=[128],
+        shape_signature=[128],
+        data=np.linspace(-0.1, 0.1, 128, dtype=np.float32),
+    )
+    model_ir.tensors["reshape_shape"] = TensorIR(
+        name="reshape_shape",
+        dtype="INT32",
+        shape=[3],
+        shape_signature=[3],
+        data=np.asarray([1, 2400, 128], dtype=np.int32),
+    )
+    model_ir.tensors["conv_out_nhwc"] = TensorIR(
+        name="conv_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 40, 60, 128],
+        shape_signature=[1, 40, 60, 128],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["y"] = TensorIR(
+        name="y",
+        dtype="FLOAT32",
+        shape=[1, 2400, 128],
+        shape_signature=[1, 2400, 128],
+        logical_layout="NWC",
+    )
+    model_ir.operators.extend(
+        [
+            OperatorIR(
+                op_type="CONV_2D",
+                inputs=["input_cf", "w", "b"],
+                outputs=["conv_out_nhwc"],
+                options={
+                    "strideH": 2,
+                    "strideW": 2,
+                    "dilationHFactor": 1,
+                    "dilationWFactor": 1,
+                    "padding": "SAME",
+                    "fusedActivationFunction": "NONE",
+                },
+            ),
+            OperatorIR(
+                op_type="RESHAPE",
+                inputs=["conv_out_nhwc", "reshape_shape"],
+                outputs=["y"],
+                options={"newShape": [1, 2400, 128], "onnxRawNewShape": [1, 2400, 128], "allowZero": False},
+            ),
+        ]
+    )
+    return model_ir
+
+
 def _make_boundary_wrapped_conv_dual_pool_concat_conv_model_ir() -> ModelIR:
     model_ir = ModelIR(name="boundary_wrapped_conv_dual_pool_concat_conv")
     model_ir.inputs = ["x"]
@@ -13417,6 +13576,24 @@ def test_export_pytorch_package_runs_residual_add_island_on_channel_first_aliase
     assert re.search(r"\w+_cf = torch\.add\(\w+_cf, \w+_cf\)", model_source) is not None
     assert re.search(r"self\.conv_block_2\(\w+_cf\)", model_source) is not None
     assert "torch.add(conv1_nhwc, conv0_nhwc)" not in model_source
+
+
+def test_export_pytorch_package_materializes_nhwc_conv_output_before_rank3_reshape(tmp_path) -> None:
+    model_ir = _make_conv_nhwc_flatten_rank3_model_ir()
+    normalized = prepare_model_ir_for_native_pytorch(model_ir)
+    package_path = str(tmp_path / "conv_nhwc_flatten_rank3_pytorch")
+    metadata = _build_metadata_payload(normalized)
+    metadata["execution_backend"] = "native"
+    tensor_storage_name_map = _make_tensor_storage_name_map(normalized)
+    _write_native_model_file(
+        package_path,
+        model_ir=normalized,
+        metadata=metadata,
+        tensor_storage_name_map=tensor_storage_name_map,
+    )
+    model_source = (Path(package_path) / "model.py").read_text(encoding="utf-8")
+    assert "x = x_cf.permute(0, 2, 3, 1).contiguous()" in model_source
+    assert "x = x_cf\n" not in model_source
 
 
 def test_build_tensor_var_name_map_shortens_long_tensor_names_deterministically() -> None:
@@ -20117,6 +20294,33 @@ def test_align_tensor_to_target_shape_narrows_oversized_static_dims() -> None:
     out = _align_tensor_to_target_shape(value, [1, 1, 40, 512])
     assert tuple(out.shape) == (1, 1, 40, 512)
     assert torch.equal(out, value[:, :, :40, :])
+
+
+def test_generated_runtime_apply_pool2d_normalizes_channel_last_target_shape(tmp_path) -> None:
+    package_path = export_pytorch_package_from_model_ir(
+        model_ir=_make_add_model_ir(),
+        output_folder_path=str(tmp_path / "pool_target_runtime_pkg"),
+    )
+    runtime_module = _import_generated_runtime_module(package_path)
+    value = torch.arange(1 * 160 * 240, dtype=torch.float32).reshape(1, 160, 240, 1)
+    out = runtime_module._apply_pool2d(
+        value,
+        filter_height=2,
+        filter_width=2,
+        stride_h=2,
+        stride_w=2,
+        padding="VALID",
+        target_shape=[1, 1, 80, 120],
+        is_max_pool=True,
+        channel_last=True,
+    )
+    expected = F.max_pool2d(
+        value.permute(0, 3, 1, 2).contiguous(),
+        kernel_size=(2, 2),
+        stride=(2, 2),
+    ).permute(0, 2, 3, 1).contiguous()
+    assert tuple(out.shape) == (1, 80, 120, 1)
+    assert torch.equal(out, expected)
 
 
 def test_export_artifacts_unroll_static_while_sigmoid_chain(tmp_path) -> None:

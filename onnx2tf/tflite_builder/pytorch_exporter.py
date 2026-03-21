@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -5064,6 +5065,12 @@ def _emit_native_direct_module_op_for_codegen(
         output_layout = normalize_logical_layout(
             output_tensor.logical_layout if output_tensor is not None else LOGICAL_LAYOUT_UNKNOWN
         )
+        needs_materialized_output_bridge = (
+            output_tensor is not None
+            and len(list(output_tensor.shape)) in {3, 4, 5}
+            and output_layout != LOGICAL_LAYOUT_UNKNOWN
+            and output_layout != raw_output_layout
+        )
         use_channel_first_alias = (
             output_tensor is not None
             and len(list(output_tensor.shape)) in {3, 4, 5}
@@ -5071,7 +5078,7 @@ def _emit_native_direct_module_op_for_codegen(
         )
         raw_output_var = (
             derived_local_var_name_fn(f"{output_vars[0]}_cf", "t")
-            if use_channel_first_alias
+            if use_channel_first_alias or needs_materialized_output_bridge
             else output_vars[0]
         )
         conv_input_tensor = model_ir.tensors.get(conv_input_name, None)
@@ -5144,8 +5151,9 @@ def _emit_native_direct_module_op_for_codegen(
         conv_pad_arg = conv_module_pad_specs.get(int(op_index), None)
         if conv_pad_arg is not None:
             conv_input_expr = f"F.pad({conv_input_expr}, {repr(conv_pad_arg)}, mode='constant', value=0.0)"
-        if can_emit_direct_module_call_fn(op):
-            if use_channel_first_alias:
+        used_direct_module_call = can_emit_direct_module_call_fn(op)
+        if used_direct_module_call:
+            if use_channel_first_alias or needs_materialized_output_bridge:
                 channel_first_tensor_expr_aliases[output_name] = raw_output_var
             else:
                 channel_first_tensor_expr_aliases.pop(output_name, None)
@@ -5181,6 +5189,12 @@ def _emit_native_direct_module_op_for_codegen(
                         f"{target_shape_literal_fn(output_name)})"
                     )
                 forward_lines.append(f"{output_vars[0]} = {public_output_expr}")
+        elif used_direct_module_call and raw_output_var != output_vars[0]:
+            if fused != "NONE":
+                forward_lines[-1] = forward_lines[-1].replace(f"{output_vars[0]} =", f"{raw_output_var} =", 1)
+            forward_lines.append(
+                f"{output_vars[0]} = {emit_module_output_expr_fn(output_name=output_name, expr=raw_output_var, raw_output_layout=raw_output_layout)}"
+            )
         return True
     if op_type == "TRANSPOSE_CONV":
         runtime_imports.add("_apply_module_transpose_conv2d")
@@ -5212,12 +5226,45 @@ def _emit_native_direct_module_op_for_codegen(
         forward_lines.extend(activation_lines_fn(output_vars[0], fused))
         return True
     if op_type == "CONV_3D":
-        if can_emit_direct_module_call_fn(op):
-            forward_lines.append(f"{output_vars[0]} = self.{attr_name}({tensor_expr_fn(str(op.inputs[0]))})")
+        output_name = str(outputs[0])
+        output_tensor = model_ir.tensors.get(output_name, None)
+        output_layout = normalize_logical_layout(
+            output_tensor.logical_layout if output_tensor is not None else LOGICAL_LAYOUT_UNKNOWN
+        )
+        raw_output_layout = (
+            channel_first_logical_layout(len(list(output_tensor.shape)))
+            if output_tensor is not None
+            else LOGICAL_LAYOUT_UNKNOWN
+        )
+        needs_materialized_output_bridge = (
+            output_tensor is not None
+            and len(list(output_tensor.shape)) in {3, 4, 5}
+            and output_layout != LOGICAL_LAYOUT_UNKNOWN
+            and output_layout != raw_output_layout
+        )
+        raw_output_var = (
+            derived_local_var_name_fn(f"{output_vars[0]}_cf", "t")
+            if needs_materialized_output_bridge
+            else output_vars[0]
+        )
+        used_direct_module_call = can_emit_direct_module_call_fn(op)
+        if used_direct_module_call:
+            if needs_materialized_output_bridge:
+                channel_first_tensor_expr_aliases[output_name] = raw_output_var
+            else:
+                channel_first_tensor_expr_aliases.pop(output_name, None)
+            forward_lines.append(f"{raw_output_var} = self.{attr_name}({tensor_expr_fn(str(op.inputs[0]))})")
         else:
             runtime_imports.add("_apply_module_conv3d")
             forward_lines.append(
                 f"{output_vars[0]} = _apply_module_conv3d(self.{attr_name}, {tensor_expr_fn(str(op.inputs[0]))}, target_shape={output_target_shape}, target_logical_layout={repr(normalize_logical_layout(model_ir.tensors[outputs[0]].logical_layout))}, fused='NONE')"
+            )
+            channel_first_tensor_expr_aliases.pop(output_name, None)
+        if used_direct_module_call and raw_output_var != output_vars[0]:
+            if fused != "NONE":
+                forward_lines[-1] = forward_lines[-1].replace(f"{output_vars[0]} =", f"{raw_output_var} =", 1)
+            forward_lines.append(
+                f"{output_vars[0]} = {emit_module_output_expr_fn(output_name=output_name, expr=raw_output_var, raw_output_layout=raw_output_layout)}"
             )
         forward_lines.extend(activation_lines_fn(output_vars[0], fused))
         return True
@@ -9178,6 +9225,18 @@ def _is_channel_last_factorized_rank3_sequence_reshape(
     input_layout = normalize_logical_layout(input_tensor.logical_layout)
     if not is_channel_last_logical_layout(input_layout):
         return False
+    return _is_channel_last_factorized_rank3_sequence_reshape_by_shape(
+        input_tensor=input_tensor,
+        output_tensor=output_tensor,
+    )
+
+
+def _is_channel_last_factorized_rank3_sequence_reshape_by_shape(
+    input_tensor: Optional[TensorIR],
+    output_tensor: Optional[TensorIR],
+) -> bool:
+    if input_tensor is None or output_tensor is None:
+        return False
     input_shape = [int(v) for v in list(input_tensor.shape)]
     output_shape = [int(v) for v in list(output_tensor.shape)]
     if len(input_shape) not in {4, 5} or len(output_shape) != 3:
@@ -9194,6 +9253,28 @@ def _is_channel_last_factorized_rank3_sequence_reshape(
     factor = int(input_channels // output_features)
     expected_sequence_extent = int(spatial_extent * factor)
     return int(output_shape[1]) == expected_sequence_extent
+
+
+def _has_channel_last_factorized_rank3_sequence_consumer(
+    *,
+    model_ir: ModelIR,
+    consumers: Dict[str, List[int]],
+    tensor_name: str,
+) -> bool:
+    input_tensor = model_ir.tensors.get(str(tensor_name), None)
+    if input_tensor is None:
+        return False
+    for consumer_idx in consumers.get(str(tensor_name), []):
+        consumer = model_ir.operators[int(consumer_idx)]
+        if str(consumer.op_type) != "RESHAPE" or len(consumer.outputs) != 1:
+            continue
+        output_tensor = model_ir.tensors.get(str(consumer.outputs[0]), None)
+        if _is_channel_last_factorized_rank3_sequence_reshape_by_shape(
+            input_tensor=input_tensor,
+            output_tensor=output_tensor,
+        ):
+            return True
+    return False
 
 
 def _propagate_pytorch_friendly_layouts(model_ir: ModelIR) -> None:
@@ -9756,6 +9837,19 @@ def _apply_feature_last_sequence_layouts(
             continue
         op_type = str(op.op_type)
         input_tensor = model_ir.tensors.get(str(op.inputs[0]), None) if len(op.inputs) >= 1 else None
+        if (
+            rank in {4, 5}
+            and _has_channel_last_factorized_rank3_sequence_consumer(
+                model_ir=model_ir,
+                consumers=consumers,
+                tensor_name=output_name,
+            )
+        ):
+            target_layout = channel_last_logical_layout(rank)
+            if normalize_logical_layout(output_tensor.logical_layout) != target_layout:
+                output_tensor.logical_layout = target_layout
+                any_changed = True
+            continue
         if op_type == "TRANSPOSE":
             perm = _read_transpose_perm(model_ir, op)
             if output_name in preserve_channel_last_tensor_names and rank == 3 and perm == [1, 0, 2]:
@@ -15744,8 +15838,6 @@ def export_dynamo_onnx_from_generated_package(
             },
         )
         return None
-    _rewrite_generated_model_source_for_exported_program(package_path, model_ir=None)
-    _apply_fast_precanonicalize_repairs_until_stable(package_path)
     try:
         example_inputs, example_input_shapes, dynamic_inputs_present = _build_pytorch_export_example_inputs(
             package_dir=package_dir,
@@ -15833,18 +15925,22 @@ with torch.no_grad():
     )
 print(json.dumps({"file_name": dynamo_onnx_path.name}))
     """
-    child_payload, last_error_message = _run_generated_package_export_child(
-        example_inputs=example_inputs,
-        child_script=child_script,
-        package_path=package_path,
-        artifact_path=dynamo_onnx_path,
-        child_payload={
-            "input_names": [str(v) for v in list(metadata.get("inputs", []))],
-            "output_names": [str(v) for v in list(metadata.get("outputs", []))],
-        },
-        temp_prefix="onnx2tf_dynamo_onnx_",
-        timeout_sec=timeout_sec,
-    )
+    with _temporarily_rewrite_generated_model_source_for_exported_program(
+        package_path,
+        model_ir=None,
+    ):
+        child_payload, last_error_message = _run_generated_package_export_child(
+            example_inputs=example_inputs,
+            child_script=child_script,
+            package_path=package_path,
+            artifact_path=dynamo_onnx_path,
+            child_payload={
+                "input_names": [str(v) for v in list(metadata.get("inputs", []))],
+                "output_names": [str(v) for v in list(metadata.get("outputs", []))],
+            },
+            temp_prefix="onnx2tf_dynamo_onnx_",
+            timeout_sec=timeout_sec,
+        )
     if child_payload is None or not dynamo_onnx_path.exists():
         _remove_generated_package_artifact_if_exists(dynamo_onnx_path)
         extra_fields = None
@@ -15947,8 +16043,6 @@ def export_exported_program_from_generated_package(
             },
         )
         return None
-    _rewrite_generated_model_source_for_exported_program(package_path, model_ir=None)
-    _apply_fast_precanonicalize_repairs_until_stable(package_path)
     try:
         example_inputs, example_input_shapes, dynamic_inputs_present = _build_pytorch_export_example_inputs(
             package_dir=package_dir,
@@ -17791,15 +17885,19 @@ with torch.no_grad():
 torch.export.save(exported, str(exported_program_path))
 print(json.dumps({"file_name": exported_program_path.name}))
 """
-    child_payload, last_error_message = _run_generated_package_export_child(
-        example_inputs=example_inputs,
-        child_script=child_script,
-        package_path=package_path,
-        artifact_path=exported_program_path,
-        child_payload={},
-        temp_prefix="onnx2tf_exported_program_",
-        timeout_sec=timeout_sec,
-    )
+    with _temporarily_rewrite_generated_model_source_for_exported_program(
+        package_path,
+        model_ir=None,
+    ):
+        child_payload, last_error_message = _run_generated_package_export_child(
+            example_inputs=example_inputs,
+            child_script=child_script,
+            package_path=package_path,
+            artifact_path=exported_program_path,
+            child_payload={},
+            temp_prefix="onnx2tf_exported_program_",
+            timeout_sec=timeout_sec,
+        )
     if child_payload is None or not exported_program_path.exists():
         _remove_generated_package_artifact_if_exists(exported_program_path)
         extra_fields = None
@@ -21138,6 +21236,10 @@ def _canonicalize_generated_model_source_for_raw_export(
                 )
                 for lookahead in range(index + 1, min(index + 5, len(lines)))
             )
+            future_reshape_consumer = any(
+                re.search(rf"\btorch\.reshape\({re.escape(alias)}, ", lines[lookahead]) is not None
+                for lookahead in range(index + 1, min(index + 5, len(lines)))
+            )
             if (
                 alias_tensor is not None
                 and source_tensor is not None
@@ -21146,6 +21248,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and list(alias_tensor.shape) == [n, h, w, c]
                 and not source.endswith("_cf")
                 and not future_pool_consumer
+                and not future_reshape_consumer
             ):
                 indent = str(cf_nhwc_materialize_match.group("indent"))
                 lines[index] = f"{indent}{alias} = {source}"
@@ -21181,10 +21284,18 @@ def _canonicalize_generated_model_source_for_raw_export(
             lhs = str(generic_alias_match.group("lhs"))
             rhs = str(generic_alias_match.group("rhs"))
             next_reshape_match = None
+            next_rank3_reshape_match = None
             for lookahead_index in range(index + 1, min(index + 5, len(lines))):
                 candidate_reshape_match = rank4_reshape_consumer_re.match(lines[lookahead_index])
                 if candidate_reshape_match is not None and str(candidate_reshape_match.group("input")) == lhs:
                     next_reshape_match = candidate_reshape_match
+                    break
+                candidate_rank3_reshape_match = rank3_reshape_from_rank4_source_re.match(lines[lookahead_index])
+                if (
+                    candidate_rank3_reshape_match is not None
+                    and str(candidate_rank3_reshape_match.group("src")) == lhs
+                ):
+                    next_rank3_reshape_match = candidate_rank3_reshape_match
                     break
             lhs_exact_shape = _model_ir_exact_shape(lhs)
             rhs_exact_shape = _model_ir_exact_shape(rhs)
@@ -21247,6 +21358,61 @@ def _canonicalize_generated_model_source_for_raw_export(
                 cf_materialized_alias_sources.pop(lhs, None)
                 generic_alias_sources.pop(lhs, None)
                 line = lines[index]
+            elif (
+                "_nhwc" in lhs
+                and _is_known_cf_name(rhs, set())
+                and next_rank3_reshape_match is not None
+                and str(next_rank3_reshape_match.group("src")) == lhs
+            ):
+                indent = str(generic_alias_match.group("indent"))
+                if nhwc_target_shape is not None and len(nhwc_target_shape) == 4:
+                    lines[index] = (
+                        f"{indent}{lhs} = _align_tensor_to_target_shape("
+                        f"{rhs}.permute(0, 2, 3, 1).contiguous(), {nhwc_target_shape})"
+                    )
+                else:
+                    lines[index] = f"{indent}{lhs} = {rhs}.permute(0, 2, 3, 1).contiguous()"
+                changed = True
+                cf_materialized_alias_sources.pop(lhs, None)
+                generic_alias_sources.pop(lhs, None)
+                line = lines[index]
+            elif (
+                next_rank3_reshape_match is not None
+                and _is_known_cf_name(rhs, set())
+                and rhs_exact_shape is not None
+                and len(rhs_exact_shape) == 4
+            ):
+                rank3_target_shape_text = (
+                    next_rank3_reshape_match.group("resolved_shape")
+                    or next_rank3_reshape_match.group("shape")
+                )
+                rank3_target_shape = (
+                    [
+                        int(value.strip())
+                        for value in str(rank3_target_shape_text).split(",")
+                        if value.strip()
+                    ]
+                    if rank3_target_shape_text is not None
+                    else []
+                )
+                if (
+                    nhwc_target_shape is not None
+                    and len(nhwc_target_shape) == 4
+                    and len(rank3_target_shape) == 3
+                    and int(rank3_target_shape[0]) == int(nhwc_target_shape[0])
+                    and int(rank3_target_shape[2]) == int(nhwc_target_shape[3])
+                    and int(rank3_target_shape[1])
+                    == int(np.prod(nhwc_target_shape[1:3], dtype=np.int64))
+                ):
+                    indent = str(generic_alias_match.group("indent"))
+                    lines[index] = (
+                        f"{indent}{lhs} = _align_tensor_to_target_shape("
+                        f"{rhs}.permute(0, 2, 3, 1).contiguous(), {nhwc_target_shape})"
+                    )
+                    changed = True
+                    cf_materialized_alias_sources.pop(lhs, None)
+                    generic_alias_sources.pop(lhs, None)
+                    line = lines[index]
             else:
                 generic_alias_sources[lhs] = rhs
                 if _is_known_cf_name(rhs, set()):
@@ -23544,6 +23710,10 @@ def _canonicalize_generated_model_source_for_raw_export(
                     if re.search(rf"\b{re.escape(alias)}\b", future_line) is None:
                         continue
                     future_use_count += 1
+                    if re.search(rf"\btorch\.reshape\({re.escape(alias)}, ", future_line) is not None:
+                        alias_consumed_by_rank3_reshape = True
+                        future_uses_are_safe = False
+                        break
                     rank3_match = rank3_reshape_from_rank4_source_re.match(future_line)
                     if rank3_match is not None and str(rank3_match.group("src")) == alias:
                         alias_consumed_by_rank3_reshape = True
@@ -24471,6 +24641,55 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"[1, {channel_count}, 1, 1])"
         )
         changed = True
+    for index in range(len(lines) - 1):
+        generic_alias_match = generic_alias_re.match(lines[index])
+        rank3_reshape_match = rank3_reshape_from_rank4_source_re.match(lines[index + 1])
+        if (
+            generic_alias_match is None
+            or rank3_reshape_match is None
+            or str(rank3_reshape_match.group("src")) != str(generic_alias_match.group("lhs"))
+        ):
+            continue
+        lhs = str(generic_alias_match.group("lhs"))
+        rhs = str(generic_alias_match.group("rhs"))
+        if "_nhwc" not in lhs or not _is_known_cf_name(rhs, singleton_cf_vars):
+            continue
+        lhs_exact_shape = _model_ir_exact_shape(lhs)
+        rhs_exact_shape = _model_ir_exact_shape(rhs)
+        nhwc_target_shape = lhs_exact_shape
+        if nhwc_target_shape is None and rhs_exact_shape is not None and len(rhs_exact_shape) == 4:
+            nhwc_target_shape = [
+                int(rhs_exact_shape[0]),
+                int(rhs_exact_shape[2]),
+                int(rhs_exact_shape[3]),
+                int(rhs_exact_shape[1]),
+            ]
+        if nhwc_target_shape is None or len(nhwc_target_shape) != 4:
+            continue
+        rank3_target_shape_text = (
+            rank3_reshape_match.group("resolved_shape")
+            or rank3_reshape_match.group("shape")
+        )
+        if rank3_target_shape_text is None:
+            continue
+        rank3_target_shape = [
+            int(value.strip())
+            for value in str(rank3_target_shape_text).split(",")
+            if value.strip()
+        ]
+        if (
+            len(rank3_target_shape) != 3
+            or int(rank3_target_shape[0]) != int(nhwc_target_shape[0])
+            or int(rank3_target_shape[2]) != int(nhwc_target_shape[3])
+            or int(rank3_target_shape[1]) != int(np.prod(nhwc_target_shape[1:3], dtype=np.int64))
+        ):
+            continue
+        indent = str(generic_alias_match.group("indent"))
+        lines[index] = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape("
+            f"{rhs}.permute(0, 2, 3, 1).contiguous(), {nhwc_target_shape})"
+        )
+        changed = True
     finalized_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
     if finalized_lines != lines:
         lines = finalized_lines
@@ -25222,23 +25441,7 @@ def _repair_cf_pool_target_shape(
         int(apply_pool2d_match.group("c")),
     ]
     if str(apply_pool2d_match.group("channel_last")) == "True":
-        if _fast_precanonicalize_rank4_layout_hint(
-            current_shape,
-            preferred_channel_count=preferred_channel_count,
-        ) == "nhwc":
-            return None, None
-        normalized_shape = _normalize_nhwc_rank4_shape(
-            current_shape,
-            preferred_channel_count=preferred_channel_count,
-        )
-        rewritten = (
-            f"{apply_pool2d_match.group('indent')}{lhs_name} = _apply_pool2d("
-            f"{input_name}, {apply_pool2d_match.group('rest')}, target_shape={repr(normalized_shape)}, "
-            f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=True)"
-        )
-        if rewritten == line:
-            return None, None
-        return rewritten, lhs_name
+        return None, None
     should_repair = (
         str(apply_pool2d_match.group("channel_last")) == "False"
         or _fast_precanonicalize_is_cf_like(input_name, dynamic_cf_like_names, context)
@@ -25488,6 +25691,10 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     simple_alias_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)$"
     )
+    rank3_reshape_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
+    )
     simple_binary_expr_re = re.compile(
         r"^torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)$"
     )
@@ -25562,6 +25769,72 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     )
     for index, line in enumerate(lines[:-1]):
         simple_alias_match = simple_alias_re.match(line)
+        if simple_alias_match is not None:
+            next_rank3_reshape_match = (
+                rank3_reshape_re.match(lines[index + 1])
+                if index + 1 < len(lines)
+                else None
+            )
+            reshape_target_dims: List[int] = []
+            reshape_target_text = ""
+            reshape_feature_dim: int | None = None
+            rhs_name = str(simple_alias_match.group("rhs"))
+            rhs_producer_module = module_output_producers.get(rhs_name, None)
+            rhs_producer_channels = (
+                conv_block_out_channels.get(rhs_producer_module, None)
+                if rhs_producer_module is not None
+                else None
+            )
+            if next_rank3_reshape_match is not None:
+                reshape_target_text = str(
+                    next_rank3_reshape_match.group("resolved_shape")
+                    or next_rank3_reshape_match.group("shape")
+                    or ""
+                )
+                try:
+                    reshape_target_dims = [
+                        int(token.strip())
+                        for token in reshape_target_text.split(",")
+                        if token.strip() != ""
+                    ]
+                except Exception:
+                    reshape_target_dims = []
+                if len(reshape_target_dims) == 3 and all(
+                    int(dim) > 0 for dim in reshape_target_dims
+                ):
+                    reshape_feature_dim = int(reshape_target_dims[-1])
+            if (
+                next_rank3_reshape_match is not None
+                and str(next_rank3_reshape_match.group("input")) == str(simple_alias_match.group("lhs"))
+                and (
+                    rhs_name in cf_like_names
+                    or rhs_name.endswith("_cf")
+                    or rhs_name.endswith("_out_cf")
+                )
+                and (
+                    "_nhwc" in str(simple_alias_match.group("lhs"))
+                    or (
+                        rhs_producer_channels is not None
+                        and reshape_feature_dim is not None
+                        and int(rhs_producer_channels) == int(reshape_feature_dim)
+                        and not str(simple_alias_match.group("lhs")).endswith("_cf")
+                    )
+                    or (
+                        reshape_feature_dim is not None
+                        and len(reshape_target_dims) == 3
+                        and int(reshape_target_dims[1]) > int(reshape_target_dims[2])
+                        and not str(simple_alias_match.group("lhs")).endswith("_cf")
+                    )
+                )
+            ):
+                lines[index] = (
+                    f"{simple_alias_match.group('indent')}{simple_alias_match.group('lhs')} = "
+                    f"{simple_alias_match.group('rhs')}.permute(0, 2, 3, 1).contiguous()"
+                )
+                nhwc_like_names.add(str(simple_alias_match.group("lhs")))
+                changed = True
+                line = lines[index]
+                simple_alias_match = None
         if simple_alias_match is not None:
             rhs_name = str(simple_alias_match.group("rhs"))
             if (
@@ -28401,12 +28674,75 @@ def _rewrite_generated_model_source_for_exported_program(
     model_path = package_path / "model.py"
     if not model_path.exists():
         return
-    lines = model_path.read_text(encoding="utf-8").splitlines()
-    rewritten_lines = _repair_exported_program_direct_conv_cf_add_targets(lines)
+    original_lines = model_path.read_text(encoding="utf-8").splitlines()
+    rewritten_lines = _repair_exported_program_channel_last_pool_targets(original_lines)
+    rewritten_lines = _repair_exported_program_direct_conv_cf_add_targets(rewritten_lines)
     rewritten_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(rewritten_lines)
     rewritten_lines = _repair_channel_last_gap_conv_inputs(rewritten_lines)
-    if rewritten_lines != lines:
+    if rewritten_lines != original_lines:
         model_path.write_text("\n".join(rewritten_lines) + "\n", encoding="utf-8")
+
+
+@contextlib.contextmanager
+def _temporarily_rewrite_generated_model_source_for_exported_program(
+    package_path: Path,
+    model_ir: ModelIR | None = None,
+):
+    model_path = package_path / "model.py"
+    if not model_path.exists():
+        yield
+        return
+    original_source = model_path.read_text(encoding="utf-8")
+    try:
+        _rewrite_generated_model_source_for_exported_program(
+            package_path,
+            model_ir=model_ir,
+        )
+        _apply_fast_precanonicalize_repairs_until_stable(package_path)
+        yield
+    finally:
+        current_source = model_path.read_text(encoding="utf-8")
+        if current_source != original_source:
+            model_path.write_text(original_source, encoding="utf-8")
+
+
+def _repair_exported_program_channel_last_pool_targets(lines: List[str]) -> List[str]:
+    rewritten = list(lines)
+    repair_context = _build_fast_precanonicalize_repair_context(rewritten)
+    apply_pool2d_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+    )
+    for index, line in enumerate(rewritten):
+        apply_pool2d_match = apply_pool2d_re.match(line)
+        if apply_pool2d_match is None:
+            continue
+        lhs_name = str(apply_pool2d_match.group("lhs"))
+        if not _fast_precanonicalize_has_channel_last_spatial_consumer(
+            lhs_name,
+            index,
+            rewritten,
+            repair_context,
+        ):
+            continue
+        current_shape = [
+            int(apply_pool2d_match.group("n")),
+            int(apply_pool2d_match.group("h")),
+            int(apply_pool2d_match.group("w")),
+            int(apply_pool2d_match.group("c")),
+        ]
+        if (
+            str(apply_pool2d_match.group("channel_last")) == "True"
+            and _fast_precanonicalize_rank4_layout_hint(current_shape) == "nhwc"
+        ):
+            continue
+        normalized_shape = _normalize_nhwc_rank4_shape(current_shape)
+        rewritten[index] = (
+            f"{apply_pool2d_match.group('indent')}{lhs_name} = _apply_pool2d("
+            f"{apply_pool2d_match.group('input')}, {apply_pool2d_match.group('rest')}, "
+            f"target_shape={repr(normalized_shape)}, "
+            f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=True)"
+        )
+    return rewritten
 
 
 def _repair_exported_program_direct_conv_cf_add_targets(lines: List[str]) -> List[str]:
