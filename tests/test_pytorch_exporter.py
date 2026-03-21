@@ -3712,6 +3712,37 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_sig
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_signature_with_chained_buffer_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_semantic_chained_buffer_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def forward(self, pooled_cf, enc_attn, dec_attn):",
+                "        mask_alias0: torch.Tensor = self.mask_buf_a",
+                "        mask_alias1 = mask_alias0",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(pooled_cf, mask_alias1, [12, 48, 64, 6])",
+                "        pooled_out = _apply_pool2d(pooled_cf, channel_last=False, is_max_pool=True, target_shape=[1, 40, 60, 1], padding='VALID', stride_w=2, stride_h=2, filter_width=2, filter_height=2)",
+                "        encoder_softmax = _apply_softmax(enc_attn, target_shape=[12, 6, 48, 64], axis=-1, beta=1.0)",
+                "        decoder_softmax = _apply_softmax(dec_attn, beta=1.0, axis=3, target_shape=(12, 6, 48, 64))",
+                "        return _binary_lhs_1, _binary_rhs_1, pooled_out, encoder_softmax, decoder_softmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_signature_with_parenthesized_typed_buffer_alias(
     tmp_path,
 ) -> None:
@@ -3918,6 +3949,72 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_with_parenth
                 "        encoder_softmax = _apply_softmax(enc_attn, axis=3, beta=1.0, target_shape=[24, 6, 48, 64])",
                 "        decoder_softmax = _apply_softmax(dec_attn, axis=3, beta=1.0, target_shape=[24, 6, 48, 64])",
                 "        return pooled_out, encoder_softmax, decoder_softmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_with_parenthesized_copy_expression(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_semantic_parenthesized_copy_expression_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_((self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous()))",
+                "    def forward(self, pooled_cf, enc_attn, dec_attn, dec0_rhs):",
+                "        pooled_out = _apply_pool2d(pooled_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=False)",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_1, _binary_rhs_1), [12, 48, 6, 64])",
+                "        encoder_softmax = _apply_softmax(enc_attn, axis=3, beta=1.0, target_shape=[24, 6, 48, 64])",
+                "        decoder_softmax = _apply_softmax(dec_attn, axis=3, beta=1.0, target_shape=[24, 6, 48, 64])",
+                "        return pooled_out, dec0_mul, encoder_softmax, decoder_softmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_with_binary_output_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_semantic_binary_output_aliases_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, pooled_cf, enc_attn, dec_attn, dec0_rhs):",
+                "        pooled_out = _apply_pool2d(pooled_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 40, 60, 1], is_max_pool=True, channel_last=False)",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        masked_lhs = _binary_lhs_1",
+                "        masked_rhs = _binary_rhs_1",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(masked_lhs, masked_rhs), [12, 48, 6, 64])",
+                "        encoder_softmax = _apply_softmax(enc_attn, axis=3, beta=1.0, target_shape=[24, 6, 48, 64])",
+                "        decoder_softmax = _apply_softmax(dec_attn, axis=3, beta=1.0, target_shape=[24, 6, 48, 64])",
+                "        return pooled_out, dec0_mul, encoder_softmax, decoder_softmax",
                 "",
             ]
         ),
@@ -5062,6 +5159,225 @@ def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes
     assert "self.mask_buf_a.copy_(self.attn_src_a)" in repaired
     assert "(self.mask_buf_a).copy_" not in repaired
     assert "[12, 48, 64, 6]" not in repaired
+    assert "[12, 6, 48, 64]" in repaired
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_parenthesized_copy_expression(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_parenthesized_copy_expression_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_((self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous()))",
+                "    def forward(self, dec0_rhs):",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_1, _binary_rhs_1), [12, 48, 6, 64])",
+                "        return dec0_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "self.mask_buf_a.copy_(self.attn_src_a)" in repaired
+    assert "self.mask_buf_a.copy_((self.attn_src_a" not in repaired
+    assert "[12, 48, 64, 6]" not in repaired
+    assert "[12, 6, 48, 64]" in repaired
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_binary_output_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_binary_output_aliases_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, dec0_rhs):",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        masked_lhs = _binary_lhs_1",
+                "        masked_rhs = _binary_rhs_1",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(masked_lhs, masked_rhs), [12, 48, 6, 64])",
+                "        return dec0_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "self.mask_buf_a.copy_(self.attn_src_a)" in repaired
+    assert "[12, 48, 64, 6]" not in repaired
+    assert "[12, 48, 6, 64]" not in repaired
+    assert "[12, 6, 48, 64]" in repaired
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_chained_binary_output_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_chained_binary_output_aliases_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, dec0_rhs):",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        masked_lhs0 = _binary_lhs_1",
+                "        masked_rhs0 = _binary_rhs_1",
+                "        masked_lhs1 = masked_lhs0",
+                "        masked_rhs1 = masked_rhs0",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(masked_lhs1, masked_rhs1), [12, 48, 6, 64])",
+                "        return dec0_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "self.mask_buf_a.copy_(self.attn_src_a)" in repaired
+    assert "[12, 48, 64, 6]" not in repaired
+    assert "[12, 48, 6, 64]" not in repaired
+    assert "[12, 6, 48, 64]" in repaired
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_tuple_binary_output_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_tuple_binary_output_aliases_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, dec0_rhs):",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        masked_lhs, masked_rhs = _binary_lhs_1, _binary_rhs_1",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(masked_lhs, masked_rhs), [12, 48, 6, 64])",
+                "        return dec0_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "self.mask_buf_a.copy_(self.attn_src_a)" in repaired
+    assert "[12, 48, 64, 6]" not in repaired
+    assert "[12, 48, 6, 64]" not in repaired
+    assert "[12, 6, 48, 64]" in repaired
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_parenthesized_tuple_binary_output_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_parenthesized_tuple_binary_output_aliases_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, dec0_rhs):",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        masked_lhs, masked_rhs = (_binary_lhs_1), (_binary_rhs_1)",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(masked_lhs, masked_rhs), [12, 48, 6, 64])",
+                "        return dec0_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "self.mask_buf_a.copy_(self.attn_src_a)" in repaired
+    assert "[12, 48, 64, 6]" not in repaired
+    assert "[12, 48, 6, 64]" not in repaired
+    assert "[12, 6, 48, 64]" in repaired
+
+
+def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_wrapped_parenthesized_tuple_binary_output_aliases(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_repair_wrapped_parenthesized_tuple_binary_output_aliases_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('mask_buf_a', torch.zeros([1, 48, 6, 64], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.mask_buf_a.copy_(self.attn_src_a.permute(*(0, 2, 1, 3)).contiguous())",
+                "    def forward(self, dec0_rhs):",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(dec0_rhs, self.mask_buf_a, [12, 48, 64, 6])",
+                "        (masked_lhs, masked_rhs) = ((_binary_lhs_1), (_binary_rhs_1))",
+                "        dec0_mul = _align_tensor_to_target_shape(torch.mul(masked_lhs, masked_rhs), [12, 48, 6, 64])",
+                "        return dec0_mul",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    repaired = model_path.read_text(encoding="utf-8")
+    assert "self.mask_buf_a.copy_(self.attn_src_a)" in repaired
+    assert "[12, 48, 64, 6]" not in repaired
+    assert "[12, 48, 6, 64]" not in repaired
     assert "[12, 6, 48, 64]" in repaired
 
 

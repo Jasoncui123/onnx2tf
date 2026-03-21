@@ -27089,10 +27089,10 @@ _SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN = (
     r")"
 )
 _SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
-    rf"^(?P<indent>\s*)(?P<target>\(?\s*(?:self\.)?(?P<buffer>[A-Za-z0-9_]+)\s*\)?)\.copy_\((?:(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?(?P<src_fn>.+?),\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
+    rf"^(?P<indent>\s*)(?P<target>\(?\s*(?:self\.)?(?P<buffer>[A-Za-z0-9_]+)\s*\)?)\.copy_\(\s*\(?(?:(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?(?P<src_fn>.+?),\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?\)?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
 )
 _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
-    rf"^(?:.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?.+?,\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?$"
+    rf"^\(?(?:.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?.+?,\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?\)?$"
 )
 _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
     r"^\s*self\.register_buffer\((?P<name_kw>name\s*=\s*)?(?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote),\s*"
@@ -27105,21 +27105,48 @@ _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
 _SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN = r"[^,]+"
 
 
-def _collect_shadowformer_buffer_aliases(lines: Sequence[str]) -> Dict[str, str]:
-    buffer_alias_re = re.compile(
+def _collect_shadowformer_local_aliases(lines: Sequence[str]) -> Dict[str, str]:
+    alias_re = re.compile(
         r"^\s*(?P<alias>[A-Za-z0-9_]+)(?:\s*:\s*[^=]+)?\s*=\s*\(?\s*(?P<source>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)?\s*$"
     )
-    buffer_aliases: Dict[str, str] = {}
+    pair_alias_re = re.compile(
+        r"^\s*\(?\s*(?P<lhs_alias>[A-Za-z0-9_]+)\s*,\s*(?P<rhs_alias>[A-Za-z0-9_]+)\s*\)?\s*=\s*\(?\s*\(?\s*(?P<lhs_source>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)?\s*,\s*\(?\s*(?P<rhs_source>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)?\s*\)?\s*\)?\s*$"
+    )
+    aliases: Dict[str, str] = {}
     for line in lines:
-        alias_match = buffer_alias_re.match(str(line))
+        current_line = str(line)
+        pair_alias_match = pair_alias_re.match(current_line)
+        if pair_alias_match is not None:
+            lhs_source_name = str(pair_alias_match.group("lhs_source"))
+            rhs_source_name = str(pair_alias_match.group("rhs_source"))
+            aliases[str(pair_alias_match.group("lhs_alias"))] = aliases.get(lhs_source_name, lhs_source_name)
+            aliases[str(pair_alias_match.group("rhs_alias"))] = aliases.get(rhs_source_name, rhs_source_name)
+            continue
+        alias_match = alias_re.match(current_line)
         if alias_match is None:
             continue
         alias_name = str(alias_match.group("alias"))
         source_name = str(alias_match.group("source"))
+        aliases[alias_name] = aliases.get(source_name, source_name)
+    resolved_aliases: Dict[str, str] = {}
+    for alias_name in aliases:
+        resolved_name = alias_name
+        seen_names: Set[str] = set()
+        while resolved_name in aliases and resolved_name not in seen_names:
+            seen_names.add(resolved_name)
+            next_name = aliases[resolved_name]
+            if next_name == resolved_name:
+                break
+            resolved_name = next_name
+        resolved_aliases[alias_name] = resolved_name
+    return resolved_aliases
+
+
+def _collect_shadowformer_buffer_aliases(lines: Sequence[str]) -> Dict[str, str]:
+    buffer_aliases: Dict[str, str] = {}
+    for alias_name, source_name in _collect_shadowformer_local_aliases(lines).items():
         if source_name.startswith("self."):
             buffer_aliases[alias_name] = source_name[len("self.") :]
-        elif source_name in buffer_aliases:
-            buffer_aliases[alias_name] = buffer_aliases[source_name]
     return buffer_aliases
 
 
@@ -27164,6 +27191,7 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
 
     changed = False
     lines = model_lines
+    local_aliases = _collect_shadowformer_local_aliases(lines)
     buffer_aliases = _collect_shadowformer_buffer_aliases(lines)
     known_shadowformer_shapes = _collect_shadowformer_supported_shapes(
         registered_shapes,
@@ -27171,23 +27199,15 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         aligned_shapes,
         buffer_aligned_shapes,
     )
-    semantic_supported_buffers = (
-        set(buffer_aligned_buffers)
-        if buffer_aligned_buffers
-        else set(copied_buffers)
-    )
     supported_buffers = {
         buffer_name
         for buffer_name, buffer_shape in buffer_shapes.items()
         if (
-            buffer_name in semantic_supported_buffers
-            and
-            (
-                buffer_aligned_buffers
-                or buffer_name in copied_buffers
-            )
-            and
             buffer_shape in known_shadowformer_shapes
+            and (
+                buffer_name in copied_buffers
+                or buffer_name in buffer_aligned_buffers
+            )
         )
     }
     binary_shape_re = re.compile(
@@ -27292,7 +27312,9 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             continue
         mul_match = mul_align_shape_re.match(current_line)
         if mul_match is not None:
-            if frozenset({str(mul_match.group("mul_lhs")), str(mul_match.group("mul_rhs"))}) not in binary_output_pairs:
+            resolved_mul_lhs = local_aliases.get(str(mul_match.group("mul_lhs")), str(mul_match.group("mul_lhs")))
+            resolved_mul_rhs = local_aliases.get(str(mul_match.group("mul_rhs")), str(mul_match.group("mul_rhs")))
+            if frozenset({resolved_mul_lhs, resolved_mul_rhs}) not in binary_output_pairs:
                 continue
             dims = [
                 int(mul_match.group("d1")),
@@ -27781,6 +27803,7 @@ def _collect_shadowformer_fast_repair_facts(
     )
 
     raw_buffer_dims: Dict[str, Tuple[int, int, int]] = {}
+    local_aliases = _collect_shadowformer_local_aliases(lines)
     buffer_aliases = _collect_shadowformer_buffer_aliases(lines)
     plain_copy_buffers: Set[str] = set()
     permuted_copy_buffers: Set[str] = set()
@@ -27858,7 +27881,9 @@ def _collect_shadowformer_fast_repair_facts(
             continue
         mul_match = mul_align_shape_re.match(current_line)
         if mul_match is not None:
-            if frozenset({str(mul_match.group("mul_lhs")), str(mul_match.group("mul_rhs"))}) not in binary_output_pairs:
+            resolved_mul_lhs = local_aliases.get(str(mul_match.group("mul_lhs")), str(mul_match.group("mul_lhs")))
+            resolved_mul_rhs = local_aliases.get(str(mul_match.group("mul_rhs")), str(mul_match.group("mul_rhs")))
+            if frozenset({resolved_mul_lhs, resolved_mul_rhs}) not in binary_output_pairs:
                 continue
             dims = [int(mul_match.group("d1")), int(mul_match.group("d2")), int(mul_match.group("d3"))]
             inferred_shape = _infer_shadowformer_shape_from_dims(dims, registered_shapes)
