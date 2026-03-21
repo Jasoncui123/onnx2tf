@@ -27990,6 +27990,25 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         expr = str(expr).strip()
         return any(pattern.match(expr) is not None for pattern in inline_patterns)
 
+    def _parse_stage7_mul_args(args: str) -> tuple[str, str] | None:
+        parts = _split_stage7_top_level_args(args)
+        if len(parts) == 2 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None
+            for part in parts
+        ):
+            return parts[0].strip(), parts[1].strip()
+        keyword_values: Dict[str, str] = {}
+        for part in parts:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            keyword_values[key.strip()] = value.strip()
+        input0 = keyword_values.get("input")
+        input1 = keyword_values.get("other")
+        if input0 is None or input1 is None:
+            return None
+        return input0, input1
+
     has_stage7_def = False
     has_forward_call = False
     packed_forward_names: Set[str] = set()
@@ -28036,6 +28055,21 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
                 singleton_anchor_count += 1
                 if _has_stage7_inline_branch_reshape(anchor_args[0]):
                     gather_reshape_count += 1
+                continue
+        stage7_mul_assign_match = re.match(
+            r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.mul\((?P<args>.+)\)$",
+            current_line,
+        )
+        if stage7_mul_assign_match is not None:
+            parsed_mul_args = _parse_stage7_mul_args(str(stage7_mul_assign_match.group("args")))
+            if (
+                parsed_mul_args is not None
+                and (
+                    _has_stage7_inline_branch_reshape(parsed_mul_args[0])
+                    or _has_stage7_inline_branch_reshape(parsed_mul_args[1])
+                )
+            ):
+                gather_reshape_count += 1
                 continue
         if stage7_return_re.match(current_line) is not None:
             has_stage7_return = True
@@ -28171,6 +28205,9 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     stage7_anchor_pair_assign_re = re.compile(
         r"^\s*(?P<pair>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[[^\]]+\])?\s*=\s*_align_binary_inputs_to_anchor\((?P<args>.+)\)$"
+    )
+    stage7_mul_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.mul\((?P<args>.+)\)$"
     )
     stage7_pair_alias_re = re.compile(
         r"^\s*(?P<pair>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[[^\]]+\])?\s*=\s*\(*\s*\(?(?P<rhs0>[A-Za-z0-9_]+)\)?\s*,\s*\(?(?P<rhs1>[A-Za-z0-9_]+)\)?\s*\)*$"
@@ -28323,7 +28360,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     stage7_gather_matches: list[tuple[int, dict[str, str]]] = []
     stage7_reduce_permute_matches: list[tuple[int, dict[str, str]]] = []
     stage7_add_matches: list[tuple[int, re.Match[str]]] = []
-    stage7_mul_matches: list[tuple[int, re.Match[str]]] = []
+    stage7_mul_matches: list[tuple[int, dict[str, str]]] = []
     stage7_return_match: re.Match[str] | None = None
     stage7_return_index: int | None = None
     block_end_index = None
@@ -28430,53 +28467,24 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             str(positional_match.group("indices")),
         )
 
-    def _parse_stage7_index_select_args(args: str) -> tuple[str, str] | None:
-        positional_patterns = [
-            re.compile(
-                r"^\s*(?P<input>[A-Za-z0-9_]+)\s*,\s*0\s*,\s*(?P<indices>[A-Za-z0-9_]+)\s*$"
-            ),
-            re.compile(
-                r"^\s*(?P<input>[A-Za-z0-9_]+)\s*,\s*dim\s*=\s*0\s*,\s*index\s*=\s*(?P<indices>[A-Za-z0-9_]+)\s*$"
-            ),
-            re.compile(
-                r"^\s*(?P<input>[A-Za-z0-9_]+)\s*,\s*index\s*=\s*(?P<indices>[A-Za-z0-9_]+)\s*,\s*dim\s*=\s*0\s*$"
-            ),
-        ]
-        positional_match = next(
-            (
-                match
-                for pattern in positional_patterns
-                if (match := pattern.match(args)) is not None
-            ),
-            None,
-        )
-        if positional_match is not None:
-            return (
-                str(positional_match.group("input")),
-                str(positional_match.group("indices")),
-            )
-        keyword_input_match = re.search(
-            r"(?:^|,\s*)(?:input|source)\s*=\s*(?P<input>[A-Za-z0-9_]+)(?=,|$)",
-            args,
-        )
-        keyword_index_match = re.search(
-            r"(?:^|,\s*)(?:index|indices)\s*=\s*(?P<indices>[A-Za-z0-9_]+)(?=,|$)",
-            args,
-        )
-        keyword_dim_match = re.search(
-            r"(?:^|,\s*)dim\s*=\s*0(?=,|$)",
-            args,
-        )
-        if (
-            keyword_input_match is None
-            or keyword_index_match is None
-            or keyword_dim_match is None
+    def _parse_stage7_mul_args(args: str) -> tuple[str, str] | None:
+        parts = _split_stage7_top_level_args(args)
+        if len(parts) == 2 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None
+            for part in parts
         ):
+            return parts[0].strip(), parts[1].strip()
+        keyword_values: Dict[str, str] = {}
+        for part in parts:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            keyword_values[key.strip()] = value.strip()
+        input0 = keyword_values.get("input")
+        input1 = keyword_values.get("other")
+        if input0 is None or input1 is None:
             return None
-        return (
-            str(keyword_input_match.group("input")),
-            str(keyword_index_match.group("indices")),
-        )
+        return input0, input1
 
     def _parse_stage7_index_select_args(args: str) -> tuple[str, str] | None:
         positional_patterns = [
@@ -28668,16 +28676,20 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             )
             if add_match is not None:
                 stage7_add_matches.append((scan_index, add_match))
-            mul_match = next(
-                (
-                    match
-                    for pattern in stage7_score_mul_res
-                    if (match := pattern.match(lines[scan_index])) is not None
-                ),
-                None,
-            )
-            if mul_match is not None:
-                stage7_mul_matches.append((scan_index, mul_match))
+            mul_assign_match = stage7_mul_assign_re.match(lines[scan_index])
+            if mul_assign_match is not None:
+                parsed_mul_args = _parse_stage7_mul_args(str(mul_assign_match.group("args")))
+                if parsed_mul_args is not None:
+                    stage7_mul_matches.append(
+                        (
+                            scan_index,
+                            {
+                                "lhs": str(mul_assign_match.group("lhs")),
+                                "input0": parsed_mul_args[0],
+                                "input1": parsed_mul_args[1],
+                            },
+                        )
+                    )
             singleton_anchor_match = stage7_singleton_anchor_assign_re.match(lines[scan_index])
             if singleton_anchor_match is not None:
                 singleton_anchor_args = _parse_stage7_singleton_anchor_args(
@@ -28847,6 +28859,28 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         str(match.group("lhs"))
         for _, match in stage7_gather_reshape_matches
     }
+
+    def _derive_stage7_branch_mul_pair(match: dict[str, str]) -> tuple[str, str] | None:
+        resolved_input0 = _resolve_stage7_alias(str(match["input0"]))
+        resolved_input1 = _resolve_stage7_alias(str(match["input1"]))
+        if (
+            resolved_input0 in stage7_branch_rs_names
+            and resolved_input1 in stage7_param_names
+        ):
+            return stage7_rs_sources[resolved_input0], resolved_input1
+        if (
+            resolved_input1 in stage7_branch_rs_names
+            and resolved_input0 in stage7_param_names
+        ):
+            return stage7_rs_sources[resolved_input1], resolved_input0
+        inline_roles0 = _parse_stage7_inline_branch_roles(str(match["input0"]))
+        if inline_roles0[0] is not None and resolved_input1 in stage7_param_names:
+            return str(inline_roles0[0]), resolved_input1
+        inline_roles1 = _parse_stage7_inline_branch_roles(str(match["input1"]))
+        if inline_roles1[0] is not None and resolved_input0 in stage7_param_names:
+            return str(inline_roles1[0]), resolved_input0
+        return None
+
     detected_add_names = [
         _resolve_stage7_alias(str(match.group("input")))
         for _, match in stage7_shape_matches
@@ -28861,30 +28895,19 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         )
     ]
     stage7_branch_mul_pairs = {
-        resolved_inputs[0]: resolved_inputs[1]
+        branch_pair[0]: branch_pair[1]
         for _, match in stage7_mul_matches
-        for resolved_inputs in [(
-            _resolve_stage7_alias(str(match.group("input0"))),
-            _resolve_stage7_alias(str(match.group("input1"))),
-        )]
-        if (
-            resolved_inputs[0] in stage7_branch_rs_names
-            and resolved_inputs[1] in stage7_param_names
-        )
-        or (
-            resolved_inputs[1] in stage7_branch_rs_names
-            and resolved_inputs[0] in stage7_param_names
-        )
-        for branch_rs_name, branch_tr_name in [(
-            resolved_inputs[0], resolved_inputs[1]
-        ) if resolved_inputs[0] in stage7_branch_rs_names else (
-            resolved_inputs[1], resolved_inputs[0]
-        )]
+        for branch_pair in [_derive_stage7_branch_mul_pair(match)]
+        if branch_pair is not None
     }
     detected_tr_names.extend(
         tr_name
         for _, tr_name in stage7_branch_mul_pairs.items()
         if tr_name not in detected_tr_names
+    )
+    covered_stage7_branch_count = max(
+        len(stage7_gather_reshape_matches),
+        len(stage7_branch_mul_pairs),
     )
     if len(detected_tr_names) < len(stage7_gather_reshape_matches):
         fallback_detected_tr_names = [
@@ -28913,7 +28936,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     provisional_branch_count = min(
         len(detected_add_names),
         len(detected_tr_names),
-        len(stage7_gather_reshape_matches),
+        covered_stage7_branch_count,
     )
     descriptor_param_index = (
         stage7_param_names.index(descriptor_input_name)
@@ -28964,6 +28987,16 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             gather_input_root_counts[inline_gather_root_name] = (
                 gather_input_root_counts.get(inline_gather_root_name, 0) + 1
             )
+    for _, match in stage7_mul_matches:
+        for inline_gather_root_name in [
+            _parse_stage7_inline_branch_roles(str(match["input0"]))[1],
+            _parse_stage7_inline_branch_roles(str(match["input1"]))[1],
+        ]:
+            if inline_gather_root_name is not None:
+                gather_input_root_order.append(inline_gather_root_name)
+                gather_input_root_counts[inline_gather_root_name] = (
+                    gather_input_root_counts.get(inline_gather_root_name, 0) + 1
+                )
 
     def _rank_stage7_gather_roots(root_names: Set[str]) -> list[str]:
         return sorted(
@@ -28999,7 +29032,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                     if _resolve_stage7_alias(str(anchor_match["rs"])) == str(match.group("lhs"))
                     for resolved_tr in [_resolve_stage7_alias(str(anchor_match["tr"]))]
                 ),
-                stage7_branch_mul_pairs.get(str(match.group("lhs"))),
+                stage7_branch_mul_pairs.get(add_name),
             )
         ]
         if tr_name is not None
@@ -29010,6 +29043,11 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         for add_name, _ in [_parse_stage7_inline_branch_roles(str(match["rs"]))]
         if add_name is not None
     )
+    raw_stage7_branch_pairs.extend(
+        (add_name, tr_name)
+        for add_name, tr_name in stage7_branch_mul_pairs.items()
+        if (add_name, tr_name) not in raw_stage7_branch_pairs
+    )
     stage7_branch_pairs = raw_stage7_branch_pairs
     stage7_add_sources = {
         str(match.group("lhs")): (
@@ -29019,9 +29057,9 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         for _, match in stage7_add_matches
     }
     stage7_mul_sources = {
-        str(match.group("lhs")): (
-            _resolve_stage7_alias(str(match.group("input0"))),
-            _resolve_stage7_alias(str(match.group("input1"))),
+        str(match["lhs"]): (
+            _resolve_stage7_alias(str(match["input0"])),
+            _resolve_stage7_alias(str(match["input1"])),
         )
         for _, match in stage7_mul_matches
     }
@@ -29281,6 +29319,12 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         return result
 
     final_stage7_mul_leaves = _collect_stage7_mul_leaves(final_stage7_aggregate_root)
+    stage7_mul_branch_pairs_by_lhs = {
+        str(match["lhs"]): branch_pair
+        for _, match in stage7_mul_matches
+        for branch_pair in [_derive_stage7_branch_mul_pair(match)]
+        if branch_pair is not None
+    }
 
     def _stage7_branch_pair_input_set(add_name: str, tr_name: str) -> Set[str] | None:
         rs_name = next(
@@ -29293,6 +29337,27 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         )
         if rs_name is not None:
             return {_resolve_stage7_alias(rs_name), _resolve_stage7_alias(tr_name)}
+        direct_mul_input_set = next(
+            (
+                {
+                    _resolve_stage7_alias(str(match["input0"])),
+                    _resolve_stage7_alias(str(match["input1"])),
+                }
+                for _, match in stage7_mul_matches
+                for branch_pair in [(
+                    stage7_branch_mul_pairs.get(add_name),
+                    _resolve_stage7_alias(tr_name),
+                )]
+                if branch_pair[0] == branch_pair[1]
+                and (
+                    _parse_stage7_inline_branch_roles(str(match["input0"]))[0] == add_name
+                    or _parse_stage7_inline_branch_roles(str(match["input1"]))[0] == add_name
+                )
+            ),
+            None,
+        )
+        if direct_mul_input_set is not None:
+            return direct_mul_input_set
         return next(
             (
                 {
@@ -29315,8 +29380,27 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 continue
             if any(set(stage7_mul_sources[mul_name]) == branch_input_set for mul_name in final_stage7_mul_leaves):
                 constrained_branch_pairs.append((add_name, tr_name))
+        if len(constrained_branch_pairs) < len(final_stage7_mul_leaves):
+            constrained_branch_pairs = [
+                branch_pair
+                for _, match in stage7_mul_matches
+                for branch_pair in [stage7_mul_branch_pairs_by_lhs.get(str(match["lhs"]))]
+                if branch_pair is not None
+                and str(match["lhs"]) in final_stage7_mul_leaves
+            ]
         if constrained_branch_pairs:
             stage7_branch_pairs = constrained_branch_pairs
+
+    def _stage7_branch_mul_match(add_name: str, tr_name: str) -> dict[str, str] | None:
+        return next(
+            (
+                match
+                for _, match in stage7_mul_matches
+                for branch_pair in [_derive_stage7_branch_mul_pair(match)]
+                if branch_pair == (add_name, tr_name)
+            ),
+            None,
+        )
 
     def _stage7_branch_pair_gather_root(add_name: str, tr_name: str) -> str | None:
         rs_name = next(
@@ -29337,6 +29421,34 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 rs_name,
             )
             return _resolve_stage7_gather_roles(gather_input_name)[1]
+        direct_mul_match = _stage7_branch_mul_match(add_name, tr_name)
+        direct_mul_gather_root = next(
+            (
+                inline_roles[1]
+                for input_name in (
+                    str(direct_mul_match["input0"]),
+                    str(direct_mul_match["input1"]),
+                )
+                for inline_roles in [_parse_stage7_inline_branch_roles(input_name)]
+                if inline_roles[0] == add_name and inline_roles[1] is not None
+            ),
+            None,
+        ) if direct_mul_match is not None else None
+        if direct_mul_gather_root is None and direct_mul_match is not None:
+            direct_mul_gather_root = next(
+                (
+                    _resolve_stage7_gather_roles(resolved_input_name)[1]
+                    for input_name in (
+                        str(direct_mul_match["input0"]),
+                        str(direct_mul_match["input1"]),
+                    )
+                    for resolved_input_name in [_resolve_stage7_alias(input_name)]
+                    if resolved_input_name in stage7_branch_rs_names
+                ),
+                None,
+            )
+        if direct_mul_gather_root is not None:
+            return direct_mul_gather_root
         return next(
             (
                 inline_gather_root_name
@@ -29366,8 +29478,8 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 (add_name, tr_name)
                 for add_name, tr_name in stage7_branch_pairs
                 for branch_gather_root_name in [_stage7_branch_pair_gather_root(add_name, tr_name)]
-                if branch_gather_root_name is not None
-                and (
+                if branch_gather_root_name is None
+                or (
                     preferred_stage7_gather_root is None
                     or branch_gather_root_name == preferred_stage7_gather_root
                 )
@@ -29443,6 +29555,23 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         for scan_index, match in stage7_gather_reshape_matches
         if str(match.group("lhs")) in relevant_rs_names
     ]
+    relevant_mul_matches = [
+        (scan_index, match)
+        for scan_index, match in stage7_mul_matches
+        for branch_pair in [_derive_stage7_branch_mul_pair(match)]
+        if branch_pair is not None
+        and branch_pair[0] in relevant_add_names
+        and branch_pair[1] in set(tr_names[:branch_count])
+        and (
+            preferred_stage7_gather_root is None
+            or _parse_stage7_inline_branch_roles(str(match["input0"]))[1] == preferred_stage7_gather_root
+            or _parse_stage7_inline_branch_roles(str(match["input1"]))[1] == preferred_stage7_gather_root
+            or (
+                _resolve_stage7_alias(str(match["input0"])) in relevant_rs_names
+                or _resolve_stage7_alias(str(match["input1"])) in relevant_rs_names
+            )
+        )
+    ]
     relevant_anchor_matches = [
         (scan_index, match)
         for scan_index, match in stage7_singleton_anchor_matches
@@ -29464,6 +29593,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             relevant_shape_matches
             + relevant_gather_matches
             + relevant_gather_reshape_matches
+            + relevant_mul_matches
             + relevant_anchor_matches
         )
     ]
