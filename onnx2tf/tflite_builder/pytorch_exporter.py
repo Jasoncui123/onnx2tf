@@ -27142,13 +27142,34 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
         )
     }
     binary_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+,\s*[A-Za-z0-9_\.]+,\s*(?:\[|\())"
+        r"^(?P<indent>\s*(?P<out_lhs>[A-Za-z0-9_]+),\s*(?P<out_rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+,\s*[A-Za-z0-9_\.]+,\s*(?:\[|\())"
         rf"(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
     )
     mul_align_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*(?:\[|\())"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<mul_lhs>[A-Za-z0-9_]+),\s*(?P<mul_rhs>[A-Za-z0-9_]+)\),\s*(?:\[|\())"
         rf"(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
     )
+    binary_output_pairs: Set[frozenset[str]] = set()
+    for line in lines:
+        binary_match = binary_shape_re.match(str(line))
+        if binary_match is None:
+            continue
+        dims = [
+            int(binary_match.group("d1")),
+            int(binary_match.group("d2")),
+            int(binary_match.group("d3")),
+        ]
+        inferred_shape = _infer_shadowformer_shape_from_dims(dims, known_shadowformer_shapes)
+        if inferred_shape is None:
+            continue
+        binary_output_pairs.add(
+            frozenset(
+                {
+                    str(binary_match.group("out_lhs")),
+                    str(binary_match.group("out_rhs")),
+                }
+            )
+        )
 
     for index, line in enumerate(lines):
         current_line = str(line)
@@ -27219,6 +27240,8 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             continue
         mul_match = mul_align_shape_re.match(current_line)
         if mul_match is not None:
+            if frozenset({str(mul_match.group("mul_lhs")), str(mul_match.group("mul_rhs"))}) not in binary_output_pairs:
+                continue
             dims = [
                 int(mul_match.group("d1")),
                 int(mul_match.group("d2")),
@@ -27692,10 +27715,10 @@ def _collect_shadowformer_fast_repair_facts(
         r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+?)(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*\)$"
     )
     binary_shape_re = re.compile(
-        rf"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+),\s*(?P<rhs>[A-Za-z0-9_\.]+),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
+        rf"^\s*(?P<out_lhs>[A-Za-z0-9_]+),\s*(?P<out_rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+),\s*(?P<rhs>[A-Za-z0-9_\.]+),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
     mul_align_shape_re = re.compile(
-        rf"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\([A-Za-z0-9_]+,\s*[A-Za-z0-9_]+\),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
+        rf"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<mul_lhs>[A-Za-z0-9_]+),\s*(?P<mul_rhs>[A-Za-z0-9_]+)\),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
 
     raw_buffer_dims: Dict[str, Tuple[int, int, int]] = {}
@@ -27728,6 +27751,7 @@ def _collect_shadowformer_fast_repair_facts(
     aligned_shapes: Set[Tuple[int, int, int]] = set()
     buffer_aligned_buffers: Set[str] = set()
     buffer_aligned_shapes: Set[Tuple[int, int, int]] = set()
+    binary_output_pairs: Set[frozenset[str]] = set()
 
     for buffer_name, dims in raw_buffer_dims.items():
         if buffer_name in plain_copy_buffers and buffer_name not in permuted_copy_buffers:
@@ -27747,6 +27771,14 @@ def _collect_shadowformer_fast_repair_facts(
             dims = [int(binary_match.group("d1")), int(binary_match.group("d2")), int(binary_match.group("d3"))]
             inferred_shape = _infer_shadowformer_shape_from_dims(dims, registered_shapes)
             if inferred_shape is not None:
+                binary_output_pairs.add(
+                    frozenset(
+                        {
+                            str(binary_match.group("out_lhs")),
+                            str(binary_match.group("out_rhs")),
+                        }
+                    )
+                )
                 aligned_shapes.add(inferred_shape)
                 for operand_name in (str(binary_match.group("lhs")), str(binary_match.group("rhs"))):
                     if not operand_name.startswith("self."):
@@ -27759,6 +27791,8 @@ def _collect_shadowformer_fast_repair_facts(
             continue
         mul_match = mul_align_shape_re.match(current_line)
         if mul_match is not None:
+            if frozenset({str(mul_match.group("mul_lhs")), str(mul_match.group("mul_rhs"))}) not in binary_output_pairs:
+                continue
             dims = [int(mul_match.group("d1")), int(mul_match.group("d2")), int(mul_match.group("d3"))]
             inferred_shape = _infer_shadowformer_shape_from_dims(dims, registered_shapes)
             if inferred_shape is not None:
