@@ -28432,6 +28432,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     block_end_index = None
     stage7_alias_sources: Dict[str, str] = {}
     stage7_pair_alias_sources: Dict[str, tuple[str, str]] = {}
+    stage7_passthrough_sources: Dict[str, str] = {}
 
     def _split_stage7_top_level_args(args: str) -> list[str]:
         parts: list[str] = []
@@ -28512,6 +28513,18 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         ):
             return None
         return str(shape_alias_match.group("lhs")), rhs_value
+
+    def _parse_stage7_align_passthrough(line: str) -> tuple[str, str] | None:
+        passthrough_match = re.match(
+            r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<args>.+)\)$",
+            line,
+        )
+        if passthrough_match is None:
+            return None
+        passthrough_args = _split_stage7_top_level_args(str(passthrough_match.group("args")))
+        if not passthrough_args:
+            return None
+        return str(passthrough_match.group("lhs")), passthrough_args[0].strip()
 
     def _parse_stage7_singleton_anchor_args(args: str) -> tuple[str, str] | None:
         parts = _split_stage7_top_level_args(args)
@@ -28695,29 +28708,104 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         dims_pattern = stage7_permute_dims_patterns.get(expected_dims)
         if dims_pattern is None:
             return None
-        positional_match = re.match(
-            rf"^\s*(?P<input>[A-Za-z0-9_]+)\s*,\s*{dims_pattern}\s*$",
-            args,
+        parts = _split_stage7_top_level_args(args)
+        if len(parts) == 2 and re.fullmatch(dims_pattern, parts[1].strip()) is not None:
+            return parts[0].strip()
+        keyword_values: Dict[str, str] = {}
+        for part in parts:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            keyword_values[key.strip()] = value.strip()
+        input_value = next(
+            (
+                keyword_values[key]
+                for key in ("input", "x", "tensor")
+                if key in keyword_values
+            ),
+            None,
         )
-        if positional_match is not None:
-            return str(positional_match.group("input"))
-        input_match = re.search(
-            r"(?:^|,\s*)(?:input|x|tensor)\s*=\s*(?P<input>[A-Za-z0-9_]+)(?=,|$)",
-            args,
+        dims_value = next(
+            (
+                keyword_values[key]
+                for key in ("perm", "dims", "axes")
+                if key in keyword_values
+            ),
+            None,
         )
-        dims_match = re.search(
-            rf"(?:^|,\s*)(?:perm|dims|axes)\s*=\s*{dims_pattern}(?=,|$)",
-            args,
-        )
-        if input_match is None or dims_match is None:
+        if input_value is None or dims_value is None or re.fullmatch(dims_pattern, dims_value) is None:
             return None
-        return str(input_match.group("input"))
+        return input_value
+
+    def _unwrap_stage7_passthrough_expr(expr: str) -> str:
+        unwrapped_expr = _resolve_stage7_alias(str(expr).strip())
+        while True:
+            if unwrapped_expr in stage7_passthrough_sources:
+                unwrapped_expr = _resolve_stage7_alias(stage7_passthrough_sources[unwrapped_expr])
+                continue
+            stripped_expr = unwrapped_expr.strip()
+            while stripped_expr.startswith("(") and stripped_expr.endswith(")"):
+                depth = 0
+                balanced = True
+                for index, char in enumerate(stripped_expr):
+                    if char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if depth < 0 or (depth == 0 and index != len(stripped_expr) - 1):
+                            balanced = False
+                            break
+                if not balanced or depth != 0:
+                    break
+                stripped_expr = stripped_expr[1:-1].strip()
+            if not stripped_expr.startswith("_align_tensor_to_target_shape(") or not stripped_expr.endswith(")"):
+                return stripped_expr
+            align_args = _split_stage7_top_level_args(
+                stripped_expr[len("_align_tensor_to_target_shape("):-1]
+            )
+            if not align_args:
+                return stripped_expr
+            unwrapped_expr = _resolve_stage7_alias(align_args[0].strip())
+
+    def _parse_stage7_inline_add_sources(expr: str) -> tuple[str, str] | None:
+        expr = _unwrap_stage7_passthrough_expr(expr)
+        direct_match = re.match(
+            r"^torch\.add\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\)$",
+            expr,
+        )
+        if direct_match is not None:
+            return (
+                _resolve_stage7_alias(str(direct_match.group("input0"))),
+                _resolve_stage7_alias(str(direct_match.group("input1"))),
+            )
+        keyword_match = re.match(
+            r"^torch\.add\(\s*input\s*=\s*(?P<input0>[A-Za-z0-9_]+)\s*,\s*other\s*=\s*(?P<input1>[A-Za-z0-9_]+)\s*\)$",
+            expr,
+        )
+        if keyword_match is not None:
+            return (
+                _resolve_stage7_alias(str(keyword_match.group("input0"))),
+                _resolve_stage7_alias(str(keyword_match.group("input1"))),
+            )
+        reordered_keyword_match = re.match(
+            r"^torch\.add\(\s*other\s*=\s*(?P<input1>[A-Za-z0-9_]+)\s*,\s*input\s*=\s*(?P<input0>[A-Za-z0-9_]+)\s*\)$",
+            expr,
+        )
+        if reordered_keyword_match is not None:
+            return (
+                _resolve_stage7_alias(str(reordered_keyword_match.group("input0"))),
+                _resolve_stage7_alias(str(reordered_keyword_match.group("input1"))),
+            )
+        return None
 
     if stage7_def_index is not None:
         for scan_index in range(stage7_def_index + 1, stage7_end_index):
             parsed_shape_alias = _parse_stage7_anchor_shape_alias(lines[scan_index])
             if parsed_shape_alias is not None:
                 stage7_anchor_shape_alias_sources[parsed_shape_alias[0]] = parsed_shape_alias[1]
+            parsed_passthrough_alias = _parse_stage7_align_passthrough(lines[scan_index])
+            if parsed_passthrough_alias is not None:
+                stage7_passthrough_sources[parsed_passthrough_alias[0]] = parsed_passthrough_alias[1]
             anchor_pair_match = stage7_anchor_pair_assign_re.match(lines[scan_index])
             if anchor_pair_match is not None:
                 anchor_pair_args = _parse_stage7_singleton_anchor_args(str(anchor_pair_match.group("args")))
@@ -29482,14 +29570,30 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             if resolved_current_name in seen:
                 continue
             seen.add(resolved_current_name)
+            passthrough_current_name = _unwrap_stage7_passthrough_expr(resolved_current_name)
+            if passthrough_current_name != resolved_current_name:
+                stack.append(passthrough_current_name)
+                continue
             if resolved_current_name in stage7_add_sources:
                 stack.extend(stage7_add_sources[resolved_current_name])
+                continue
+            inline_add_sources = _parse_stage7_inline_add_sources(resolved_current_name)
+            if inline_add_sources is not None:
+                stack.extend(inline_add_sources)
                 continue
             if resolved_current_name in stage7_mul_sources:
                 result.add(resolved_current_name)
         return result
 
     final_stage7_mul_leaves = _collect_stage7_mul_leaves(final_stage7_aggregate_root)
+    if final_stage7_aggregate_root is not None and not final_stage7_mul_leaves:
+        unwrapped_final_stage7_aggregate_root = _unwrap_stage7_passthrough_expr(
+            final_stage7_aggregate_root
+        )
+        if unwrapped_final_stage7_aggregate_root != final_stage7_aggregate_root:
+            final_stage7_mul_leaves = _collect_stage7_mul_leaves(
+                unwrapped_final_stage7_aggregate_root
+            )
     stage7_mul_branch_pairs_by_lhs = {
         str(match["lhs"]): branch_pair
         for _, match in stage7_mul_matches
