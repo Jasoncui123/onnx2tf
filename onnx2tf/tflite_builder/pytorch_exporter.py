@@ -26672,6 +26672,9 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     pidnet_permute_conv_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
+    pidnet_plain_alias_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)$"
+    )
 
     def _pidnet_is_cf_like_name(name: str) -> bool:
         if name.endswith("_cf") or name.endswith("_out_cf"):
@@ -26691,6 +26694,10 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         tracked_names: Set[str] = {str(name)}
         for lookahead_index in range(start_index + 1, len(lines)):
             future_line = str(lines[lookahead_index])
+            plain_alias_match = pidnet_plain_alias_re.match(future_line)
+            if plain_alias_match is not None and str(plain_alias_match.group("input")) in tracked_names:
+                tracked_names.add(str(plain_alias_match.group("lhs")))
+                continue
             alias_match = pidnet_cf_alias_re.match(future_line)
             if alias_match is not None and str(alias_match.group("input")) in tracked_names:
                 tracked_names.add(str(alias_match.group("lhs")))
@@ -26753,6 +26760,25 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     }
 
     for index, line in enumerate(lines):
+        pidnet_plain_alias_match = pidnet_plain_alias_re.match(line)
+        if pidnet_plain_alias_match is not None:
+            input_name = str(pidnet_plain_alias_match.group("input"))
+            lhs_name = str(pidnet_plain_alias_match.group("lhs"))
+            if _pidnet_is_cf_like_name(input_name):
+                pidnet_cf_alias_sources.add(lhs_name)
+            if input_name in pidnet_cf_binary_sources:
+                pidnet_cf_binary_sources.add(lhs_name)
+            if input_name in pidnet_cf_mul_sources:
+                pidnet_cf_mul_sources.add(lhs_name)
+            if input_name in pidnet_cf_reduce_sum_sources:
+                pidnet_cf_reduce_sum_sources.add(lhs_name)
+            if input_name in pidnet_cf_mean_sources:
+                pidnet_cf_mean_sources.add(lhs_name)
+            if input_name in pidnet_cf_pad_sources:
+                pidnet_cf_pad_sources.add(lhs_name)
+            if input_name in pidnet_cf_pool_sources:
+                pidnet_cf_pool_sources.add(lhs_name)
+            continue
         pidnet_cf_resize_match = pidnet_cf_resize_re.match(line)
         if pidnet_cf_resize_match is not None:
             input_name = str(pidnet_cf_resize_match.group("input"))
@@ -26890,14 +26916,15 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                     int(pidnet_binary_anchor_match.group("d2")),
                     int(pidnet_binary_anchor_match.group("d3")),
                 ]
+                preferred_channel_count = _pidnet_rank4_preferred_channel_count(
+                    current_shape,
+                    prefer_last_if_nhwc=any(
+                        input_name in pidnet_cf_alias_sources for input_name in (input_a, input_b)
+                    ),
+                )
                 normalized_shape = _normalize_cf_rank4_shape(
                     current_shape,
-                    preferred_channel_count=_pidnet_rank4_preferred_channel_count(
-                        current_shape,
-                        prefer_last_if_nhwc=any(
-                            input_name in pidnet_cf_alias_sources for input_name in (input_a, input_b)
-                        ),
-                    ),
+                    preferred_channel_count=preferred_channel_count,
                 )
                 if normalized_shape != current_shape:
                     lines[index] = (
