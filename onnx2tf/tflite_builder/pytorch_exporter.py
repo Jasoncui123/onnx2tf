@@ -26585,6 +26585,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     pidnet_cf_mean_sources: Set[str] = set()
     pidnet_cf_pad_sources: Set[str] = set()
     pidnet_cf_pool_sources: Set[str] = set()
+    pidnet_const_alias_sources: Set[str] = set()
 
     def _pidnet_rank4_preferred_channel_count(
         shape: Sequence[int],
@@ -26644,12 +26645,12 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     pidnet_bn_mul_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
-        r"torch\.mul\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+)\), "
+        r"torch\.mul\((?P<input>[A-Za-z0-9_]+), (?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_bn_add_anchor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), "
+        r"(?P<input>[A-Za-z0-9_]+), (?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_cf_pad_re = re.compile(
@@ -26666,14 +26667,14 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     )
     pidnet_scale3_anchor_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
-        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), "
+        r"(?P<input>[A-Za-z0-9_]+), (?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_permute_conv_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
     pidnet_plain_alias_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*(?P<input>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*$"
     )
 
     def _pidnet_is_cf_like_name(name: str) -> bool:
@@ -26689,6 +26690,9 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             | pidnet_cf_pad_sources
             | pidnet_cf_pool_sources
         )
+
+    def _pidnet_is_const_like_expr(expr: str) -> bool:
+        return str(expr).startswith("self.") or str(expr) in pidnet_const_alias_sources
 
     def _pidnet_has_cf_layout_consumer(name: str, *, start_index: int) -> bool:
         tracked_names: Set[str] = {str(name)}
@@ -26764,6 +26768,8 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         if pidnet_plain_alias_match is not None:
             input_name = str(pidnet_plain_alias_match.group("input"))
             lhs_name = str(pidnet_plain_alias_match.group("lhs"))
+            if input_name.startswith("self."):
+                pidnet_const_alias_sources.add(lhs_name)
             if _pidnet_is_cf_like_name(input_name):
                 pidnet_cf_alias_sources.add(lhs_name)
             if input_name in pidnet_cf_binary_sources:
@@ -26910,31 +26916,42 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             lhs0_name = str(pidnet_binary_anchor_match.group("lhs0"))
             lhs1_name = str(pidnet_binary_anchor_match.group("lhs1"))
             if any(_pidnet_is_cf_like_name(input_name) for input_name in (input_a, input_b)):
-                current_shape = [
-                    int(pidnet_binary_anchor_match.group("n")),
-                    int(pidnet_binary_anchor_match.group("d1")),
-                    int(pidnet_binary_anchor_match.group("d2")),
-                    int(pidnet_binary_anchor_match.group("d3")),
-                ]
-                preferred_channel_count = _pidnet_rank4_preferred_channel_count(
-                    current_shape,
-                    prefer_last_if_nhwc=any(
-                        input_name in pidnet_cf_alias_sources for input_name in (input_a, input_b)
-                    ),
-                )
-                normalized_shape = _normalize_cf_rank4_shape(
-                    current_shape,
-                    preferred_channel_count=preferred_channel_count,
-                )
-                if normalized_shape != current_shape:
-                    lines[index] = (
-                        f"{pidnet_binary_anchor_match.group('indent')}{pidnet_binary_anchor_match.group('lhs0')}, "
-                        f"{pidnet_binary_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                        f"{input_a}, {input_b}, {normalized_shape})"
+                scale3_anchor_match = pidnet_scale3_anchor_re.match(line)
+                bn_add_anchor_match = pidnet_bn_add_anchor_re.match(line)
+                if (
+                    scale3_anchor_match is not None
+                    and _pidnet_is_const_like_expr(str(scale3_anchor_match.group("const_expr")))
+                ) or (
+                    bn_add_anchor_match is not None
+                    and _pidnet_is_const_like_expr(str(bn_add_anchor_match.group("const_expr")))
+                ):
+                    pass
+                else:
+                    current_shape = [
+                        int(pidnet_binary_anchor_match.group("n")),
+                        int(pidnet_binary_anchor_match.group("d1")),
+                        int(pidnet_binary_anchor_match.group("d2")),
+                        int(pidnet_binary_anchor_match.group("d3")),
+                    ]
+                    preferred_channel_count = _pidnet_rank4_preferred_channel_count(
+                        current_shape,
+                        prefer_last_if_nhwc=any(
+                            input_name in pidnet_cf_alias_sources for input_name in (input_a, input_b)
+                        ),
                     )
-                    changed = True
-                pidnet_cf_binary_sources.update({lhs0_name, lhs1_name})
-                continue
+                    normalized_shape = _normalize_cf_rank4_shape(
+                        current_shape,
+                        preferred_channel_count=preferred_channel_count,
+                    )
+                    if normalized_shape != current_shape:
+                        lines[index] = (
+                            f"{pidnet_binary_anchor_match.group('indent')}{pidnet_binary_anchor_match.group('lhs0')}, "
+                            f"{pidnet_binary_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
+                            f"{input_a}, {input_b}, {normalized_shape})"
+                        )
+                        changed = True
+                    pidnet_cf_binary_sources.update({lhs0_name, lhs1_name})
+                    continue
         pidnet_cf_pool_match = pidnet_cf_pool_re.match(line)
         if pidnet_cf_pool_match is not None:
             input_name = str(pidnet_cf_pool_match.group("input"))
@@ -26963,29 +26980,36 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 _pidnet_is_cf_like_name(input_a)
                 or _pidnet_is_cf_like_name(input_b)
             ):
-                current_shape = [
-                    int(pidnet_mul_align_match.group("n")),
-                    int(pidnet_mul_align_match.group("d1")),
-                    int(pidnet_mul_align_match.group("d2")),
-                    int(pidnet_mul_align_match.group("d3")),
-                ]
-                normalized_shape = _normalize_cf_rank4_shape(current_shape)
-                if normalized_shape == current_shape:
-                    normalized_shape = _normalize_cf_rank4_shape(
-                        current_shape,
-                        preferred_channel_count=_pidnet_rank4_preferred_channel_count(
+                bn_mul_match = pidnet_bn_mul_re.match(line)
+                if (
+                    bn_mul_match is not None
+                    and _pidnet_is_const_like_expr(str(bn_mul_match.group("const_expr")))
+                ):
+                    pass
+                else:
+                    current_shape = [
+                        int(pidnet_mul_align_match.group("n")),
+                        int(pidnet_mul_align_match.group("d1")),
+                        int(pidnet_mul_align_match.group("d2")),
+                        int(pidnet_mul_align_match.group("d3")),
+                    ]
+                    normalized_shape = _normalize_cf_rank4_shape(current_shape)
+                    if normalized_shape == current_shape:
+                        normalized_shape = _normalize_cf_rank4_shape(
                             current_shape,
-                            prefer_last_if_nhwc=True,
-                        ),
-                    )
-                if normalized_shape != current_shape:
-                    lines[index] = (
-                        f"{pidnet_mul_align_match.group('indent')}{pidnet_mul_align_match.group('lhs')} = "
-                        f"_align_tensor_to_target_shape(torch.mul({input_a}, {input_b}), {normalized_shape})"
-                    )
-                    changed = True
-                pidnet_cf_mul_sources.add(str(pidnet_mul_align_match.group("lhs")))
-                continue
+                            preferred_channel_count=_pidnet_rank4_preferred_channel_count(
+                                current_shape,
+                                prefer_last_if_nhwc=True,
+                            ),
+                        )
+                    if normalized_shape != current_shape:
+                        lines[index] = (
+                            f"{pidnet_mul_align_match.group('indent')}{pidnet_mul_align_match.group('lhs')} = "
+                            f"_align_tensor_to_target_shape(torch.mul({input_a}, {input_b}), {normalized_shape})"
+                        )
+                        changed = True
+                    pidnet_cf_mul_sources.add(str(pidnet_mul_align_match.group("lhs")))
+                    continue
         pidnet_reduce_sum_match = pidnet_reduce_sum_re.match(line)
         if (
             pidnet_reduce_sum_match is not None
@@ -27016,6 +27040,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         pidnet_scale3_anchor_match = pidnet_scale3_anchor_re.match(line)
         if pidnet_scale3_anchor_match is not None:
             input_name = str(pidnet_scale3_anchor_match.group("input"))
+            const_expr = str(pidnet_scale3_anchor_match.group("const_expr"))
             current_shape = [
                 int(pidnet_scale3_anchor_match.group("n")),
                 int(pidnet_scale3_anchor_match.group("d1")),
@@ -27030,11 +27055,11 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                     current_shape,
                     preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
                 )
-            if _pidnet_is_cf_like_name(input_name):
+            if _pidnet_is_cf_like_name(input_name) and _pidnet_is_const_like_expr(const_expr):
                 lines[index] = (
                     f"{pidnet_scale3_anchor_match.group('indent')}{pidnet_scale3_anchor_match.group('lhs0')}, "
                     f"{pidnet_scale3_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                    f"{input_name}, torch.reshape(self.{pidnet_scale3_anchor_match.group('const_attr')}, {normalized_shape}), "
+                    f"{input_name}, torch.reshape({const_expr}, {normalized_shape}), "
                     f"{normalized_shape})"
                 )
                 changed = True
@@ -27060,6 +27085,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         pidnet_bn_mul_match = pidnet_bn_mul_re.match(line)
         if pidnet_bn_mul_match is not None:
             input_name = str(pidnet_bn_mul_match.group("input"))
+            const_expr = str(pidnet_bn_mul_match.group("const_expr"))
             current_shape = [
                 int(pidnet_bn_mul_match.group("n")),
                 int(pidnet_bn_mul_match.group("d1")),
@@ -27070,11 +27096,13 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 current_shape,
                 preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
             )
-            if input_name in pidnet_cf_mean_sources or _pidnet_is_cf_like_name(input_name):
+            if (
+                input_name in pidnet_cf_mean_sources or _pidnet_is_cf_like_name(input_name)
+            ) and _pidnet_is_const_like_expr(const_expr):
                 lines[index] = (
                     f"{pidnet_bn_mul_match.group('indent')}{pidnet_bn_mul_match.group('lhs')} = "
                     f"_align_tensor_to_target_shape(torch.mul({input_name}, "
-                    f"torch.reshape(self.{pidnet_bn_mul_match.group('const_attr')}, {normalized_shape})), "
+                    f"torch.reshape({const_expr}, {normalized_shape})), "
                     f"{normalized_shape})"
                 )
                 changed = True
@@ -27083,6 +27111,7 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         pidnet_bn_add_anchor_match = pidnet_bn_add_anchor_re.match(line)
         if pidnet_bn_add_anchor_match is not None:
             input_name = str(pidnet_bn_add_anchor_match.group("input"))
+            const_expr = str(pidnet_bn_add_anchor_match.group("const_expr"))
             current_shape = [
                 int(pidnet_bn_add_anchor_match.group("n")),
                 int(pidnet_bn_add_anchor_match.group("d1")),
@@ -27093,11 +27122,11 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 current_shape,
                 preferred_channel_count=_pidnet_rank4_preferred_channel_count(current_shape),
             )
-            if _pidnet_is_cf_like_name(input_name):
+            if _pidnet_is_cf_like_name(input_name) and _pidnet_is_const_like_expr(const_expr):
                 lines[index] = (
                     f"{pidnet_bn_add_anchor_match.group('indent')}{pidnet_bn_add_anchor_match.group('lhs0')}, "
                     f"{pidnet_bn_add_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                    f"{input_name}, torch.reshape(self.{pidnet_bn_add_anchor_match.group('const_attr')}, {normalized_shape}), "
+                    f"{input_name}, torch.reshape({const_expr}, {normalized_shape}), "
                     f"{normalized_shape})"
                 )
                 changed = True
