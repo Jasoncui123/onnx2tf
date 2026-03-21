@@ -27089,7 +27089,7 @@ _SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN = (
     r")"
 )
 _SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
-    rf"^(?P<indent>\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\()(?:(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?(?P<src_fn>.+?),\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
+    rf"^(?P<indent>\s*)(?P<target>\(?\s*(?:self\.)?(?P<buffer>[A-Za-z0-9_]+)\s*\)?)\.copy_\((?:(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?(?P<src_fn>.+?),\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
 )
 _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
     rf"^(?:.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?.+?,\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?$"
@@ -27103,6 +27103,46 @@ _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
     r"(?P<register_trailing_comma>\s*,?)\)$"
 )
 _SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN = r"[^,]+"
+
+
+def _collect_shadowformer_buffer_aliases(lines: Sequence[str]) -> Dict[str, str]:
+    buffer_alias_re = re.compile(
+        r"^\s*(?P<alias>[A-Za-z0-9_]+)(?:\s*:\s*[^=]+)?\s*=\s*\(?\s*(?P<source>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)?\s*$"
+    )
+    buffer_aliases: Dict[str, str] = {}
+    for line in lines:
+        alias_match = buffer_alias_re.match(str(line))
+        if alias_match is None:
+            continue
+        alias_name = str(alias_match.group("alias"))
+        source_name = str(alias_match.group("source"))
+        if source_name.startswith("self."):
+            buffer_aliases[alias_name] = source_name[len("self.") :]
+        elif source_name in buffer_aliases:
+            buffer_aliases[alias_name] = buffer_aliases[source_name]
+    return buffer_aliases
+
+
+def _strip_outer_parentheses(expr: str) -> str:
+    text = str(expr).strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        balanced = True
+        for index, char in enumerate(text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth < 0:
+                    balanced = False
+                    break
+                if depth == 0 and index != len(text) - 1:
+                    balanced = False
+                    break
+        if not balanced or depth != 0:
+            break
+        text = text[1:-1].strip()
+    return text
 
 
 def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
@@ -27124,29 +27164,38 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
 
     changed = False
     lines = model_lines
+    buffer_aliases = _collect_shadowformer_buffer_aliases(lines)
     known_shadowformer_shapes = _collect_shadowformer_supported_shapes(
         registered_shapes,
         copied_shapes,
         aligned_shapes,
         buffer_aligned_shapes,
     )
+    semantic_supported_buffers = (
+        set(buffer_aligned_buffers)
+        if buffer_aligned_buffers
+        else set(copied_buffers)
+    )
     supported_buffers = {
         buffer_name
         for buffer_name, buffer_shape in buffer_shapes.items()
         if (
-            buffer_shape in known_shadowformer_shapes
-            and (
-                buffer_name in copied_buffers
-                or buffer_name in buffer_aligned_buffers
+            buffer_name in semantic_supported_buffers
+            and
+            (
+                buffer_aligned_buffers
+                or buffer_name in copied_buffers
             )
+            and
+            buffer_shape in known_shadowformer_shapes
         )
     }
     binary_shape_re = re.compile(
-        r"^(?P<indent>\s*(?P<out_lhs>[A-Za-z0-9_]+),\s*(?P<out_rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_\.]+,\s*[A-Za-z0-9_\.]+,\s*(?:\[|\())"
+        r"^(?P<indent>\s*(?P<out_lhs>[A-Za-z0-9_]+),\s*(?P<out_rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs(?:_to_anchor)?\(\(?\s*[A-Za-z0-9_\.]+\s*\)?,\s*\(?\s*[A-Za-z0-9_\.]+\s*\)?,\s*(?:\[|\())"
         rf"(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
     )
     mul_align_shape_re = re.compile(
-        r"^(?P<indent>\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<mul_lhs>[A-Za-z0-9_]+),\s*(?P<mul_rhs>[A-Za-z0-9_]+)\),\s*(?:\[|\())"
+        r"^(?P<indent>\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\(\(?\s*(?P<mul_lhs>[A-Za-z0-9_]+)\s*\)?,\s*\(?\s*(?P<mul_rhs>[A-Za-z0-9_]+)\s*\)?\),\s*(?:\[|\())"
         rf"(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?P<suffix>(?:\]|\))\))$"
     )
     binary_output_pairs: Set[frozenset[str]] = set()
@@ -27211,10 +27260,13 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             continue
         copy_match = _SHADOWFORMER_COPY_PERMUTE_RE.match(current_line)
         if copy_match is not None:
-            if copy_match.group("buffer") not in supported_buffers:
+            copy_buffer_name = str(copy_match.group("buffer"))
+            resolved_buffer_name = buffer_aliases.get(copy_buffer_name, copy_buffer_name)
+            if resolved_buffer_name not in supported_buffers:
                 continue
-            src_expr = str(copy_match.group("src") or copy_match.group("src_fn"))
-            rewritten = f"{copy_match.group('indent')}{src_expr}{copy_match.group('copy_kwargs')})"
+            src_expr = _strip_outer_parentheses(str(copy_match.group("src") or copy_match.group("src_fn")))
+            target_expr = _strip_outer_parentheses(str(copy_match.group("target")))
+            rewritten = f"{copy_match.group('indent')}{target_expr}.copy_({src_expr}{copy_match.group('copy_kwargs')})"
             if rewritten != current_line:
                 lines[index] = rewritten
                 changed = True
@@ -27684,6 +27736,11 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
         aligned_shapes,
         buffer_aligned_shapes,
     )
+    semantic_supported_shapes = (
+        set(buffer_aligned_shapes)
+        if buffer_aligned_shapes
+        else (set() if registered_shapes else set(supported_shapes))
+    )
     has_cf_pool = False
     for line in lines:
         current_line = str(line)
@@ -27694,7 +27751,9 @@ def _has_shadowformer_avoid_model_ir_signature(lines: Sequence[str]) -> bool:
         return False
     repeated_windows: Dict[Tuple[int, int], int] = {}
     for _, heads, height, width in softmax_shapes:
-        if supported_shapes and (heads, height, width) not in supported_shapes:
+        if semantic_supported_shapes and (heads, height, width) not in semantic_supported_shapes:
+            continue
+        if registered_shapes and not semantic_supported_shapes:
             continue
         repeated_windows[(height, width)] = repeated_windows.get((height, width), 0) + 1
     return any(count >= 2 for count in repeated_windows.values())
@@ -27712,16 +27771,17 @@ def _collect_shadowformer_fast_repair_facts(
     Set[Tuple[int, int, int]],
 ]:
     copy_re = re.compile(
-        r"^\s*self\.(?P<buffer>[A-Za-z0-9_]+)\.copy_\((?P<src>.+?)(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*\)$"
+        r"^\s*(?:\(?\s*(?:self\.)?(?P<buffer>[A-Za-z0-9_]+)\s*\)?)\.copy_\((?P<src>.+?)(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*\)$"
     )
     binary_shape_re = re.compile(
-        rf"^\s*(?P<out_lhs>[A-Za-z0-9_]+),\s*(?P<out_rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_\.]+),\s*(?P<rhs>[A-Za-z0-9_\.]+),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
+        rf"^\s*(?P<out_lhs>[A-Za-z0-9_]+),\s*(?P<out_rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs(?:_to_anchor)?\(\(?\s*(?P<lhs>[A-Za-z0-9_\.]+)\s*\)?,\s*\(?\s*(?P<rhs>[A-Za-z0-9_\.]+)\s*\)?,\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
     mul_align_shape_re = re.compile(
-        rf"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<mul_lhs>[A-Za-z0-9_]+),\s*(?P<mul_rhs>[A-Za-z0-9_]+)\),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
+        rf"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.mul\(\(?\s*(?P<mul_lhs>[A-Za-z0-9_]+)\s*\)?,\s*\(?\s*(?P<mul_rhs>[A-Za-z0-9_]+)\s*\)?\),\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
 
     raw_buffer_dims: Dict[str, Tuple[int, int, int]] = {}
+    buffer_aliases = _collect_shadowformer_buffer_aliases(lines)
     plain_copy_buffers: Set[str] = set()
     permuted_copy_buffers: Set[str] = set()
 
@@ -27736,12 +27796,16 @@ def _collect_shadowformer_fast_repair_facts(
             )
             continue
         copy_match = copy_re.match(current_line)
-        if copy_match is not None and copy_match.group("buffer") in raw_buffer_dims:
+        if copy_match is not None:
+            copy_buffer_name = str(copy_match.group("buffer"))
+            resolved_buffer_name = buffer_aliases.get(copy_buffer_name, copy_buffer_name)
+            if resolved_buffer_name not in raw_buffer_dims:
+                continue
             src_expr = str(copy_match.group("src"))
             if _SHADOWFORMER_COPY_PERMUTE_SRC_RE.match(src_expr) is not None:
-                permuted_copy_buffers.add(copy_match.group("buffer"))
+                permuted_copy_buffers.add(resolved_buffer_name)
             else:
-                plain_copy_buffers.add(copy_match.group("buffer"))
+                plain_copy_buffers.add(resolved_buffer_name)
             continue
 
     registered_shapes: Set[Tuple[int, int, int]] = set()
@@ -27781,9 +27845,12 @@ def _collect_shadowformer_fast_repair_facts(
                 )
                 aligned_shapes.add(inferred_shape)
                 for operand_name in (str(binary_match.group("lhs")), str(binary_match.group("rhs"))):
-                    if not operand_name.startswith("self."):
+                    if operand_name.startswith("self."):
+                        buffer_name = operand_name[len("self.") :]
+                    else:
+                        buffer_name = buffer_aliases.get(operand_name)
+                    if buffer_name is None:
                         continue
-                    buffer_name = operand_name[len("self.") :]
                     buffer_shape = buffer_shapes.get(buffer_name)
                     if buffer_shape == inferred_shape:
                         buffer_aligned_buffers.add(buffer_name)
