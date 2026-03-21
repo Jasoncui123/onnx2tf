@@ -20997,6 +20997,28 @@ def test_rewrite_binary_aligned_target_shapes_uses_recorded_binary_target(tmp_pa
     ) in rewritten
 
 
+def test_rewrite_binary_aligned_target_shapes_uses_downstream_target_for_const_expr(tmp_path) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        "\n".join(
+            [
+                "def forward(spp_pool_out):",
+                "    _binary_lhs_124, _binary_rhs_124 = _align_binary_inputs_to_anchor(spp_pool_out, torch.reshape(self.const_demo, [1, 512, 1, 2]), [1, 512, 1, 1])",
+                "    spp_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_124, _binary_rhs_124), [1, 512, 1, 2])",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _rewrite_binary_aligned_target_shapes(model_file)
+
+    rewritten = model_file.read_text(encoding="utf-8")
+    assert (
+        "_align_binary_inputs_to_anchor(spp_pool_out, torch.reshape(self.const_demo, [1, 512, 1, 2]), [1, 512, 1, 2])"
+    ) in rewritten
+
+
 def test_rewrite_binary_conv_bridge_target_shapes_uses_downstream_conv_channels(tmp_path) -> None:
     model_file = tmp_path / "model.py"
     model_file.write_text(
@@ -21074,6 +21096,30 @@ def test_rewrite_channel_first_pool_target_shapes_uses_input_channel_dim(tmp_pat
     assert (
         "spp_pool_out = _apply_pool2d(spp_input_cf, filter_height=5, filter_width=5, stride_h=2, stride_w=2, "
         "padding='SAME', target_shape=[1, 512, 2, 3], is_max_pool=False, channel_last=False)"
+    ) in rewritten
+
+
+def test_rewrite_channel_first_pool_target_shapes_uses_downstream_binary_target(tmp_path) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        "\n".join(
+            [
+                "def forward(spp_input_cf):",
+                "    spp_pool_out = _apply_pool2d(spp_input_cf, filter_height=9, filter_width=9, stride_h=4, stride_w=4, padding='VALID', target_shape=[1, 1, 2, 512], is_max_pool=False, channel_last=False)",
+                "    _binary_lhs_124, _binary_rhs_124 = _align_binary_inputs_to_anchor(spp_pool_out, torch.reshape(self.const_demo, [1, 512, 1, 2]), [1, 512, 1, 1])",
+                "    spp_mul = _align_tensor_to_target_shape(torch.mul(_binary_lhs_124, _binary_rhs_124), [1, 512, 1, 2])",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _rewrite_channel_first_pool_target_shapes(model_file)
+
+    rewritten = model_file.read_text(encoding="utf-8")
+    assert (
+        "spp_pool_out = _apply_pool2d(spp_input_cf, filter_height=9, filter_width=9, stride_h=4, stride_w=4, "
+        "padding='VALID', target_shape=[1, 512, 1, 2], is_max_pool=False, channel_last=False)"
     ) in rewritten
 
 

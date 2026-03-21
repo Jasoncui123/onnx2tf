@@ -178,7 +178,9 @@ def _rewrite_binary_aligned_target_shapes(model_file: Path) -> None:
     )
     binary_align_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+) = _align_binary_inputs(?:_to_anchor)?\("
-        r"(?P<left>[A-Za-z0-9_]+), (?P<right>[A-Za-z0-9_]+), \[(?P<shape>[0-9,\s]+)\]\)\s*$"
+        r"(?P<left>[A-Za-z0-9_]+), "
+        r"(?P<right>(?:[A-Za-z0-9_]+|self\.[A-Za-z0-9_]+|torch\.reshape\(self\.[A-Za-z0-9_]+, \[[0-9,\s]+\]\))), "
+        r"\[(?P<shape>[0-9,\s]+)\]\)\s*$"
     )
     binary_expr_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
@@ -219,8 +221,10 @@ def _rewrite_binary_aligned_target_shapes(model_file: Path) -> None:
                 if token.strip()
             ]
             candidate_shape: Optional[list[int]] = None
-            left_root = _resolve_alias(str(align_match.group("left")))
-            right_root = _resolve_alias(str(align_match.group("right")))
+            left_expr = str(align_match.group("left")).strip()
+            right_expr = str(align_match.group("right")).strip()
+            left_root = _resolve_alias(left_expr)
+            right_root = _resolve_alias(right_expr)
             left_shape = static_shape_by_var.get(left_root, None)
             right_shape = static_shape_by_var.get(right_root, None)
             if left_shape is not None and right_shape is not None and left_shape == right_shape:
@@ -229,15 +233,32 @@ def _rewrite_binary_aligned_target_shapes(model_file: Path) -> None:
                 candidate_shape = list(left_shape)
             elif right_shape is not None and str(right_root).endswith("_cf"):
                 candidate_shape = list(right_shape)
+            if candidate_shape is None and ("self." in right_expr or "torch.reshape(" in right_expr):
+                for future_index in range(index + 1, min(len(lines), index + 5)):
+                    future_expr_match = binary_expr_re.match(lines[future_index])
+                    if (
+                        future_expr_match is None
+                        or str(future_expr_match.group("a")) != str(align_match.group("lhs"))
+                        or str(future_expr_match.group("b")) != str(align_match.group("rhs"))
+                    ):
+                        continue
+                    future_shape = [
+                        int(token.strip())
+                        for token in str(future_expr_match.group("shape")).split(",")
+                        if token.strip()
+                    ]
+                    if len(future_shape) == 4:
+                        candidate_shape = list(future_shape)
+                    break
             if candidate_shape is not None and candidate_shape != target_shape:
                 lines[index] = (
                     f"{align_match.group('indent')}{align_match.group('lhs')}, {align_match.group('rhs')} = "
-                    f"_align_binary_inputs_to_anchor({align_match.group('left')}, {align_match.group('right')}, "
+                    f"_align_binary_inputs_to_anchor({left_expr}, {right_expr}, "
                     f"{repr([int(v) for v in list(candidate_shape)])})"
                     if "_align_binary_inputs_to_anchor(" in line
                     else (
                         f"{align_match.group('indent')}{align_match.group('lhs')}, {align_match.group('rhs')} = "
-                        f"_align_binary_inputs({align_match.group('left')}, {align_match.group('right')}, "
+                        f"_align_binary_inputs({left_expr}, {right_expr}, "
                         f"{repr([int(v) for v in list(candidate_shape)])})"
                     )
                 )
@@ -411,7 +432,10 @@ def _rewrite_channel_first_pool_target_shapes(model_file: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?P<input>[A-Za-z0-9_]+), (?P<args>.+), target_shape=\[(?P<shape>[0-9,\s]+)\], is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
     )
     binary_consumer_re = re.compile(
-        r"^\s*_binary_lhs_(?P<index>\d+), _binary_rhs_(?P=index)\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[^,\n]+), \[(?P<shape>[0-9,\s]+)\]\)$"
+        r"^\s*_binary_lhs_(?P<index>\d+), _binary_rhs_(?P=index)\s*=\s*_align_binary_inputs(?:_to_anchor)?\("
+        r"(?P<lhs>[A-Za-z0-9_]+), "
+        r"(?P<rhs>(?:[A-Za-z0-9_]+|self\.[A-Za-z0-9_]+|torch\.reshape\(self\.[A-Za-z0-9_]+, \[[0-9,\s]+\]\))), "
+        r"\[(?P<shape>[0-9,\s]+)\]\)$"
     )
     binary_target_re = re.compile(
         r"^\s*[A-Za-z0-9_]+\s*=\s*_align_tensor_to_target_shape\(torch\.(?:mul|add|sub|div|max|min)\(_binary_lhs_(?P<index>\d+), _binary_rhs_(?P=index)\), \[(?P<shape>[0-9,\s]+)\]\)$"
@@ -443,7 +467,10 @@ def _rewrite_channel_first_pool_target_shapes(model_file: Path) -> None:
         pool_lhs = str(pool_match.group("lhs"))
         for future_index in range(index + 1, len(lines)):
             binary_consumer_match = binary_consumer_re.match(lines[future_index])
-            if binary_consumer_match is None or str(binary_consumer_match.group("lhs")) != pool_lhs:
+            if (
+                binary_consumer_match is None
+                or str(binary_consumer_match.group("lhs")) != pool_lhs
+            ):
                 continue
             binary_index = str(binary_consumer_match.group("index"))
             for body_index in range(future_index + 1, min(len(lines), future_index + 5)):
