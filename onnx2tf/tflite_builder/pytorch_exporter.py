@@ -27096,9 +27096,11 @@ _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
 )
 _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
     r"^\s*self\.register_buffer\((?P<name_kw>name\s*=\s*)?(?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote),\s*"
-    r"(?P<tensor_kw>tensor\s*=\s*)?torch\.zeros\((?:size=)?(?:\[|\()\s*1\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)\s*(?:\]|\))"
-    r"(?P<zeros_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)"
-    r"(?:,\s*persistent=(?P<persistent>True|False))?\)$"
+    r"(?P<tensor_kw>tensor\s*=\s*)?torch\.zeros\((?P<zeros_prefix>(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?\s*,\s*)*)(?:size\s*=\s*)?(?:\[|\()\s*1\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)\s*(?:\]|\))"
+    r"(?P<zeros_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)"
+    r"(?P<zeros_trailing_comma>\s*,?)\)"
+    r"(?:,\s*persistent\s*=\s*(?P<persistent>True|False))?"
+    r"(?P<register_trailing_comma>\s*,?)\)$"
 )
 _SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN = r"[^,]+"
 
@@ -27166,6 +27168,11 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
             if shape not in known_shadowformer_shapes:
                 continue
             zeros_expr = f"torch.zeros([1, {shape[0]}, {shape[1]}, {shape[2]}]"
+            zeros_prefix = str(register_match.group("zeros_prefix") or "").strip()
+            if zeros_prefix:
+                zeros_prefix = zeros_prefix.rstrip(", ")
+                if zeros_prefix:
+                    zeros_expr += f", {zeros_prefix}"
             zeros_kwargs = str(register_match.group("zeros_kwargs") or "")
             if zeros_kwargs:
                 zeros_expr += zeros_kwargs
@@ -27771,7 +27778,7 @@ def _collect_shadowformer_fast_repair_facts(
 def _collect_shadowformer_softmax_shapes(lines: Sequence[str]) -> List[Tuple[str, int, int, int]]:
     axis_re = re.compile(r"(?:^|[,(])\s*axis\s*=\s*(?:3|-1)(?:$|[,)])")
     target_shape_re = re.compile(
-        rf"target_shape=(?:\[|\()\s*(?P<batches>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\s*(?:\]|\))"
+        rf"target_shape\s*=\s*(?:\[|\()\s*(?P<batches>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<heads>\d+)\s*,\s*(?P<height>\d+)\s*,\s*(?P<width>\d+)\s*(?:\]|\))"
     )
     softmax_shapes: List[Tuple[str, int, int, int]] = []
     for line in lines:
