@@ -27821,6 +27821,7 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
 
 
 def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
+    stage7_reshape_shape_pattern = r"(?:\[\s*-1\s*,\s*1\s*\]|\(\s*-1\s*,\s*1\s*\))"
     stage7_def_re = re.compile(
         r"^\s*def _forward_stage_7\(self, .+\)(?: -> (?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?:$"
     )
@@ -27833,14 +27834,51 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
     forward_index_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\s*=\s*(?P<packed>[A-Za-z0-9_]+)\[(?P<index>[01])\]$"
     )
-    gather_reshape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, _resolve_reshape_shape\(\[-1, 1\], [A-Za-z0-9_]+, allow_zero=False\)\)$"
-    )
+    gather_reshape_res = [
+        re.compile(
+            rf"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, _resolve_reshape_shape\({stage7_reshape_shape_pattern}, [A-Za-z0-9_]+, allow_zero=False\)\)$"
+        ),
+        re.compile(
+            rf"^\s*[A-Za-z0-9_]+ = torch\.reshape\(\s*input\s*=\s*[A-Za-z0-9_]+\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, [A-Za-z0-9_]+, allow_zero=False\)\s*\)$"
+        ),
+        re.compile(
+            rf"^\s*[A-Za-z0-9_]+ = torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, [A-Za-z0-9_]+, allow_zero=False\)\s*,\s*input\s*=\s*[A-Za-z0-9_]+\s*\)$"
+        ),
+    ]
     singleton_anchor_re = re.compile(
         r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\([A-Za-z0-9_]+, [A-Za-z0-9_]+, (?:\[|\()1, 1, 1, 1(?:\]|\))\)$"
     )
+    anchor_pair_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[[^\]]+\])?\s*=\s*_align_binary_inputs_to_anchor\([A-Za-z0-9_]+, [A-Za-z0-9_]+, (?:\[|\()1, 1, 1, 1(?:\]|\))\)$"
+    )
     stage7_return_re = re.compile(
         r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
+    )
+    stage7_descriptor_permute_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[1, 0\]\)$"
+    )
+    stage7_gather_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.gather\(\s*(?:input\s*=\s*)?[A-Za-z0-9_]+\s*,\s*(?:(?:0|dim\s*=\s*0)\s*,\s*(?:index\s*=\s*)?(?P<indices>[A-Za-z0-9_]+)|index\s*=\s*(?P<indices_reordered>[A-Za-z0-9_]+)\s*,\s*dim\s*=\s*0)\s*\)$"
+    )
+    stage7_gather_reshape_res = [
+        re.compile(
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), _resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P=input), allow_zero=False\)\)$"
+        ),
+        re.compile(
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*input\s*=\s*(?P<input>[A-Za-z0-9_]+)\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P=input), allow_zero=False\)\s*\)$"
+        ),
+        re.compile(
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<input>[A-Za-z0-9_]+), allow_zero=False\)\s*,\s*input\s*=\s*(?P=input)\s*\)$"
+        ),
+    ]
+    stage7_gather_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.gather\(\s*(?:input\s*=\s*)?[A-Za-z0-9_]+\s*,\s*(?:(?:0|dim\s*=\s*0)\s*,\s*(?:index\s*=\s*)?(?P<indices>[A-Za-z0-9_]+)|index\s*=\s*(?P<indices_reordered>[A-Za-z0-9_]+)\s*,\s*dim\s*=\s*0)\s*\)$"
+    )
+    stage7_score_squeeze_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.squeeze\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    stage7_score_mul_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\)$"
     )
 
     has_stage7_def = False
@@ -27871,10 +27909,13 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
                 )
                 has_forward_call = has_forward_call or packed_forward_indices[packed_name] == {"0", "1"}
             continue
-        if gather_reshape_re.match(current_line) is not None:
+        if any(pattern.match(current_line) is not None for pattern in gather_reshape_res):
             gather_reshape_count += 1
             continue
         if singleton_anchor_re.match(current_line) is not None:
+            singleton_anchor_count += 1
+            continue
+        if anchor_pair_re.match(current_line) is not None:
             singleton_anchor_count += 1
             continue
         if stage7_return_re.match(current_line) is not None:
@@ -27895,6 +27936,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     lines = model_source.splitlines()
     if not _has_alike_fast_repair_signature(lines):
         return
+    stage7_reshape_shape_pattern = r"(?:\[\s*-1\s*,\s*1\s*\]|\(\s*-1\s*,\s*1\s*\))"
 
     rank4_eq_align_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.eq\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
@@ -27938,11 +27980,52 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     stage7_return_re = re.compile(
         r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
     )
+    stage7_descriptor_permute_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[1, 0\]\)$"
+    )
+    stage7_gather_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.gather\(\s*(?:input\s*=\s*)?[A-Za-z0-9_]+\s*,\s*(?:(?:0|dim\s*=\s*0)\s*,\s*(?:index\s*=\s*)?(?P<indices>[A-Za-z0-9_]+)|index\s*=\s*(?P<indices_reordered>[A-Za-z0-9_]+)\s*,\s*dim\s*=\s*0)\s*\)$"
+    )
+    stage7_gather_reshape_res = [
+        re.compile(
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), _resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P=input), allow_zero=False\)\)$"
+        ),
+        re.compile(
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*input\s*=\s*(?P<input>[A-Za-z0-9_]+)\s*,\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P=input), allow_zero=False\)\s*\)$"
+        ),
+        re.compile(
+            rf"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(\s*shape\s*=\s*_resolve_reshape_shape\({stage7_reshape_shape_pattern}, (?P<input>[A-Za-z0-9_]+), allow_zero=False\)\s*,\s*input\s*=\s*(?P=input)\s*\)$"
+        ),
+    ]
+    stage7_score_squeeze_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.squeeze\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    stage7_score_mul_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.mul\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\)$"
+    )
     stage7_shape_tensor_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _shape_tensor\((?P<input>[A-Za-z0-9_]+), dtype=torch\.int32(?:, device=(?P=input)\.device)?\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _shape_tensor\((?P<input>[A-Za-z0-9_]+), dtype=torch\.int32(?:, device=(?P<device_source>[A-Za-z0-9_]+)\.device)?\)$"
     )
     stage7_singleton_anchor_re = re.compile(
         r"^\s*(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<rs>[A-Za-z0-9_]+), (?P<tr>[A-Za-z0-9_]+), (?:\[|\()1, 1, 1, 1(?:\]|\))\)$"
+    )
+    stage7_anchor_pair_re = re.compile(
+        r"^\s*(?P<pair>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[[^\]]+\])?\s*=\s*_align_binary_inputs_to_anchor\((?P<rs>[A-Za-z0-9_]+), (?P<tr>[A-Za-z0-9_]+), (?:\[|\()1, 1, 1, 1(?:\]|\))\)$"
+    )
+    stage7_pair_alias_re = re.compile(
+        r"^\s*(?P<pair>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[[^\]]+\])?\s*=\s*\(*\s*\(?(?P<rhs0>[A-Za-z0-9_]+)\)?\s*,\s*\(?(?P<rhs1>[A-Za-z0-9_]+)\)?\s*\)*$"
+    )
+    stage7_pair_rebind_re = re.compile(
+        r"^\s*(?P<pair>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[[^\]]+\])?\s*=\s*\(*\s*(?P<source_pair>[A-Za-z0-9_]+)\s*\)*$"
+    )
+    stage7_pair_unpack_re = re.compile(
+        r"^\s*\(?(?P<lhs0>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\)?\s*=\s*\(*\s*(?P<pair>[A-Za-z0-9_]+)\s*\)*$"
+    )
+    stage7_tuple_alias_re = re.compile(
+        r"^\s*\(?(?P<lhs0>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\)?\s*=\s*\(?(?P<rhs0>[A-Za-z0-9_]+)\)?\s*,\s*\(?(?P<rhs1>[A-Za-z0-9_]+)\)?$"
+    )
+    stage7_plain_alias_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\s*=\s*\(?(?P<rhs>[A-Za-z0-9_]+)\)?$"
     )
 
     changed = False
@@ -28075,14 +28158,74 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
     ) if stage7_def_index is not None else len(lines)
     stage7_shape_matches: list[tuple[int, re.Match[str]]] = []
     stage7_singleton_anchor_matches: list[tuple[int, re.Match[str]]] = []
+    stage7_descriptor_matches: list[tuple[int, re.Match[str]]] = []
+    stage7_gather_reshape_matches: list[tuple[int, re.Match[str]]] = []
+    stage7_gather_matches: list[tuple[int, re.Match[str]]] = []
     stage7_return_match: re.Match[str] | None = None
     stage7_return_index: int | None = None
     block_end_index = None
+    stage7_alias_sources: Dict[str, str] = {}
+    stage7_pair_alias_sources: Dict[str, tuple[str, str]] = {}
     if stage7_def_index is not None:
         for scan_index in range(stage7_def_index + 1, stage7_end_index):
+            anchor_pair_match = stage7_anchor_pair_re.match(lines[scan_index])
+            if anchor_pair_match is not None:
+                stage7_pair_alias_sources[str(anchor_pair_match.group("pair"))] = (
+                    str(anchor_pair_match.group("rs")),
+                    str(anchor_pair_match.group("tr")),
+                )
+                stage7_singleton_anchor_matches.append((scan_index, anchor_pair_match))
+            pair_alias_match = stage7_pair_alias_re.match(lines[scan_index])
+            if pair_alias_match is not None:
+                stage7_pair_alias_sources[str(pair_alias_match.group("pair"))] = (
+                    str(pair_alias_match.group("rhs0")),
+                    str(pair_alias_match.group("rhs1")),
+                )
+            pair_rebind_match = stage7_pair_rebind_re.match(lines[scan_index])
+            if pair_rebind_match is not None:
+                source_pair_name = str(pair_rebind_match.group("source_pair"))
+                if source_pair_name in stage7_pair_alias_sources:
+                    stage7_pair_alias_sources[str(pair_rebind_match.group("pair"))] = (
+                        stage7_pair_alias_sources[source_pair_name][0],
+                        stage7_pair_alias_sources[source_pair_name][1],
+                    )
+            pair_unpack_match = stage7_pair_unpack_re.match(lines[scan_index])
+            if pair_unpack_match is not None:
+                pair_name = str(pair_unpack_match.group("pair"))
+                if pair_name in stage7_pair_alias_sources:
+                    rhs0, rhs1 = stage7_pair_alias_sources[pair_name]
+                    stage7_alias_sources[str(pair_unpack_match.group("lhs0"))] = rhs0
+                    stage7_alias_sources[str(pair_unpack_match.group("lhs1"))] = rhs1
+            tuple_alias_match = stage7_tuple_alias_re.match(lines[scan_index])
+            if tuple_alias_match is not None:
+                stage7_alias_sources[str(tuple_alias_match.group("lhs0"))] = str(
+                    tuple_alias_match.group("rhs0")
+                )
+                stage7_alias_sources[str(tuple_alias_match.group("lhs1"))] = str(
+                    tuple_alias_match.group("rhs1")
+                )
+            alias_match = stage7_plain_alias_re.match(lines[scan_index])
+            if alias_match is not None:
+                stage7_alias_sources[str(alias_match.group("lhs"))] = str(alias_match.group("rhs"))
             shape_match = stage7_shape_tensor_re.match(lines[scan_index])
             if shape_match is not None:
                 stage7_shape_matches.append((scan_index, shape_match))
+            descriptor_match = stage7_descriptor_permute_re.match(lines[scan_index])
+            if descriptor_match is not None:
+                stage7_descriptor_matches.append((scan_index, descriptor_match))
+            gather_match = stage7_gather_re.match(lines[scan_index])
+            if gather_match is not None:
+                stage7_gather_matches.append((scan_index, gather_match))
+            gather_reshape_match = next(
+                (
+                    match
+                    for pattern in stage7_gather_reshape_res
+                    if (match := pattern.match(lines[scan_index])) is not None
+                ),
+                None,
+            )
+            if gather_reshape_match is not None:
+                stage7_gather_reshape_matches.append((scan_index, gather_reshape_match))
             singleton_anchor_match = stage7_singleton_anchor_re.match(lines[scan_index])
             if singleton_anchor_match is not None:
                 stage7_singleton_anchor_matches.append((scan_index, singleton_anchor_match))
@@ -28090,16 +28233,180 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             if return_match is not None:
                 stage7_return_match = return_match
                 stage7_return_index = scan_index
+    score_tail_match: re.Match[str] | None = None
     if stage7_return_match is not None and stage7_return_index is not None:
-        score_tail_re = re.compile(
-            rf"^\s*{re.escape(str(stage7_return_match.group('score')))} = torch\.reshape\([A-Za-z0-9_]+, .+\)$"
-        )
+        score_tail_res = [
+            re.compile(
+                rf"^\s*{re.escape(str(stage7_return_match.group('score')))} = torch\.reshape\((?P<input>[A-Za-z0-9_]+), .+\)$"
+            ),
+            re.compile(
+                rf"^\s*{re.escape(str(stage7_return_match.group('score')))} = torch\.reshape\(\s*input\s*=\s*(?P<input>[A-Za-z0-9_]+)\s*,\s*shape\s*=.+\)$"
+            ),
+            re.compile(
+                rf"^\s*{re.escape(str(stage7_return_match.group('score')))} = torch\.reshape\(\s*shape\s*=.+,\s*input\s*=\s*(?P<input>[A-Za-z0-9_]+)\s*\)$"
+            ),
+        ]
         for scan_index in range(stage7_return_index - 1, stage7_def_index, -1):
-            if score_tail_re.match(lines[scan_index]) is not None:
+            score_tail_match = next(
+                (
+                    match
+                    for pattern in score_tail_res
+                    if (match := pattern.match(lines[scan_index])) is not None
+                ),
+                None,
+            )
+            if score_tail_match is not None:
                 block_end_index = scan_index
                 break
-    branch_count = min(len(stage7_shape_matches), len(stage7_singleton_anchor_matches))
-    block_start_index = stage7_shape_matches[0][0] if branch_count >= 1 else None
+
+    def _resolve_stage7_alias(name: str) -> str:
+        current = str(name)
+        seen: Set[str] = set()
+        while current in stage7_alias_sources and current not in seen:
+            seen.add(current)
+            current = str(stage7_alias_sources[current])
+        return current
+
+    def _resolve_stage7_anchor_sources(match: re.Match[str]) -> tuple[str, str]:
+        return (
+            _resolve_stage7_alias(str(match.group("rs"))),
+            _resolve_stage7_alias(str(match.group("tr"))),
+        )
+
+    def _stage7_anchor_output_names(match: re.Match[str]) -> tuple[str, str] | None:
+        group_dict = match.groupdict()
+        lhs0 = group_dict.get("lhs0")
+        lhs1 = group_dict.get("lhs1")
+        if lhs0 is None or lhs1 is None:
+            return None
+        return str(lhs0), str(lhs1)
+
+    detected_add_names = [
+        _resolve_stage7_alias(str(match.group("input")))
+        for _, match in stage7_shape_matches
+    ]
+    detected_tr_names = [
+        _resolve_stage7_alias(str(match.group("tr")))
+        for _, match in stage7_singleton_anchor_matches
+    ]
+    stage7_param_names = re.findall(r"([A-Za-z0-9_]+): torch\.Tensor", lines[stage7_def_index])
+    stage7_descriptors_name = str(stage7_return_match.group("descriptors")) if stage7_return_match is not None else None
+    descriptor_input_name = next(
+        (
+            str(match.group("input"))
+            for _, match in stage7_descriptor_matches
+            if stage7_descriptors_name is not None and str(match.group("lhs")) == stage7_descriptors_name
+        ),
+        None,
+    )
+    provisional_branch_count = min(
+        len(detected_add_names),
+        len(detected_tr_names),
+        len(stage7_gather_reshape_matches),
+    )
+    descriptor_param_index = (
+        stage7_param_names.index(descriptor_input_name)
+        if descriptor_input_name in stage7_param_names
+        else None
+    )
+    pre_descriptor_params = (
+        stage7_param_names[:descriptor_param_index]
+        if descriptor_param_index is not None
+        else stage7_param_names
+    )
+    post_descriptor_params = (
+        stage7_param_names[descriptor_param_index + 1 :]
+        if descriptor_param_index is not None
+        else stage7_param_names
+    )
+    ordered_add_names = [
+        param_name
+        for param_name in pre_descriptor_params
+        if param_name in detected_add_names
+    ]
+    if provisional_branch_count >= 1 and len(ordered_add_names) > provisional_branch_count:
+        ordered_add_names = ordered_add_names[-provisional_branch_count:]
+    ordered_tr_names = [
+        param_name
+        for param_name in post_descriptor_params
+        if param_name in detected_tr_names
+    ]
+    if provisional_branch_count >= 1 and len(ordered_tr_names) > provisional_branch_count:
+        ordered_tr_names = ordered_tr_names[:provisional_branch_count]
+    add_names = ordered_add_names or detected_add_names
+    tr_names = ordered_tr_names or detected_tr_names
+    stage7_gather_sources = {
+        str(match.group("lhs")): _resolve_stage7_alias(
+            str(match.group("indices") or match.group("indices_reordered"))
+        )
+        for _, match in stage7_gather_matches
+    }
+    stage7_rs_sources = {
+        str(match.group("lhs")): stage7_gather_sources.get(
+            _resolve_stage7_alias(str(match.group("input")))
+        )
+        for _, match in stage7_gather_reshape_matches
+    }
+    stage7_branch_pairs = [
+        (add_name, tr_name)
+        for _, match in stage7_gather_reshape_matches
+        for add_name in [stage7_rs_sources.get(str(match.group("lhs")))]
+        if add_name is not None
+        for tr_name in [
+            next(
+                (
+                    resolved_tr
+                    for _, anchor_match in stage7_singleton_anchor_matches
+                    if _resolve_stage7_alias(str(anchor_match.group("rs"))) == str(match.group("lhs"))
+                    for resolved_tr in [_resolve_stage7_alias(str(anchor_match.group("tr")))]
+                ),
+                None,
+            )
+        ]
+        if tr_name is not None
+    ]
+    if stage7_branch_pairs:
+        add_names = [add_name for add_name, _ in stage7_branch_pairs]
+        tr_names = [tr_name for _, tr_name in stage7_branch_pairs]
+    branch_count = min(len(add_names), len(tr_names))
+    relevant_add_names = set(add_names[:branch_count])
+    relevant_shape_matches = [
+        (scan_index, match)
+        for scan_index, match in stage7_shape_matches
+        if _resolve_stage7_alias(str(match.group("input"))) in relevant_add_names
+    ]
+    relevant_gather_matches = [
+        (scan_index, match)
+        for scan_index, match in stage7_gather_matches
+        if _resolve_stage7_alias(str(match.group("indices") or match.group("indices_reordered")))
+        in relevant_add_names
+    ]
+    relevant_rs_names = {
+        str(match.group("lhs"))
+        for _, match in stage7_gather_reshape_matches
+        if stage7_rs_sources.get(str(match.group("lhs"))) in relevant_add_names
+    }
+    relevant_gather_reshape_matches = [
+        (scan_index, match)
+        for scan_index, match in stage7_gather_reshape_matches
+        if str(match.group("lhs")) in relevant_rs_names
+    ]
+    relevant_anchor_matches = [
+        (scan_index, match)
+        for scan_index, match in stage7_singleton_anchor_matches
+        if _resolve_stage7_alias(str(match.group("rs"))) in relevant_rs_names
+        and _resolve_stage7_alias(str(match.group("tr"))) in set(tr_names[:branch_count])
+    ]
+    relevant_start_indices = [
+        scan_index
+        for scan_index, _ in (
+            relevant_shape_matches
+            + relevant_gather_matches
+            + relevant_gather_reshape_matches
+            + relevant_anchor_matches
+        )
+    ]
+    block_start_index = min(relevant_start_indices) if relevant_start_indices else None
     if (
         stage7_def_index is None
         or forward_call_index is None
@@ -28138,13 +28445,58 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         )
         changed = True
 
-    stage7_param_names = re.findall(r"([A-Za-z0-9_]+): torch\.Tensor", lines[stage7_def_index])
     score_cast_name = stage7_param_names[-1] if stage7_param_names else "wadkd_cast5_out0"
     if score_cast_name == "scores_map" and len(stage7_param_names) >= 2:
         score_cast_name = stage7_param_names[-2]
     score_lhs = str(stage7_return_match.group("score"))
-    add_names = [str(match.group("input")) for _, match in stage7_shape_matches[:branch_count]]
-    tr_names = [str(match.group("tr")) for _, match in stage7_singleton_anchor_matches[:branch_count]]
+    if score_tail_match is not None and block_end_index is not None:
+        score_tail_input_name = _resolve_stage7_alias(str(score_tail_match.group("input")))
+        score_mul_lhs_name = next(
+            (
+                str(match.group("input"))
+                for scan_index in range(block_end_index - 1, stage7_def_index, -1)
+                if (match := stage7_score_squeeze_re.match(lines[scan_index])) is not None
+                and str(match.group("lhs")) == score_tail_input_name
+            ),
+            score_tail_input_name,
+        )
+        if score_mul_lhs_name is not None:
+            score_mul_inputs = next(
+                (
+                    (str(match.group("input0")), str(match.group("input1")))
+                    for scan_index in range(block_end_index - 1, stage7_def_index, -1)
+                    if (match := stage7_score_mul_re.match(lines[scan_index])) is not None
+                    and str(match.group("lhs")) == score_mul_lhs_name
+                ),
+                None,
+            )
+            if score_mul_inputs is not None:
+                raw_score_mul_input_set = {score_mul_inputs[0], score_mul_inputs[1]}
+                score_mul_input_set = {
+                    _resolve_stage7_alias(score_mul_inputs[0]),
+                    _resolve_stage7_alias(score_mul_inputs[1]),
+                }
+                score_cast_candidate = next(
+                    (
+                        resolved_name
+                        for _, match in reversed(stage7_singleton_anchor_matches)
+                        if (
+                            _stage7_anchor_output_names(match) is not None
+                            and set(_stage7_anchor_output_names(match) or ()) == raw_score_mul_input_set
+                        )
+                        or set(_resolve_stage7_anchor_sources(match)) == score_mul_input_set
+                        for resolved_name in _resolve_stage7_anchor_sources(match)
+                        if resolved_name in stage7_param_names
+                        and resolved_name not in add_names
+                        and resolved_name not in tr_names
+                        and resolved_name != descriptor_input_name
+                    ),
+                    None,
+                )
+                if score_cast_candidate is not None:
+                    score_cast_name = score_cast_candidate
+    add_names = add_names[:branch_count]
+    tr_names = tr_names[:branch_count]
     temp_prefix = re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_]+", "_", score_lhs)).strip("_")
     if not temp_prefix:
         temp_prefix = "stage7"
