@@ -8088,6 +8088,68 @@ def test_apply_fast_precanonicalize_repairs_propagates_cf_aliases_to_softmax_and
     assert "out_public_layout_bridge = torch.cat([box_out_cf, obj_out_cf, cls_scores], dim=1)" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_propagates_cf_aliases_to_softmax_and_keyword_torch_cat_tuple(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alias_keyword_torch_cat_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, box_out_cf: torch.Tensor, obj_out_cf: torch.Tensor, cls_logits_cf: torch.Tensor) -> torch.Tensor:",
+                "        cls_logits_nhwc = cls_logits_cf",
+                "        cls_scores = _apply_softmax(cls_logits_nhwc, axis=3, beta=1.0, target_shape=[1, 22, 22, 80])",
+                "        out_public_layout_bridge = torch.cat(tensors=(box_out_cf, obj_out_cf, cls_scores), dim=3)",
+                "        return out_public_layout_bridge",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "cls_logits_nhwc = cls_logits_cf" in rewritten
+    assert "cls_scores = _apply_softmax(cls_logits_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])" in rewritten
+    assert "out_public_layout_bridge = torch.cat([box_out_cf, obj_out_cf, cls_scores], dim=1)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_propagates_cf_aliases_to_softmax_and_keyword_apply_concat_tuple(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_alias_keyword_apply_concat_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, box_out_cf: torch.Tensor, obj_out_cf: torch.Tensor, cls_logits_cf: torch.Tensor) -> torch.Tensor:",
+                "        cls_logits_nhwc = cls_logits_cf",
+                "        cls_scores = _apply_softmax(cls_logits_nhwc, axis=3, beta=1.0, target_shape=[1, 22, 22, 80])",
+                "        out_public_layout_bridge = _apply_concat(inputs=(box_out_cf, obj_out_cf, cls_scores), axis=3, target_shape=(1, 22, 22, 85), fused='NONE')",
+                "        return out_public_layout_bridge",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "cls_logits_nhwc = cls_logits_cf" in rewritten
+    assert "cls_scores = _apply_softmax(cls_logits_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])" in rewritten
+    assert "out_public_layout_bridge = torch.cat([box_out_cf, obj_out_cf, cls_scores], dim=1)" in rewritten
+
+
 @pytest.mark.parametrize(("height", "width"), [(180, 320), (96, 160)])
 def test_apply_fast_precanonicalize_repairs_repairs_split_axis_from_cf_consumers(
     tmp_path,
@@ -8153,6 +8215,62 @@ def test_apply_fast_precanonicalize_repairs_keeps_split_axis_for_nhwc_consumers(
                 "    def forward(self, logits_nhwc: torch.Tensor) -> torch.Tensor:",
                 "        score0, score1, score2 = list(torch.tensor_split(logits_nhwc, 3, dim=_normalize_dim(3, logits_nhwc.ndim)))",
                 "        out = _apply_concat([score0, score1, score2], axis=3, target_shape=[1, 22, 22, 3], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "score0, score1, score2 = list(torch.tensor_split(logits_nhwc, 3, dim=_normalize_dim(3, logits_nhwc.ndim)))" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_repairs_split_axis_from_keyword_torch_cat_cf_consumers(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_split_keyword_torch_cat_cf_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, in_public_layout_bridge: torch.Tensor) -> torch.Tensor:",
+                "        split0, split1, split2 = list(torch.tensor_split(in_public_layout_bridge, 3, dim=_normalize_dim(3, in_public_layout_bridge.ndim)))",
+                "        fused = torch.cat(tensors=(split0, split1, split2), dim=1)",
+                "        return fused",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "torch.tensor_split(in_public_layout_bridge, 3, dim=_normalize_dim(1, in_public_layout_bridge.ndim))" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_split_axis_for_keyword_apply_concat_nhwc_consumers(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_split_keyword_apply_concat_nhwc_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, logits_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        score0, score1, score2 = list(torch.tensor_split(logits_nhwc, 3, dim=_normalize_dim(3, logits_nhwc.ndim)))",
+                "        out = _apply_concat(inputs=(score0, score1, score2), axis=3, target_shape=(1, 22, 22, 3), fused='NONE')",
                 "        return out",
                 "",
             ]
@@ -8634,6 +8752,37 @@ def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_bridge_with_generi
     assert "conv_out = self.conv_block_19(merge_tensor)" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_bridge_with_keyword_apply_concat_tuple(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_keyword_apply_concat_tuple_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, relu51_tmp0, branch0_in, branch1_in, branch2_in):",
+                "        low_resize = _apply_resize(branch0_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 16], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        mid_resize = _apply_resize(branch1_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        high_resize = _apply_resize(branch2_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 64], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        merge_tensor = _apply_concat(inputs=(relu51_tmp0, low_resize, mid_resize, high_resize), axis=3, target_shape=(1, 32, 64, 144), fused='NONE')",
+                "        conv_out = self.conv_block_19(merge_tensor)",
+                "        return conv_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "merge_tensor = torch.cat([relu51_tmp0, low_resize, mid_resize, high_resize], dim=1)" in rewritten
+    assert "conv_out = self.conv_block_19(merge_tensor)" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_prelude_with_generic_names(
     tmp_path,
 ) -> None:
@@ -8677,6 +8826,37 @@ def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_prelude_with_gener
     assert "mid_up = _apply_resize(mid_merge, [32, 64], method='bilinear', target_shape=[1, 16, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
     assert "high_merge = _align_tensor_to_target_shape(torch.add(mid_up, bridge_cf), [1, 32, 4, 4])" in rewritten
     assert "high_up = _apply_resize(high_merge, [32, 64], method='bilinear', target_shape=[1, 32, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
+    assert "merge_tensor = torch.cat([relu51_tmp0, low_up, mid_up, high_up], dim=1)" in rewritten
+    assert "conv71_out = self.conv_block_71(merge_tensor)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_permute_bridge_with_keyword_apply_concat_tuple(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_keyword_apply_concat_permute_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, relu51_tmp0, branch0_in, branch1_in, branch2_in):",
+                "        low_up = _apply_resize(branch0_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 8], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        mid_up = _apply_resize(branch1_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 16], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        high_up = _apply_resize(branch2_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        merge_tensor = _apply_concat(inputs=(relu51_tmp0, low_up, mid_up, high_up), axis=3, target_shape=(1, 32, 64, 88), fused='NONE')",
+                "        conv71_out = self.conv_block_71(_torch_permute(merge_tensor, [0, 3, 1, 2]))",
+                "        return conv71_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
     assert "merge_tensor = torch.cat([relu51_tmp0, low_up, mid_up, high_up], dim=1)" in rewritten
     assert "conv71_out = self.conv_block_71(merge_tensor)" in rewritten
 
@@ -8749,6 +8929,25 @@ def test_has_humanseg_fast_repair_signature_accepts_keyword_size_resize(
         "        mid_up = _apply_resize(input=branch1_in, size=(32, 64), method='bilinear', target_shape=(1, 32, 64, 32), align_corners=False, half_pixel_centers=True, channel_last=True)",
         "        high_up = _apply_resize(input=branch2_in, size=(32, 64), method='bilinear', target_shape=(1, 32, 64, 64), align_corners=False, half_pixel_centers=True, channel_last=True)",
         "        merge_tensor = _apply_concat(inputs=[skip_tail, low_up, mid_up, high_up], axis=3, target_shape=(1, 32, 64, 144), fused='NONE')",
+        "        conv71_out = self.conv_block_71(_torch_permute(input=merge_tensor, perm=(0, 3, 1, 2)))",
+        "        return conv71_out",
+        "",
+    ]
+
+    assert _has_humanseg_fast_repair_signature(lines) is True
+
+
+def test_has_humanseg_fast_repair_signature_accepts_reordered_keyword_resize_args(
+    tmp_path,
+) -> None:
+    lines = [
+        "import torch",
+        "class Model(torch.nn.Module):",
+        "    def forward(self, skip_tail, branch0_in, branch1_in, branch2_in):",
+        "        low_up = _apply_resize(target_shape=(1, 32, 64, 16), input=branch0_in, size=(32, 64), method='bilinear', half_pixel_centers=True, channel_last=True, align_corners=False)",
+        "        mid_up = _apply_resize(target_shape=(1, 32, 64, 32), input=branch1_in, size=(32, 64), method='bilinear', half_pixel_centers=True, channel_last=True, align_corners=False)",
+        "        high_up = _apply_resize(target_shape=(1, 32, 64, 64), input=branch2_in, size=(32, 64), method='bilinear', half_pixel_centers=True, channel_last=True, align_corners=False)",
+        "        merge_tensor = _apply_concat(inputs=(skip_tail, low_up, mid_up, high_up), axis=3, target_shape=(1, 32, 64, 144), fused='NONE')",
         "        conv71_out = self.conv_block_71(_torch_permute(input=merge_tensor, perm=(0, 3, 1, 2)))",
         "        return conv71_out",
         "",
@@ -9205,6 +9404,35 @@ def test_should_skip_expensive_raw_canonicalize_for_humanseg_with_keyword_size_r
                 "        mid_up = _apply_resize(input=mid_merge, size=(32, 64), method='bilinear', target_shape=(1, 16, 32, 64), align_corners=False, half_pixel_centers=True, channel_last=False)",
                 "        aux_up = _apply_resize(input=mid_merge, size=(32, 64), method='bilinear', target_shape=(1, 16, 32, 64), align_corners=False, half_pixel_centers=True, channel_last=False)",
                 "        merge_tensor = _apply_concat(inputs=[relu_tail, low_up, mid_up, aux_up], axis=3, target_shape=(1, 32, 64, 56), fused='NONE')",
+                "        conv_out = self.conv_block_9(_torch_permute(input=merge_tensor, perm=(0, 3, 1, 2)))",
+                "        return conv_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_humanseg_with_reordered_keyword_resize_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_reordered_keyword_resize_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, relu_tail, a, b, c, d):",
+                "        low_merge = _align_tensor_to_target_shape(torch.add(a, b), [1, 8, 16, 16])",
+                "        mid_merge = _align_tensor_to_target_shape(torch.add(c, d), [1, 16, 8, 8])",
+                "        low_up = _apply_resize(target_shape=(1, 8, 32, 64), input=low_merge, size=(32, 64), method='bilinear', half_pixel_centers=True, channel_last=False, align_corners=False)",
+                "        mid_up = _apply_resize(target_shape=(1, 16, 32, 64), input=mid_merge, size=(32, 64), method='bilinear', half_pixel_centers=True, channel_last=False, align_corners=False)",
+                "        aux_up = _apply_resize(target_shape=(1, 16, 32, 64), input=mid_merge, size=(32, 64), method='bilinear', half_pixel_centers=True, channel_last=False, align_corners=False)",
+                "        merge_tensor = _apply_concat(inputs=(relu_tail, low_up, mid_up, aux_up), axis=3, target_shape=(1, 32, 64, 56), fused='NONE')",
                 "        conv_out = self.conv_block_9(_torch_permute(input=merge_tensor, perm=(0, 3, 1, 2)))",
                 "        return conv_out",
                 "",
@@ -9844,6 +10072,58 @@ def test_should_skip_expensive_raw_canonicalize_for_version_rfb_with_generic_con
     )
 
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_version_rfb_with_compact_assignments(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_compact_assign_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, a, b, c0, c1, b0, b1):",
+                "        merge_features=_align_tensor_to_target_shape(input=torch.add(other=b, input=a), target_shape=(1, 60, 80, 64))",
+                "        head_out=self.conv_block_25(merge_features.permute(0, 3, 1, 2).contiguous())",
+                "        scores=_apply_concat(inputs=(c0, c1), axis=1, target_shape=(1, 17640, 2), fused='NONE')",
+                "        boxes=_apply_concat(inputs=(b0, b1), axis=2, target_shape=(1, 17640, 4), fused='NONE')",
+                "        return scores, boxes, head_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_version_rfb_with_compact_assignments(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_compact_assign_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add_lhs, add_rhs, cls0, cls1, box0, box1):",
+                "        detector_add=_align_tensor_to_target_shape(input=torch.add(input=add_lhs, other=add_rhs), target_shape=(1, 80, 80, 64))",
+                "        detector_conv=self.conv_block_17(detector_add.permute(0, 3, 1, 2).contiguous())",
+                "        scores=_apply_concat(inputs=(cls0, cls1), axis=1, target_shape=(1, 12800, 2), fused='NONE')",
+                "        boxes=_apply_concat(inputs=(box0, box1), axis=2, target_shape=(1, 12800, 4), fused='NONE')",
+                "        return detector_conv, scores, boxes",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
 def test_should_skip_expensive_raw_canonicalize_for_iat_llie_semantic_signature(
@@ -10967,6 +11247,32 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_with_keyw
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_with_reordered_keyword_pool_flags(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "efficientformer_reordered_pool_flags_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pooled_cf, stage_cf, residual_cf, attn_logits):",
+                "        pooled_out = _apply_pool2d(input=pooled_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=(1, 64, 40, 40), channel_last=False, is_max_pool=False)",
+                "        token_map = _align_tensor_to_target_shape(torch.add(other=residual_cf, input=stage_cf), [1, 8, 8, 320])",
+                "        attn_scores = _align_tensor_to_target_shape(torch.add(other=attn_logits, input=self.const_attn_bias), [1, 5, 64, 64])",
+                "        return pooled_out, token_map, attn_scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_with_keyword_align_wrapped_pool(
     tmp_path,
 ) -> None:
@@ -11907,6 +12213,32 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nhwc_stem_pool_bridge_wit
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nhwc_stem_pool_bridge_with_reordered_keyword_pool_flags(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "reordered_pool_flags_nhwc_stem_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, image_tensor):",
+                "        stem_cf = self.conv_block_7(image_tensor)",
+                "        stem_nhwc = _align_tensor_to_target_shape(target_shape=[1, 112, 112, 64], input=stem_cf)",
+                "        stem_pad = F.pad(input=stem_nhwc, pad=(0, 0, 1, 1, 1, 1), mode='constant', value=-3.4028234663852886e+38)",
+                "        stem_pool = _apply_pool2d(input=stem_pad, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=(1, 56, 56, 64), channel_last=True, is_max_pool=True)",
+                "        return stem_pool",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_nhwc_stem_pool_bridge_with_keyword_pad_input(
     tmp_path,
 ) -> None:
@@ -12706,6 +13038,56 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_keyword_size
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_reordered_keyword_pool_and_resize(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_reordered_pool_resize_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pyramid_cf, neck_in_nhwc, det0, det1, det2, det3):",
+                "        neck_pool_padded = F.pad(input=pyramid_cf, pad=[1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        neck_pool = _apply_pool2d(input=neck_pool_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=(1, 104, 104, 24), channel_last=True, is_max_pool=True)",
+                "        neck_up = _apply_resize(target_shape=(1, 52, 52, 96), input=neck_in_nhwc, size=(52, 52), method='bilinear', align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        return torch.cat(tensors=(det0, det1, det2, det3), dim=1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_reordered_keyword_pool_flags(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_reordered_pool_flags_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pyramid_cf, neck_in_nhwc, det0, det1, det2, det3):",
+                "        neck_pool_padded = F.pad(input=pyramid_cf, pad=(1, 1, 1, 1), mode='constant', value=-3.4028234663852886e+38)",
+                "        neck_pool = _apply_pool2d(input=neck_pool_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=(1, 104, 104, 24), channel_last=True, is_max_pool=True)",
+                "        neck_up = _apply_resize(input=neck_in_nhwc, size=(52, 52), method='bilinear', target_shape=(1, 52, 52, 96), align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        return torch.cat(tensors=(det0, det1, det2, det3), dim=1)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_not_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_three_head_branches(
     tmp_path,
 ) -> None:
@@ -12952,6 +13334,31 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_sig
                 "        pooled_out = _apply_pool2d(self.pooled_cf, channel_last=False, is_max_pool=True, target_shape=[1, 40, 60, 1], padding='VALID', stride_w=2, stride_h=2, filter_width=2, filter_height=2)",
                 "        encoder_softmax = _apply_softmax(enc_attn, beta=1.0, target_shape=[24, 6, 48, 64], axis=3)",
                 "        decoder_softmax = _apply_softmax(dec_attn, target_shape=[24, 6, 48, 64], axis=3, beta=1)",
+                "        return pooled_out, encoder_softmax, decoder_softmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_semantic_signature_with_keyword_pool_input(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "shadowformer_semantic_keyword_pool_input_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pooled_cf, enc_attn, dec_attn):",
+                "        pooled_out = _apply_pool2d(input=pooled_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='VALID', target_shape=(1, 40, 60, 1), is_max_pool=True, channel_last=False)",
+                "        encoder_softmax = _apply_softmax(input=enc_attn, axis=3, beta=1.0, target_shape=(24, 6, 48, 64))",
+                "        decoder_softmax = _apply_softmax(input=dec_attn, axis=-1, beta=1.0, target_shape=(24, 6, 48, 64))",
                 "        return pooled_out, encoder_softmax, decoder_softmax",
                 "",
             ]
@@ -19684,6 +20091,37 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_resize_tail_with
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_resize_tail_with_keyword_input_size_and_tuple_target_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_resize_keyword_tuple_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_branch_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_resize_tail_cf = _apply_resize(input=spp_branch_cf, size=(3, 5), method='bilinear', target_shape=(1, 5, 96, 3), align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        return spp_resize_tail_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_resize_tail_cf = _apply_resize(spp_branch_cf, [3, 5], method='bilinear', "
+        "target_shape=[1, 96, 3, 5], align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_resize_alias_binary_bridge_to_channel_first(tmp_path) -> None:
     package_dir = tmp_path / "resize_alias_binary_bridge_pkg"
     package_dir.mkdir()
@@ -19731,6 +20169,39 @@ def test_canonicalize_generated_model_source_rewrites_resize_alias_softmax_bridg
                 "        resize13_out_nhwc_cf = _apply_resize(cv72_out_nhwc_cf, [192, 192], method='bilinear', target_shape=[1, 192, 192, 2], align_corners=False, half_pixel_centers=True, channel_last=True)",
                 "        resize13_out_nhwc = resize13_out_nhwc_cf",
                 "        save_infer_modelscale0_tmp1 = _apply_softmax(resize13_out_nhwc, axis=1, beta=1.0, target_shape=[1, 2, 192, 192])",
+                "        return save_infer_modelscale0_tmp1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize13_out_nhwc_cf = _apply_resize(cv72_out_nhwc_cf, [192, 192], method='bilinear', "
+        "target_shape=[1, 2, 192, 192], align_corners=False, half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_resize_alias_softmax_bridge_to_channel_first_with_keyword_input_and_tuple_target_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "resize_alias_softmax_bridge_keyword_tuple_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv72_out_nhwc_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize13_out_nhwc_cf = _apply_resize(input=cv72_out_nhwc_cf, size=(192, 192), method='bilinear', target_shape=(1, 192, 192, 2), align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        resize13_out_nhwc = resize13_out_nhwc_cf",
+                "        save_infer_modelscale0_tmp1 = _apply_softmax(input=resize13_out_nhwc, axis=1, beta=1.0, target_shape=(1, 2, 192, 192))",
                 "        return save_infer_modelscale0_tmp1",
                 "",
             ]
@@ -19968,6 +20439,49 @@ def test_canonicalize_generated_model_source_keeps_dynamic_same_max_pool_shape_f
     assert "target_shape=[1, 192, 320, 1]" not in rewritten
 
 
+def test_canonicalize_generated_model_source_keeps_dynamic_same_max_pool_shape_for_cf_input_with_keyword_input_and_tuple_target_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "dynamic_cf_same_max_pool_shape_keyword_tuple_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scores_map: torch.Tensor) -> torch.Tensor:",
+                "        wadkd_max_p_out = _apply_pool2d(input=scores_map, filter_height=5, filter_width=5, stride_h=1, stride_w=1, padding='SAME', target_shape=(1, 192, 320, 1), is_max_pool=True, channel_last=False)",
+                "        return wadkd_max_p_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="dynamic_cf_same_max_pool_shape_keyword_tuple")
+    model_ir.tensors["scores_map"] = TensorIR(
+        name="scores_map",
+        dtype="FLOAT32",
+        shape=[1, 1, 192, 320],
+        shape_signature=[1, 1, 192, 320],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["wadkd_max_p_out"] = TensorIR(
+        name="wadkd_max_p_out",
+        dtype="FLOAT32",
+        shape=[1, 192, 320, 1],
+        shape_signature=[1, 192, 320, 1],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "target_shape=_tensor_shape_list(scores_map)" in rewritten
+    assert "target_shape=(1, 192, 320, 1)" not in rewritten
+
+
 def test_canonicalize_generated_model_source_rewrites_direct_torch_cat_after_cf_resize(tmp_path) -> None:
     package_dir = tmp_path / "direct_cat_after_resize_pkg"
     package_dir.mkdir()
@@ -20020,6 +20534,191 @@ def test_canonicalize_generated_model_source_rewrites_direct_torch_cat_after_cf_
         in rewritten
     )
     assert "out = torch.cat([other_cf, resize_out_nhwc], dim=1)" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_direct_torch_cat_after_cf_resize_with_keyword_input_size_and_tuple_target_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "direct_cat_after_resize_keyword_tuple_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_0(self, skip_cf: torch.Tensor, gate_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize_in_nhwc = _align_tensor_to_target_shape(torch.mul(skip_cf, gate_cf), [1, 180, 320, 32])",
+                "        resize_out_nhwc = _apply_resize(input=resize_in_nhwc, size=(180, 320), method='bilinear', target_shape=(1, 180, 320, 32), align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        return resize_out_nhwc",
+                "",
+                "    def _forward_stage_1(self, other_cf: torch.Tensor, resize_out_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        out = torch.cat([other_cf, resize_out_nhwc], dim=1)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="direct_cat_after_resize_keyword_tuple")
+    model_ir.tensors["resize_in_nhwc"] = TensorIR(
+        name="resize_in_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 32],
+        shape_signature=[1, 180, 320, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["resize_out_nhwc"] = TensorIR(
+        name="resize_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 32],
+        shape_signature=[1, 180, 320, 32],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize_in_nhwc = _align_tensor_to_target_shape(torch.mul(skip_cf, gate_cf), [1, 32, 180, 320])"
+        in rewritten
+    )
+    assert (
+        "resize_out_nhwc = _apply_resize(resize_in_nhwc, [180, 320], method='bilinear', "
+        "target_shape=[1, 32, 180, 320], align_corners=True, half_pixel_centers=False, channel_last=False)"
+        in rewritten
+    )
+    assert "out = torch.cat([other_cf, resize_out_nhwc], dim=1)" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_keyword_torch_cat_tuple_after_cf_resize(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "direct_cat_after_resize_keyword_tensors_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, skip_cf: torch.Tensor, gate_cf: torch.Tensor, other_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize_in_nhwc = _align_tensor_to_target_shape(torch.mul(skip_cf, gate_cf), [1, 180, 320, 32])",
+                "        resize_out_nhwc = _apply_resize(input=resize_in_nhwc, size=(180, 320), method='bilinear', target_shape=(1, 180, 320, 32), align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        out = torch.cat(tensors=(other_cf, resize_out_nhwc), dim=3)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="direct_cat_after_resize_keyword_tensors")
+    model_ir.tensors["resize_in_nhwc"] = TensorIR(
+        name="resize_in_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 32],
+        shape_signature=[1, 180, 320, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["resize_out_nhwc"] = TensorIR(
+        name="resize_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 32],
+        shape_signature=[1, 180, 320, 32],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize_out_nhwc = _apply_resize(resize_in_nhwc, [180, 320], method='bilinear', "
+        "target_shape=[1, 32, 180, 320], align_corners=True, half_pixel_centers=False, channel_last=False)"
+        in rewritten
+    )
+    assert "out = torch.cat([other_cf, resize_out_nhwc], dim=1)" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_keyword_apply_concat_tuple_after_cf_resize(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "direct_apply_concat_after_resize_keyword_tuple_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, skip_cf: torch.Tensor, gate_cf: torch.Tensor, other_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize_in_nhwc = _align_tensor_to_target_shape(torch.mul(skip_cf, gate_cf), [1, 180, 320, 32])",
+                "        resize_out_nhwc = _apply_resize(input=resize_in_nhwc, size=(180, 320), method='bilinear', target_shape=(1, 180, 320, 32), align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        out = _apply_concat(inputs=(other_cf, resize_out_nhwc), axis=3, target_shape=(1, 180, 320, 64), fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="direct_apply_concat_after_resize_keyword_tuple")
+    model_ir.tensors["resize_in_nhwc"] = TensorIR(
+        name="resize_in_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 32],
+        shape_signature=[1, 180, 320, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["resize_out_nhwc"] = TensorIR(
+        name="resize_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 180, 320, 32],
+        shape_signature=[1, 180, 320, 32],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize_out_nhwc = _apply_resize(resize_in_nhwc, [180, 320], method='bilinear', "
+        "target_shape=[1, 32, 180, 320], align_corners=True, half_pixel_centers=False, channel_last=False)"
+        in rewritten
+    )
+    assert "out = torch.cat([other_cf, resize_out_nhwc], dim=1)" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_binary_same_permute_with_keyword_torch_cat_tuple(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "binary_same_permute_keyword_torch_cat_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, lhs_cf: torch.Tensor, rhs_cf: torch.Tensor) -> torch.Tensor:",
+                "        add_out = torch.add(lhs_cf.permute(0, 2, 1).contiguous(), rhs_cf.permute(0, 2, 1).contiguous())",
+                "        sub_out = torch.sub(lhs_cf.permute(0, 2, 1).contiguous(), rhs_cf.permute(0, 2, 1).contiguous())",
+                "        out = torch.cat(tensors=(add_out, sub_out), dim=2)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "add_out = torch.add(lhs_cf, rhs_cf)" in rewritten
+    assert "sub_out = torch.sub(lhs_cf, rhs_cf)" in rewritten
+    assert "out = torch.cat([add_out, sub_out], dim=2)" in rewritten
 
 
 def test_canonicalize_generated_model_source_preserves_channel_last_pool_before_lrn(
