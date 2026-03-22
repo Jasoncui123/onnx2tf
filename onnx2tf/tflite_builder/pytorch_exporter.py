@@ -23997,46 +23997,80 @@ def _canonicalize_generated_model_source_for_raw_export(
         resize12_match = apply_resize_nhwc_re.match(lines[index + 2])
         concat_match = concat_re.match(lines[index + 3])
         conv_match = permuted_cf_module_input_re.match(lines[index + 4])
+        concat_inputs = (
+            [
+                input_name.strip()
+                for input_name in str(concat_match.group("inputs")).split(",")
+                if input_name.strip()
+            ]
+            if concat_match is not None
+            else []
+        )
         if (
             resize10_match is None
             or resize11_match is None
             or resize12_match is None
             or concat_match is None
             or conv_match is None
-            or str(resize10_match.group("lhs")) != "resize10_out_nhwc"
-            or str(resize11_match.group("lhs")) != "resize11_out_nhwc"
-            or str(resize12_match.group("lhs")) != "resize12_out"
-            or str(concat_match.group("lhs")) != "cv71_in"
-            or str(conv_match.group("lhs")) != "cv72_in_cf"
-            or str(conv_match.group("src")) != "cv71_in"
+            or str(conv_match.group("module")) != "self.conv_block_71"
+            or len(concat_inputs) != 4
+            or concat_inputs[1] != str(resize10_match.group("lhs"))
+            or concat_inputs[2] != str(resize11_match.group("lhs"))
+            or concat_inputs[3] != str(resize12_match.group("lhs"))
+            or str(conv_match.group("src")) != str(concat_match.group("lhs"))
         ):
             index += 1
             continue
+        resize10_shape = [
+            int(resize10_match.group("n")),
+            int(resize10_match.group("c")),
+            int(resize10_match.group("out_h")),
+            int(resize10_match.group("out_w")),
+        ]
+        resize11_shape = [
+            int(resize11_match.group("n")),
+            int(resize11_match.group("c")),
+            int(resize11_match.group("out_h")),
+            int(resize11_match.group("out_w")),
+        ]
+        resize12_shape = [
+            int(resize12_match.group("n")),
+            int(resize12_match.group("c")),
+            int(resize12_match.group("out_h")),
+            int(resize12_match.group("out_w")),
+        ]
         lines[index] = (
-            f"{resize10_match.group('indent')}resize10_out_nhwc = _apply_resize("
-            f"resize10_in_nhwc, [48, 48], method='{resize10_match.group('method')}', "
-            f"target_shape=[1, 32, 48, 48], align_corners={resize10_match.group('align')}, "
+            f"{resize10_match.group('indent')}{resize10_match.group('lhs')} = _apply_resize("
+            f"{resize10_match.group('input')}, [{resize10_match.group('out_h')}, {resize10_match.group('out_w')}], "
+            f"method='{resize10_match.group('method')}', target_shape={repr(resize10_shape)}, align_corners={resize10_match.group('align')}, "
             f"half_pixel_centers={resize10_match.group('hpc')}, channel_last=False)"
         )
         lines[index + 1] = (
-            f"{resize11_match.group('indent')}resize11_out_nhwc = _apply_resize("
-            f"resize11_in_nhwc, [48, 48], method='{resize11_match.group('method')}', "
-            f"target_shape=[1, 64, 48, 48], align_corners={resize11_match.group('align')}, "
+            f"{resize11_match.group('indent')}{resize11_match.group('lhs')} = _apply_resize("
+            f"{resize11_match.group('input')}, [{resize11_match.group('out_h')}, {resize11_match.group('out_w')}], "
+            f"method='{resize11_match.group('method')}', target_shape={repr(resize11_shape)}, align_corners={resize11_match.group('align')}, "
             f"half_pixel_centers={resize11_match.group('hpc')}, channel_last=False)"
         )
         lines[index + 2] = (
-            f"{resize12_match.group('indent')}resize12_out = _apply_resize("
-            f"resize12_in, [48, 48], method='{resize12_match.group('method')}', "
-            f"target_shape=[1, 128, 48, 48], align_corners={resize12_match.group('align')}, "
+            f"{resize12_match.group('indent')}{resize12_match.group('lhs')} = _apply_resize("
+            f"{resize12_match.group('input')}, [{resize12_match.group('out_h')}, {resize12_match.group('out_w')}], "
+            f"method='{resize12_match.group('method')}', target_shape={repr(resize12_shape)}, align_corners={resize12_match.group('align')}, "
             f"half_pixel_centers={resize12_match.group('hpc')}, channel_last=False)"
         )
         lines[index + 3] = (
-            f"{concat_match.group('indent')}cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)"
+            f"{concat_match.group('indent')}{concat_match.group('lhs')} = torch.cat([{', '.join(concat_inputs)}], dim=1)"
         )
         lines[index + 4] = (
-            f"{conv_match.group('indent')}cv72_in_cf = self.conv_block_71(cv71_in)"
+            f"{conv_match.group('indent')}{conv_match.group('lhs')} = {conv_match.group('module')}({concat_match.group('lhs')})"
         )
-        cf_aliases.update({"resize10_in_nhwc", "resize11_in_nhwc", "resize12_in", "resize10_out_nhwc", "resize11_out_nhwc", "resize12_out", "cv71_in"})
+        cf_aliases.update(
+            {
+                str(resize10_match.group("lhs")),
+                str(resize11_match.group("lhs")),
+                str(resize12_match.group("lhs")),
+                str(concat_match.group("lhs")),
+            }
+        )
         changed = True
         index += 5
     for index, line in enumerate(lines):
@@ -31506,6 +31540,9 @@ def _has_humanseg_fast_repair_signature(lines: Sequence[str]) -> bool:
     conv71_permute_assign_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = self\.conv_block_71\(_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)\)$"
     )
+    conv71_permuted_cf_assign_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = self\.conv_block_71\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+    )
     for index in range(len(lines) - 4):
         line0 = str(lines[index]).lstrip()
         line1 = str(lines[index + 1]).lstrip()
@@ -31515,6 +31552,7 @@ def _has_humanseg_fast_repair_signature(lines: Sequence[str]) -> bool:
         concat_match = concat_assign_re.match(line3)
         conv_match = conv71_assign_re.match(line4)
         conv_permute_match = conv71_permute_assign_re.match(line4)
+        conv_permuted_cf_match = conv71_permuted_cf_assign_re.match(line4)
         if (
             resize_assign_re.match(line0) is not None
             and resize_assign_re.match(line1) is not None
@@ -31528,6 +31566,10 @@ def _has_humanseg_fast_repair_signature(lines: Sequence[str]) -> bool:
                 or (
                     conv_permute_match is not None
                     and str(conv_permute_match.group("src")) == str(concat_match.group("lhs"))
+                )
+                or (
+                    conv_permuted_cf_match is not None
+                    and str(conv_permuted_cf_match.group("src")) == str(concat_match.group("lhs"))
                 )
             )
         ):

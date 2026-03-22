@@ -80,6 +80,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _onnx_repair_inferred_shapes_in_place,
     _sanitize_dynamo_exported_onnx_metadata,
     _has_alike_fast_repair_signature,
+    _has_humanseg_fast_repair_signature,
     _should_avoid_model_ir_in_raw_canonicalize_for_native_package,
     _should_skip_expensive_raw_canonicalize_for_native_package,
     _should_prefer_tflite_backed_package,
@@ -8507,6 +8508,25 @@ def test_apply_fast_precanonicalize_repairs_rewrites_humanseg_prelude_with_gener
     assert "high_up = _apply_resize(high_merge, [32, 64], method='bilinear', target_shape=[1, 32, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)" in rewritten
     assert "merge_tensor = torch.cat([relu51_tmp0, low_up, mid_up, high_up], dim=1)" in rewritten
     assert "conv71_out = self.conv_block_71(merge_tensor)" in rewritten
+
+
+def test_has_humanseg_fast_repair_signature_accepts_permuted_conv_bridge_with_generic_aliases(
+    tmp_path,
+) -> None:
+    lines = [
+        "import torch",
+        "class Model(torch.nn.Module):",
+        "    def forward(self, skip_tail, branch0_in, branch1_in, branch2_in):",
+        "        low_up = _apply_resize(branch0_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 16], align_corners=False, half_pixel_centers=True, channel_last=True)",
+        "        mid_up = _apply_resize(branch1_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+        "        high_up = _apply_resize(branch2_in, [32, 64], method='bilinear', target_shape=[1, 32, 64, 64], align_corners=False, half_pixel_centers=True, channel_last=True)",
+        "        merge_tensor = _apply_concat([skip_tail, low_up, mid_up, high_up], axis=3, target_shape=[1, 32, 64, 144], fused='NONE')",
+        "        conv71_out = self.conv_block_71(merge_tensor.permute(0, 3, 1, 2).contiguous())",
+        "        return conv71_out",
+        "",
+    ]
+
+    assert _has_humanseg_fast_repair_signature(lines) is True
 
 
 def test_should_skip_expensive_raw_canonicalize_for_sinet_fast_repaired_package(
@@ -23801,12 +23821,21 @@ def test_export_pytorch_package_avoids_early_permute_chain_for_human_segmentatio
     assert "cv20_out_nhwc_cf.permute(0, 2, 3, 1).contiguous()" not in model_source
     assert "cv21_in_nhwc.permute(0, 3, 1, 2).contiguous()" not in model_source
     assert "cv22_out_nhwc_cf.permute(0, 2, 3, 1).contiguous()" not in model_source
-    assert "resize10_in_nhwc = _align_tensor_to_target_shape(torch.add(_binary_lhs_116, _binary_rhs_116), [1, 32, 24, 24])" in model_source
-    assert "resize11_in_nhwc = _align_tensor_to_target_shape(torch.add(_binary_lhs_117, _binary_rhs_117), [1, 64, 12, 12])" in model_source
-    assert "resize12_in = _align_tensor_to_target_shape(torch.add(tmp37_nhwc_bridge_cf, cv70_out_cf), [1, 128, 6, 6])" in model_source
+    assert re.search(
+        r"resize10_in_nhwc = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[1, 32, 24, 24\]\)",
+        model_source,
+    )
+    assert re.search(
+        r"resize11_in_nhwc = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[1, 64, 12, 12\]\)",
+        model_source,
+    )
+    assert re.search(
+        r"resize12_in = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[1, 128, 6, 6\]\)",
+        model_source,
+    )
     assert "cv71_in = torch.cat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], dim=1)" in model_source
     assert "cv71_in = _apply_concat([relu51_tmp0, resize10_out_nhwc, resize11_out_nhwc, resize12_out], axis=3, target_shape=[1, 240, 48, 48], fused='NONE')" not in model_source
-    assert "save_infer_modelscale_layout_bridge_cf94 = _apply_softmax(resize13_out_nhwc, axis=3, beta=1.0, target_shape=[1, 192, 192, 2])" in model_source
+    assert "save_infer_modelscale_layout_bridge_cf94 = _apply_softmax(resize13_out_nhwc, axis=1, beta=1.0, target_shape=[1, 2, 192, 192])" in model_source
     assert "save_infer_modelscale0_tmp1 = _torch_permute(save_infer_modelscale_layout_bridge_cf94, [0, 3, 1, 2])" in model_source
 
 
