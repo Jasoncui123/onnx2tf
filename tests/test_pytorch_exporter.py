@@ -70,6 +70,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _fold_channel_last_affine_conv_bridges,
     _fold_inverse_permute_round_trips_in_exported_program_archive,
     _fold_channel_first_hardsigmoid_gate_conv_bridges,
+    _rewrite_channel_first_se_scale_binary_bridges,
     _fold_boundary_transpose_pad_conv_bridges,
     _fold_channel_last_prelu_bridges,
     _fold_rank4_reshape_permute_conv_bridges,
@@ -3661,6 +3662,44 @@ def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis_
         in rewritten
     )
     assert "upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_cf_hardsigmoid_gate_and_se_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_cf_gate_se_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def _forward_stage_0(self, features_cf: torch.Tensor) -> torch.Tensor:",
+                "        gate_mul = torch.mul(features_cf, 0.1666666716337204)",
+                "        gate_add = _align_tensor_to_target_shape(torch.add(gate_mul, 0.5), [1, 64, 128, 16])",
+                "        gate_sig = torch.clamp(gate_add, min=0.0, max=1.0)",
+                "        _binary_rhs_0, _binary_lhs_0 = _align_binary_inputs_to_anchor(gate_sig, features_cf, [1, 128, 64, 16])",
+                "        gated_cf = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [int(_binary_lhs_0.shape[0]), 16, int(_binary_lhs_0.shape[2]), int(_binary_lhs_0.shape[3])])",
+                "        feature_cf = self.conv_block_0(gated_cf)",
+                "        feature_nhwc = _align_tensor_to_target_shape(feature_cf.permute(0, 2, 3, 1).contiguous(), [1, 16, 32, 120])",
+                "        gap_cf = torch.mean(feature_cf, dim=[2, 3], keepdim=True)",
+                "        scale_cf = self.conv_block_1(gap_cf)",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(scale_cf, feature_nhwc, [1, 16, 32, 120])",
+                "        scaled_cf = _align_tensor_to_target_shape(torch.mul(_binary_lhs_1, _binary_rhs_1), [int(_binary_lhs_1.shape[0]), 120, int(_binary_lhs_1.shape[2]), int(_binary_lhs_1.shape[3])])",
+                "        return scaled_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs_until_stable(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "gate_sig = torch.nn.functional.hardsigmoid(features_cf)" in rewritten
+    assert "gated_cf = torch.mul(features_cf, gate_sig)" in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_stage(
@@ -42933,6 +42972,72 @@ def test_fold_channel_first_hardsigmoid_gate_conv_bridges_accepts_helper_permute
         "        y0 = self.conv_block_62(gated_nhwc)",
         "        gap = torch.mean(gated_nhwc, dim=[2, 3], keepdim=True)",
         "        ygap = self.conv_block_66(gap)",
+    ]
+
+
+def test_fold_channel_first_hardsigmoid_gate_conv_bridges_accepts_direct_conv_and_return() -> None:
+    lines = [
+        "        gate_mul = torch.mul(features_cf, 0.1666666716337204)",
+        "        gate_add = _align_tensor_to_target_shape(torch.add(gate_mul, 0.5), [1, 64, 128, 16])",
+        "        gate_sig = torch.clamp(gate_add, min=0.0, max=1.0)",
+        "        _binary_rhs_0, _binary_lhs_0 = _align_binary_inputs_to_anchor(gate_sig, features_cf, [1, 64, 128, 16])",
+        "        gated_nhwc = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [1, 64, 128, 16])",
+        "        y0 = self.conv_block_1(gated_nhwc)",
+        "        return gated_nhwc",
+    ]
+
+    rewritten = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+
+    assert rewritten == [
+        "        gate_sig = torch.nn.functional.hardsigmoid(features_cf)",
+        "        gated_nhwc = torch.mul(features_cf, gate_sig)",
+        "        y0 = self.conv_block_1(gated_nhwc)",
+        "        return gated_nhwc",
+    ]
+
+
+def test_fold_channel_first_hardsigmoid_gate_conv_bridges_accepts_dynamic_cf_mul_target() -> None:
+    lines = [
+        "        gate_mul = torch.mul(features_cf, 0.1666666716337204)",
+        "        gate_add = _align_tensor_to_target_shape(torch.add(gate_mul, 0.5), [1, 64, 128, 16])",
+        "        gate_sig = torch.clamp(gate_add, min=0.0, max=1.0)",
+        "        _binary_rhs_0, _binary_lhs_0 = _align_binary_inputs_to_anchor(gate_sig, features_cf, [1, 64, 128, 16])",
+        "        gated_nhwc = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [int(_binary_lhs_0.shape[0]), 16, int(_binary_lhs_0.shape[2]), int(_binary_lhs_0.shape[3])])",
+        "        y0 = self.conv_block_1(gated_nhwc)",
+        "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs_to_anchor(skip_cf, gated_nhwc, [1, 128, 16, 64])",
+    ]
+
+    rewritten = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+
+    assert rewritten == [
+        "        gate_sig = torch.nn.functional.hardsigmoid(features_cf)",
+        "        gated_nhwc = torch.mul(features_cf, gate_sig)",
+        "        y0 = self.conv_block_1(gated_nhwc)",
+        "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs_to_anchor(skip_cf, gated_nhwc, [1, 128, 16, 64])",
+    ]
+
+
+def test_rewrite_channel_first_se_scale_binary_bridges_reanchors_permuted_feature_alias() -> None:
+    lines = [
+        "        feature_nhwc = _align_tensor_to_target_shape(feature_cf.permute(0, 2, 3, 1).contiguous(), [1, 16, 32, 120])",
+        "        gap_cf = torch.mean(feature_cf, dim=[2, 3], keepdim=True)",
+        "        squeeze_cf = self.conv_block_0(gap_cf)",
+        "        scale_cf = self.conv_block_1(squeeze_cf)",
+        "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs(scale_cf, feature_nhwc, [1, 16, 32, 120])",
+        "        gated_cf = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [int(_binary_lhs_0.shape[0]), 120, int(_binary_lhs_0.shape[2]), int(_binary_lhs_0.shape[3])])",
+        "        y0 = self.conv_block_2(gated_cf)",
+    ]
+
+    rewritten = _rewrite_channel_first_se_scale_binary_bridges(lines)
+
+    assert rewritten == [
+        "        feature_nhwc = _align_tensor_to_target_shape(feature_cf.permute(0, 2, 3, 1).contiguous(), [1, 16, 32, 120])",
+        "        gap_cf = torch.mean(feature_cf, dim=[2, 3], keepdim=True)",
+        "        squeeze_cf = self.conv_block_0(gap_cf)",
+        "        scale_cf = self.conv_block_1(squeeze_cf)",
+        "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(feature_cf, scale_cf, [1, 120, 16, 32])",
+        "        gated_cf = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [int(_binary_lhs_0.shape[0]), 120, int(_binary_lhs_0.shape[2]), int(_binary_lhs_0.shape[3])])",
+        "        y0 = self.conv_block_2(gated_cf)",
     ]
 
 

@@ -7717,7 +7717,7 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
     def _line_mentions_name(line: str, name: str) -> bool:
         return re.search(rf"\b{re.escape(name)}\b", line) is not None
 
-    def _parse_gap_mean_assign(line: str) -> Tuple[str, str, str] | None:
+    def _parse_gap_mean_assign(line: str) -> Tuple[str, str, str, List[int]] | None:
         assign = _parse_simple_assignment_line(line)
         if assign is None:
             return None
@@ -7762,11 +7762,11 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
             dim_list = [int(v) for v in dim_value]
         else:
             return None
-        if dim_list != [1, 2]:
+        if dim_list not in ([1, 2], [2, 3]):
             return None
         if keepdim_expr is not None and keepdim_expr != "True":
             return None
-        return indent, lhs, input_expr
+        return indent, lhs, input_expr, list(dim_list)
 
     def _parse_cf_conv_assign(line: str) -> Tuple[str, str, str, str] | None:
         assign = _parse_simple_assignment_line(line)
@@ -7779,6 +7779,12 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
         )
         if match is not None:
             return indent, lhs, str(match.group("module")), str(match.group("input"))
+        direct_match = re.fullmatch(
+            r"self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)",
+            rhs.strip(),
+        )
+        if direct_match is not None:
+            return indent, lhs, str(direct_match.group("module")), str(direct_match.group("input"))
         stripped = rhs.strip()
         prefix = "self."
         open_paren = stripped.find("(")
@@ -7923,6 +7929,53 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
             return None
         return indent, lhs, str(binary_args[0]).strip(), str(binary_args[1]).strip(), list(target_shape)
 
+    def _parse_cf_dynamic_mul_out_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, str, int] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, target_expr = align_parts
+        binary_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", input_expr.strip())
+        if binary_match is None:
+            return None
+        binary_args = _parse_binary_mul_args(str(binary_match.group("args")))
+        if (
+            binary_args is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", str(binary_args[0]).strip()) is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", str(binary_args[1]).strip()) is None
+        ):
+            return None
+        target_match = re.fullmatch(
+            r"\[int\((?P<ref>[A-Za-z0-9_]+)\.shape\[0\]\), (?P<c>\d+), "
+            r"int\((?P=ref)\.shape\[2\]\), int\((?P=ref)\.shape\[3\]\)\]",
+            target_expr.strip(),
+        )
+        if target_match is None:
+            return None
+        return (
+            indent,
+            lhs,
+            str(binary_args[0]).strip(),
+            str(binary_args[1]).strip(),
+            str(target_match.group("ref")),
+            int(target_match.group("c")),
+        )
+
+    def _parse_return_identifier(line: str) -> str | None:
+        stripped = str(line).strip()
+        direct_match = re.fullmatch(r"return\s+(?P<value>[A-Za-z0-9_]+)", stripped)
+        if direct_match is not None:
+            return str(direct_match.group("value"))
+        parenthesized_match = re.fullmatch(r"return\s+\(\s*(?P<value>[A-Za-z0-9_]+)\s*\)", stripped)
+        if parenthesized_match is not None:
+            return str(parenthesized_match.group("value"))
+        return None
+
     index = 0
     while index <= len(rewritten) - 5:
         mul_match = _parse_scalar_mul_assign(rewritten[index])
@@ -7930,12 +7983,13 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
         clamp_match = clamp_re.match(rewritten[index + 2])
         anchor_match = _parse_anchor_assign(rewritten[index + 3])
         mul_out_match = _parse_mul_out_assign(rewritten[index + 4])
+        mul_out_cf_match = _parse_cf_dynamic_mul_out_assign(rewritten[index + 4])
         if (
             mul_match is None
             or add_match is None
             or clamp_match is None
             or anchor_match is None
-            or mul_out_match is None
+            or (mul_out_match is None and mul_out_cf_match is None)
         ):
             index += 1
             continue
@@ -7956,8 +8010,7 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
             str(add_match[2]) != mul_out
             or str(clamp_match.group("input")) != add_out
             or str(anchor_match[3]) != clamp_out
-            or list(anchor_match[5]) != list(add_match[4])
-            or list(mul_out_match[4]) != list(add_match[4])
+            or sorted(int(v) for v in list(anchor_match[5])) != sorted(int(v) for v in list(add_match[4]))
         ):
             index += 1
             continue
@@ -7965,12 +8018,6 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
         if anchor_source != source_input:
             index += 1
             continue
-        anchor_lhs = {str(anchor_match[1]), str(anchor_match[2])}
-        mul_inputs = {str(mul_out_match[2]), str(mul_out_match[3])}
-        if anchor_lhs != mul_inputs:
-            index += 1
-            continue
-        gated_output = str(mul_out_match[1])
         try:
             nhwc_target = [int(v) for v in list(add_match[4])]
         except Exception:
@@ -7980,6 +8027,27 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
             index += 1
             continue
         cf_target = [nhwc_target[0], nhwc_target[3], nhwc_target[1], nhwc_target[2]]
+        anchor_lhs = {str(anchor_match[1]), str(anchor_match[2])}
+        if mul_out_match is not None:
+            if list(mul_out_match[4]) != list(add_match[4]):
+                index += 1
+                continue
+            mul_inputs = {str(mul_out_match[2]), str(mul_out_match[3])}
+            gated_output = str(mul_out_match[1])
+            gated_indent = str(mul_out_match[0])
+        else:
+            assert mul_out_cf_match is not None
+            cf_ref = str(mul_out_cf_match[4])
+            cf_channel = int(mul_out_cf_match[5])
+            if cf_ref not in anchor_lhs or cf_channel != int(cf_target[1]):
+                index += 1
+                continue
+            mul_inputs = {str(mul_out_cf_match[2]), str(mul_out_cf_match[3])}
+            gated_output = str(mul_out_cf_match[1])
+            gated_indent = str(mul_out_cf_match[0])
+        if anchor_lhs != mul_inputs:
+            index += 1
+            continue
         function_end = _function_end_index(index)
         supported_gap_vars: Set[str] = set()
         safe_to_rewrite = True
@@ -7994,19 +8062,15 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
             if mean_match is not None and str(mean_match[2]) == gated_output:
                 supported_gap_vars.add(str(mean_match[1]))
                 continue
+            return_value = _parse_return_identifier(line)
+            if return_value == gated_output:
+                continue
             anchor_cf_match = anchor_cf_re.match(line) or binary_cf_re.match(line)
             if anchor_cf_match is not None and gated_output in {
                 str(anchor_cf_match.group("input0")),
                 str(anchor_cf_match.group("input1")),
             }:
-                target = [
-                    int(anchor_cf_match.group("n")),
-                    int(anchor_cf_match.group("c")),
-                    int(anchor_cf_match.group("h")),
-                    int(anchor_cf_match.group("w")),
-                ]
-                if target == cf_target:
-                    continue
+                continue
             safe_to_rewrite = False
             break
         if not safe_to_rewrite:
@@ -8023,6 +8087,9 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
                 mean_match = _parse_gap_mean_assign(line)
                 if mean_match is not None and str(mean_match[1]) == gap_var:
                     continue
+                return_value = _parse_return_identifier(line)
+                if return_value == gap_var:
+                    continue
                 safe_to_rewrite = False
                 break
             if not safe_to_rewrite:
@@ -8038,7 +8105,7 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
         rewritten[index + 2] = ""
         rewritten[index + 3] = ""
         rewritten[index + 4] = (
-            f"{mul_out_match[0]}{gated_output} = torch.mul({source_input}, {clamp_out})"
+            f"{gated_indent}{gated_output} = torch.mul({source_input}, {clamp_out})"
         )
         for lookahead_index in range(index + 5, function_end):
             conv_match = _parse_cf_conv_assign(rewritten[lookahead_index])
@@ -8051,10 +8118,11 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
             mean_match = _parse_gap_mean_assign(rewritten[lookahead_index])
             if mean_match is not None and str(mean_match[2]) == gated_output:
                 gap_var = str(mean_match[1])
-                rewritten[lookahead_index] = (
-                    f"{mean_match[0]}{gap_var} = "
-                    f"torch.mean({gated_output}, dim=[2, 3], keepdim=True)"
-                )
+                if list(mean_match[3]) == [1, 2]:
+                    rewritten[lookahead_index] = (
+                        f"{mean_match[0]}{gap_var} = "
+                        f"torch.mean({gated_output}, dim=[2, 3], keepdim=True)"
+                    )
                 continue
             conv_match = _parse_cf_conv_assign(rewritten[lookahead_index])
             if conv_match is not None and str(conv_match[3]) in supported_gap_vars:
@@ -8064,6 +8132,168 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
                 )
         index += 5
     return [line for line in rewritten if line != ""]
+
+
+def _rewrite_channel_first_se_scale_binary_bridges(
+    lines: Sequence[str],
+) -> List[str]:
+    rewritten = [str(line) for line in lines]
+
+    def _parse_nchw_to_nhwc_bridge_source(expr: str) -> str | None:
+        stripped = str(expr).strip()
+        if stripped.endswith(".contiguous()"):
+            stripped = stripped[: -len(".contiguous()")].strip()
+
+        def _parse_permute_like_args(args: str) -> str | None:
+            parts = _split_top_level_csv_exprs(str(args))
+            if len(parts) == 2 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+                source_expr = parts[0].strip()
+                dims_expr = _normalize_permute_dims_expr(parts[1])
+                if re.fullmatch(r"[A-Za-z0-9_]+", source_expr) is not None and dims_expr == "0,2,3,1":
+                    return source_expr
+                return None
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            source_expr = kwargs.get("input", kwargs.get("x"))
+            dims_expr = kwargs.get("dims", kwargs.get("perm"))
+            if (
+                source_expr is None
+                or dims_expr is None
+                or re.fullmatch(r"[A-Za-z0-9_]+", source_expr) is None
+                or _normalize_permute_dims_expr(dims_expr) != "0,2,3,1"
+            ):
+                return None
+            return source_expr
+
+        functional_match = re.match(r"^torch\.permute\((?P<args>.+)\)$", stripped)
+        if functional_match is not None:
+            return _parse_permute_like_args(str(functional_match.group("args")))
+        helper_match = re.match(r"^_torch_permute\((?P<args>.+)\)$", stripped)
+        if helper_match is not None:
+            return _parse_permute_like_args(str(helper_match.group("args")))
+        method_match = re.match(r"^(?P<src>[A-Za-z0-9_]+)\.permute\((?P<dims>.+)\)$", stripped)
+        if method_match is not None and _normalize_permute_dims_expr(str(method_match.group("dims"))) == "0,2,3,1":
+            return str(method_match.group("src"))
+        return None
+
+    def _parse_nchw_to_nhwc_alias(line: str) -> Tuple[str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, target_expr = align_parts
+        target_shape = _parse_rank4_shape_literal(target_expr)
+        if target_shape is None:
+            return None
+        source_expr = _parse_nchw_to_nhwc_bridge_source(input_expr)
+        if source_expr is None:
+            return None
+        return lhs, source_expr, list(target_shape)
+
+    def _parse_binary_align_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, str, List[int]] | None:
+        assign_match = re.match(
+            r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*(?P<expr>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        expr = str(assign_match.group("expr")).strip()
+        prefix = "_align_binary_inputs("
+        if not expr.startswith(prefix) or not expr.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(expr[len(prefix) : -1])
+        input0: str | None = None
+        input1: str | None = None
+        target_expr: str | None = None
+        if len(parts) == 3 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input0, input1, target_expr = (part.strip() for part in parts)
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input0 = kwargs.get("input", kwargs.get("lhs"))
+            input1 = kwargs.get("other", kwargs.get("rhs"))
+            target_expr = kwargs.get("target_shape", kwargs.get("shape"))
+        target_shape = _parse_rank4_shape_literal(target_expr) if target_expr is not None else None
+        if (
+            input0 is None
+            or input1 is None
+            or target_shape is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input0) is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input1) is None
+        ):
+            return None
+        return (
+            str(assign_match.group("indent")),
+            str(assign_match.group("lhs0")),
+            str(assign_match.group("lhs1")),
+            input0,
+            input1,
+            list(target_shape),
+        )
+
+    dynamic_cf_mul_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
+        r"torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), "
+        r"\[int\((?P<ref>[A-Za-z0-9_]+)\.shape\[0\]\), (?P<c>\d+), int\((?P=ref)\.shape\[2\]\), int\((?P=ref)\.shape\[3\]\)\]\)$"
+    )
+    nhwc_alias_sources: Dict[str, Tuple[str, List[int]]] = {}
+    for line in rewritten:
+        alias_match = _parse_nchw_to_nhwc_alias(line)
+        if alias_match is None:
+            continue
+        nhwc_alias_sources[str(alias_match[0])] = (str(alias_match[1]), list(alias_match[2]))
+
+    for index in range(len(rewritten) - 1):
+        align_match = _parse_binary_align_assign(rewritten[index])
+        mul_match = dynamic_cf_mul_re.match(rewritten[index + 1])
+        if align_match is None or mul_match is None:
+            continue
+        indent, lhs0, lhs1, input0, input1, target_shape = align_match
+        feature_source: str | None = None
+        scale_source: str | None = None
+        feature_target: List[int] | None = None
+        if input1 in nhwc_alias_sources:
+            feature_source, feature_target = nhwc_alias_sources[input1]
+            scale_source = input0
+        elif input0 in nhwc_alias_sources:
+            feature_source, feature_target = nhwc_alias_sources[input0]
+            scale_source = input1
+        if feature_source is None or feature_target is None or scale_source is None:
+            continue
+        if list(target_shape) != list(feature_target):
+            continue
+        mul_inputs = {str(mul_match.group("a")), str(mul_match.group("b"))}
+        if mul_inputs != {lhs0, lhs1}:
+            continue
+        ref_var = str(mul_match.group("ref"))
+        cf_channel_dim = int(mul_match.group("c"))
+        cf_target = [int(feature_target[0]), cf_channel_dim, int(feature_target[1]), int(feature_target[2])]
+        rewritten[index] = (
+            f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor("
+            f"{feature_source}, {scale_source}, [{cf_target[0]}, {cf_target[1]}, {cf_target[2]}, {cf_target[3]}])"
+        )
+        if ref_var != lhs0:
+            rewritten[index + 1] = (
+                f"{mul_match.group('indent')}{mul_match.group('lhs')} = "
+                f"_align_tensor_to_target_shape(torch.mul({mul_match.group('a')}, {mul_match.group('b')}), "
+                f"[int({lhs0}.shape[0]), {cf_channel_dim}, int({lhs0}.shape[2]), int({lhs0}.shape[3])])"
+            )
+    return rewritten
 
 
 def _fold_boundary_transpose_pad_conv_bridges(
@@ -21343,6 +21573,7 @@ def _canonicalize_generated_model_source_for_raw_export(
     lines = _fold_channel_first_gap_conv_bridges(lines)
     lines = _repair_channel_last_gap_conv_inputs(lines)
     lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+    lines = _rewrite_channel_first_se_scale_binary_bridges(lines)
     lines = _rewrite_channel_first_gap_outputs_to_explicit_channel_last(lines)
     lines = _rewrite_channel_last_gap_means_to_reduce_mean(lines)
     model_ir_shape_map: Dict[str, List[int]] = {}
@@ -27884,7 +28115,19 @@ def _canonicalize_generated_model_source_for_raw_export(
     if finalized_lines != lines:
         lines = finalized_lines
         changed = True
+    finalized_lines = _rewrite_channel_first_se_scale_binary_bridges(lines)
+    if finalized_lines != lines:
+        lines = finalized_lines
+        changed = True
     finalized_lines = _repair_channel_last_gap_conv_inputs(lines)
+    if finalized_lines != lines:
+        lines = finalized_lines
+        changed = True
+    finalized_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+    if finalized_lines != lines:
+        lines = finalized_lines
+        changed = True
+    finalized_lines = _rewrite_channel_first_se_scale_binary_bridges(lines)
     if finalized_lines != lines:
         lines = finalized_lines
         changed = True
@@ -31749,6 +31992,15 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 f"self.{permute_module}({permute_input})"
             )
             changed = True
+
+    finalized_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+    if finalized_lines != lines:
+        lines = finalized_lines
+        changed = True
+    finalized_lines = _rewrite_channel_first_se_scale_binary_bridges(lines)
+    if finalized_lines != lines:
+        lines = finalized_lines
+        changed = True
 
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -38103,6 +38355,7 @@ def _rewrite_generated_model_source_for_exported_program(
     rewritten_lines = _repair_exported_program_channel_last_pool_targets(original_lines)
     rewritten_lines = _repair_exported_program_direct_conv_cf_add_targets(rewritten_lines)
     rewritten_lines = _fold_channel_first_hardsigmoid_gate_conv_bridges(rewritten_lines)
+    rewritten_lines = _rewrite_channel_first_se_scale_binary_bridges(rewritten_lines)
     rewritten_lines = _repair_channel_last_gap_conv_inputs(rewritten_lines)
     if rewritten_lines != original_lines:
         model_path.write_text("\n".join(rewritten_lines) + "\n", encoding="utf-8")
