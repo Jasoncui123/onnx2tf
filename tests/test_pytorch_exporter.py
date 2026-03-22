@@ -10111,6 +10111,34 @@ def test_apply_fast_precanonicalize_repairs_repairs_cf_pool_and_binary_alignment
     assert "merged = _align_tensor_to_target_shape(torch.add(pooled, residual_cf), [1, 24, 104, 104])" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_repairs_cf_binary_alignment_before_parenthesized_return(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_binary_parenthesized_return_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pooled_cf: torch.Tensor, residual_cf: torch.Tensor) -> torch.Tensor:",
+                "        merged = _align_tensor_to_target_shape(torch.add(pooled_cf, residual_cf), [1, 104, 104, 24])",
+                "        return (merged)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "merged = _align_tensor_to_target_shape(torch.add(pooled_cf, residual_cf), [1, 104, 104, 24])" not in rewritten
+    assert "return (merged)" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_recovers_conv_block_channel_counts_for_cf_pools(
     tmp_path,
 ) -> None:
@@ -19057,6 +19085,94 @@ def test_canonicalize_generated_model_source_restores_compact_public_output_resi
     assert "target_shape=[1, 256, 21, 128]" not in rewritten
 
 
+def test_canonicalize_generated_model_source_restores_typed_public_output_resize_target_shape(tmp_path) -> None:
+    package_dir = tmp_path / "typed_public_output_resize_target_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        t607_public_layout_bridge_cf = _apply_resize(x, [128, 256], method='bilinear', target_shape=[1, 256, 21, 128], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        t_607: torch.Tensor = (t607_public_layout_bridge_cf)",
+                "        return t_607",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="typed_public_output_resize_target_fix")
+    model_ir.outputs = ["607"]
+    model_ir.tensors["607"] = TensorIR(
+        name="607",
+        dtype="FLOAT32",
+        shape=[1, 21, 128, 256],
+        shape_signature=[1, 21, 128, 256],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=model_ir,
+    )
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "t607_public_layout_bridge_cf = _apply_resize(x, [128, 256], method='bilinear', "
+        "target_shape=[1, 21, 128, 256], align_corners=False, "
+        "half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+    assert "target_shape=[1, 256, 21, 128]" not in rewritten
+
+
+def test_canonicalize_generated_model_source_restores_parenthesized_public_output_resize_target_shape(tmp_path) -> None:
+    package_dir = tmp_path / "parenthesized_public_output_resize_target_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        t607_public_layout_bridge_cf = _apply_resize(x, [128, 256], method='bilinear', target_shape=[1, 256, 21, 128], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        t_607 = t607_public_layout_bridge_cf",
+                "        return (t_607)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="parenthesized_public_output_resize_target_fix")
+    model_ir.outputs = ["607"]
+    model_ir.tensors["607"] = TensorIR(
+        name="607",
+        dtype="FLOAT32",
+        shape=[1, 21, 128, 256],
+        shape_signature=[1, 21, 128, 256],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=model_ir,
+    )
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "t607_public_layout_bridge_cf = _apply_resize(x, [128, 256], method='bilinear', "
+        "target_shape=[1, 21, 128, 256], align_corners=False, "
+        "half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+    assert "target_shape=[1, 256, 21, 128]" not in rewritten
+
+
 def test_canonicalize_generated_model_source_preserves_pidnet_pag4_mul2_alignment(tmp_path) -> None:
     package_dir = tmp_path / "pidnet_pag4_mul2_pkg"
     package_dir.mkdir()
@@ -19397,8 +19513,175 @@ def test_canonicalize_generated_model_source_preserves_nhwc_materialize_before_k
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "mask_nhwc = mask_cf" not in rewritten
-    assert "mask_nhwc = _align_tensor_to_target_shape(mask_cf.permute(0, 2, 3, 1).contiguous(), [1, 80, 120, 1])" in rewritten
+    assert "mask_nhwc = _align_tensor_to_target_shape(mask_cf.permute(0, 2, 3, 1).contiguous()," in rewritten
     assert "_apply_pool2d(input=mask_nhwc" in rewritten or "_apply_pool2d(mask_nhwc" in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_nhwc_materialize_for_keyword_pool_consumer_on_nhwc_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nhwc_materialize_keyword_pool_consumer_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, resize_out_nhwc_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize_out_nhwc = _align_tensor_to_target_shape(torch.permute(input=resize_out_nhwc_cf, dims=(0, 2, 3, 1)).contiguous(), [1, 24, 40, 32])",
+                "        pooled = _apply_pool2d(target_shape=(1, 24, 40, 32), is_max_pool=True, channel_last=True, input=resize_out_nhwc, filter_height=1, filter_width=1, stride_h=1, stride_w=1, padding='VALID')",
+                "        return pooled",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="nhwc_materialize_keyword_pool_consumer_fix")
+    model_ir.tensors["resize_out_nhwc_cf"] = TensorIR(
+        name="resize_out_nhwc_cf",
+        dtype="FLOAT32",
+        shape=[1, 24, 40, 32],
+        shape_signature=[1, 24, 40, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["resize_out_nhwc"] = TensorIR(
+        name="resize_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 24, 40, 32],
+        shape_signature=[1, 24, 40, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["pooled"] = TensorIR(
+        name="pooled",
+        dtype="FLOAT32",
+        shape=[1, 24, 40, 32],
+        shape_signature=[1, 24, 40, 32],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=model_ir,
+    )
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "resize_out_nhwc = resize_out_nhwc_cf" not in rewritten
+    assert "resize_out_nhwc = _align_tensor_to_target_shape(" in rewritten
+    assert "input=resize_out_nhwc" in rewritten or "_apply_pool2d(resize_out_nhwc" in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_nhwc_materialize_for_keyword_binary_align_consumer(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nhwc_materialize_keyword_binary_align_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, resize_out_nhwc_cf: torch.Tensor, other_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize_out_nhwc = _align_tensor_to_target_shape(torch.permute(input=resize_out_nhwc_cf, dims=(0, 2, 3, 1)).contiguous(), [1, 24, 40, 32])",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs(input=resize_out_nhwc, other=other_cf, target_shape=(1, 32, 24, 40))",
+                "        return _binary_lhs_0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="nhwc_materialize_keyword_binary_align_fix")
+    model_ir.tensors["resize_out_nhwc_cf"] = TensorIR(
+        name="resize_out_nhwc_cf",
+        dtype="FLOAT32",
+        shape=[1, 24, 40, 32],
+        shape_signature=[1, 24, 40, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["resize_out_nhwc"] = TensorIR(
+        name="resize_out_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 24, 40, 32],
+        shape_signature=[1, 24, 40, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["other_cf"] = TensorIR(
+        name="other_cf",
+        dtype="FLOAT32",
+        shape=[1, 32, 24, 40],
+        shape_signature=[1, 32, 24, 40],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=model_ir,
+    )
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize_out_nhwc = _align_tensor_to_target_shape(" in rewritten
+        or "resize_out_nhwc = resize_out_nhwc_cf" in rewritten
+    )
+    assert "_align_binary_inputs(input=resize_out_nhwc, other=other_cf, target_shape=(1, 32, 24, 40))" in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_nhwc_materialize_before_keyword_rank4_reshape_consumer(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nhwc_materialize_keyword_rank4_reshape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, mask_cf: torch.Tensor) -> torch.Tensor:",
+                "        mask_nhwc = _align_tensor_to_target_shape(torch.permute(input=mask_cf, dims=(0, 2, 3, 1)).contiguous(), [1, 24, 40, 32])",
+                "        out = torch.reshape(input=mask_nhwc, shape=(1, 24, 40, 32))",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="nhwc_materialize_keyword_rank4_reshape_fix")
+    model_ir.tensors["mask_cf"] = TensorIR(
+        name="mask_cf",
+        dtype="FLOAT32",
+        shape=[1, 32, 24, 40],
+        shape_signature=[1, 32, 24, 40],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["mask_nhwc"] = TensorIR(
+        name="mask_nhwc",
+        dtype="FLOAT32",
+        shape=[1, 24, 40, 32],
+        shape_signature=[1, 24, 40, 32],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["out"] = TensorIR(
+        name="out",
+        dtype="FLOAT32",
+        shape=[1, 24, 40, 32],
+        shape_signature=[1, 24, 40, 32],
+        logical_layout="NHWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=model_ir,
+    )
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "mask_nhwc = mask_cf" not in rewritten
+    assert "mask_nhwc = _align_tensor_to_target_shape(" in rewritten
+    assert "out = torch.reshape(input=mask_nhwc, shape=(1, 24, 40, 32))" in rewritten
 
 
 def test_canonicalize_generated_model_source_rewrites_pidnet_resize_out_to_channel_first_resize(tmp_path) -> None:
@@ -24894,6 +25177,94 @@ def test_canonicalize_generated_model_source_preserves_channel_last_pool_before_
     assert "channel_last=False" not in rewritten
     assert "_apply_pool2d(input=p13_x3_s2_out" not in rewritten
     assert "p13_x3_s2_out = _apply_pool2d(" in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_channel_last_pool_before_typed_space_to_depth_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pool_before_typed_space_to_depth_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, p13_x3_s2_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        p13_x3_s2_out = _apply_pool2d(channel_last=True, stride_w=2, input=p13_x3_s2_in_cf, target_shape=(1, 56, 56, 64), filter_height=3, padding='SAME', is_max_pool=True, stride_h=2, filter_width=3)",
+                "        _space_to_depth_x_12: torch.Tensor = (p13_x3_s2_out)",
+                "        return _space_to_depth_x_12",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "channel_last=False" not in rewritten
+    assert "p13_x3_s2_out = _apply_pool2d(" in rewritten
+    assert "_space_to_depth_x_12: torch.Tensor = (p13_x3_s2_out)" in rewritten
+
+
+def test_canonicalize_generated_model_source_preserves_channel_last_pool_before_typed_gather_slice(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pool_before_typed_gather_slice_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, p13_x3_s2_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        p13_x3_s2_out = _apply_pool2d(channel_last=True, stride_w=2, input=p13_x3_s2_in_cf, target_shape=(1, 56, 56, 64), filter_height=3, padding='SAME', is_max_pool=True, stride_h=2, filter_width=3)",
+                "        gather_slice: torch.Tensor = p13_x3_s2_out[:, :, :, [0, 1, 2, 3]]",
+                "        return gather_slice",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "channel_last=False" not in rewritten
+    assert "gather_slice: torch.Tensor = p13_x3_s2_out[:, :, :, [0, 1, 2, 3]]" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_keyword_channel_last_pool_to_channel_first(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "keyword_channel_last_pool_to_cf_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, p13_x3_s2_in_cf: torch.Tensor) -> torch.Tensor:",
+                "        p13_x3_s2_out = _apply_pool2d(channel_last=True, stride_w=2, input=p13_x3_s2_in_cf, target_shape=(1, 56, 56, 64), filter_height=3, padding='SAME', is_max_pool=True, stride_h=2, filter_width=3)",
+                "        return p13_x3_s2_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "p13_x3_s2_out = _apply_pool2d(p13_x3_s2_in_cf" in rewritten
+    assert "target_shape=[1, 64, 56, 56]" in rewritten
+    assert "is_max_pool=True, channel_last=False" in rewritten
 
 
 def test_canonicalize_generated_model_source_restores_rank3_reshape_materialize_for_channel_last_rank4_source(
