@@ -3638,6 +3638,260 @@ def test_apply_fast_precanonicalize_repairs_fix_stage1_and_gather_chain(
     assert "cv79_in = cv73_out_cf[:, [0, 24, 1, 25], :, :]" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_direct_conv_aligned_add_target_to_cf(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_direct_conv_aligned_add_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=16,",
+                "            out_channels=16,",
+                "        )",
+                "",
+                "    def forward(self, lhs_cf: torch.Tensor, rhs_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(lhs_cf, rhs_nhwc, [1, 48, 48, 16])",
+                "        fused = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 48, 48, 16])",
+                "        fused = torch.relu(fused)",
+                "        out = self.conv_block_0(fused)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_align_binary_inputs_to_anchor(lhs_cf, rhs_nhwc, [1, 16, 48, 48])" in rewritten
+    assert "fused = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 16, 48, 48])" in rewritten
+    assert "[1, 48, 48, 16])" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_aligned_add_target_without_direct_conv_consumer(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_direct_conv_aligned_add_nearmiss_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=16,",
+                "            out_channels=16,",
+                "        )",
+                "",
+                "    def forward(self, lhs_cf: torch.Tensor, rhs_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(lhs_cf, rhs_nhwc, [1, 48, 48, 16])",
+                "        fused = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 48, 48, 16])",
+                "        tmp = torch.relu(fused)",
+                "        out = tmp",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_align_binary_inputs_to_anchor(lhs_cf, rhs_nhwc, [1, 48, 48, 16])" in rewritten
+    assert "fused = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 48, 48, 16])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_aligned_add_target_for_stage_boundary_conv_consumer(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_stage_boundary_add_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=32,",
+                "            out_channels=32,",
+                "        )",
+                "",
+                "    def _forward_stage_0(self, lhs_cf: torch.Tensor, rhs_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(lhs_cf, rhs_nhwc, [1, 24, 24, 32])",
+                "        fused = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 24, 24, 32])",
+                "        fused = torch.relu(fused)",
+                "        return fused",
+                "",
+                "    def forward(self, lhs_cf: torch.Tensor, rhs_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        stage0 = self._forward_stage_0(lhs_cf, rhs_nhwc)",
+                "        out = self.conv_block_0(stage0)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_align_binary_inputs_to_anchor(lhs_cf, rhs_nhwc, [1, 32, 24, 24])" in rewritten
+    assert "fused = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 32, 24, 24])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_concat_conv_branch_targets_to_cf(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_concat_conv_branches_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=112,",
+                "            out_channels=32,",
+                "        )",
+                "",
+                "    def forward(self, low_cf: torch.Tensor, low_skip_nhwc: torch.Tensor, mid_cf: torch.Tensor, mid_skip_nhwc: torch.Tensor, high_cf: torch.Tensor, high_skip_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(low_cf, low_skip_nhwc, [1, 48, 48, 16])",
+                "        low_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 48, 48, 16])",
+                "        low_merge = torch.relu(low_merge)",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs_to_anchor(mid_cf, mid_skip_nhwc, [1, 24, 24, 32])",
+                "        mid_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_1, _binary_rhs_1), [1, 24, 24, 32])",
+                "        mid_merge = torch.relu(mid_merge)",
+                "        mid_up = _apply_resize(mid_merge, [48, 48], method='bilinear', target_shape=[1, 32, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        _binary_lhs_2, _binary_rhs_2 = _align_binary_inputs_to_anchor(high_cf, high_skip_nhwc, [1, 12, 12, 64])",
+                "        high_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_2, _binary_rhs_2), [1, 12, 12, 64])",
+                "        high_merge = torch.relu(high_merge)",
+                "        high_up = _apply_resize(high_merge, [48, 48], method='bilinear', target_shape=[1, 64, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        merged = torch.cat([low_merge, mid_up, high_up], dim=1)",
+                "        out = self.conv_block_0(merged)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_align_binary_inputs_to_anchor(low_cf, low_skip_nhwc, [1, 16, 48, 48])" in rewritten
+    assert "low_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 16, 48, 48])" in rewritten
+    assert "_align_binary_inputs_to_anchor(mid_cf, mid_skip_nhwc, [1, 32, 24, 24])" in rewritten
+    assert "mid_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_1, _binary_rhs_1), [1, 32, 24, 24])" in rewritten
+    assert "_align_binary_inputs_to_anchor(high_cf, high_skip_nhwc, [1, 64, 12, 12])" in rewritten
+    assert "high_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_2, _binary_rhs_2), [1, 64, 12, 12])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_concat_conv_branch_targets_without_channel_sum_match(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_concat_conv_branches_nearmiss_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=96,",
+                "            out_channels=32,",
+                "        )",
+                "",
+                "    def forward(self, low_cf: torch.Tensor, mid_cf: torch.Tensor, mid_skip_nhwc: torch.Tensor, high_cf: torch.Tensor, high_skip_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(low_cf, low_cf, [1, 48, 48, 16])",
+                "        low_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_0, _binary_rhs_0), [1, 48, 48, 16])",
+                "        low_merge = torch.relu(low_merge)",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs_to_anchor(mid_cf, mid_skip_nhwc, [1, 24, 24, 32])",
+                "        mid_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_1, _binary_rhs_1), [1, 24, 24, 32])",
+                "        mid_merge = torch.relu(mid_merge)",
+                "        mid_up = _apply_resize(mid_merge, [48, 48], method='bilinear', target_shape=[1, 32, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        _binary_lhs_2, _binary_rhs_2 = _align_binary_inputs_to_anchor(high_cf, high_skip_nhwc, [1, 12, 12, 64])",
+                "        high_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_2, _binary_rhs_2), [1, 12, 12, 64])",
+                "        high_merge = torch.relu(high_merge)",
+                "        high_up = _apply_resize(high_merge, [48, 48], method='bilinear', target_shape=[1, 64, 48, 48], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        merged = torch.cat([low_merge, mid_up, high_up], dim=1)",
+                "        out = self.conv_block_0(merged)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_align_binary_inputs_to_anchor(mid_cf, mid_skip_nhwc, [1, 24, 24, 32])" in rewritten
+    assert "mid_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_1, _binary_rhs_1), [1, 24, 24, 32])" in rewritten
+    assert "_align_binary_inputs_to_anchor(high_cf, high_skip_nhwc, [1, 12, 12, 64])" in rewritten
+    assert "high_merge = _align_tensor_to_target_shape(torch.add(_binary_lhs_2, _binary_rhs_2), [1, 12, 12, 64])" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis(
     tmp_path,
 ) -> None:

@@ -1,8 +1,6 @@
 # onnx2tf
 A tool for converting ONNX files to LiteRT/TFLite/TensorFlow, PyTorch native code (nn.Module), TorchScript (.pt), state_dict (.pt), Exported Program (.pt2), and Dynamo ONNX. It also supports direct conversion from LiteRT to PyTorch.
 
-The process of converting from ONNX to PyTorch is far too simple for everyone to implement, so there's no point in me doing it. I am currently working on a challenge to generate native PyTorch code for NCHW from NHWC intermediate IR generated from LiteRT.
-
 You should use LiteRT Torch rather than onnx2tf. https://github.com/google-ai-edge/litert-torch and https://github.com/google-ai-edge/ai-edge-quantizer
 
 <p align="center">

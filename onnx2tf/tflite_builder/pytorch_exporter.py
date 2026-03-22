@@ -33463,6 +33463,12 @@ def _rewrite_structural_mixed_layout_binary_anchor_and_add(
     dynamic_nhwc_like_names: Set[str],
     context: _FastPrecanonicalizeRepairContext,
 ) -> bool:
+    direct_conv_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    relu_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.relu\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
     parsed_anchor = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[index])
     if parsed_anchor is None:
         return False
@@ -33486,6 +33492,160 @@ def _rewrite_structural_mixed_layout_binary_anchor_and_add(
     )
     if preferred_channel_count is None:
         return False
+    add_lhs: str | None = None
+    parsed_dynamic_add = None
+    parsed_static_add = None
+    if index + 1 < len(lines):
+        parsed_dynamic_add = _parse_dynamic_binary_add_align_assign(lines[index + 1])
+        if (
+            parsed_dynamic_add is not None
+            and {parsed_dynamic_add[2], parsed_dynamic_add[3]} == {lhs0, lhs1}
+        ):
+            add_lhs = str(parsed_dynamic_add[1])
+        else:
+            parsed_dynamic_add = None
+            parsed_static_add = _parse_static_binary_add_align_assign(lines[index + 1])
+            if (
+                parsed_static_add is not None
+                and {parsed_static_add[2], parsed_static_add[3]} == {lhs0, lhs1}
+            ):
+                add_lhs = str(parsed_static_add[1])
+            else:
+                parsed_static_add = None
+    if add_lhs is not None:
+        def _collect_local_aliases(seed_name: str, start_line: int) -> Set[str]:
+            alias_names: Set[str] = {str(seed_name)}
+            for lookahead in range(start_line, min(len(lines), start_line + 5)):
+                relu_match = relu_assign_re.match(lines[lookahead])
+                if relu_match is not None and str(relu_match.group("input")) in alias_names:
+                    alias_names.add(str(relu_match.group("lhs")))
+                    continue
+                alias_assign = _parse_simple_assignment_line(lines[lookahead])
+                rhs_expr = str(alias_assign[2]).strip() if alias_assign is not None else None
+                if (
+                    alias_assign is not None
+                    and re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr or "") is not None
+                    and rhs_expr in alias_names
+                ):
+                    alias_names.add(str(alias_assign[1]))
+            return alias_names
+
+        def _resolve_binary_add_lhs(anchor_index: int, lhs_a: str, lhs_b: str) -> str | None:
+            if anchor_index + 1 >= len(lines):
+                return None
+            downstream_dynamic_add = _parse_dynamic_binary_add_align_assign(lines[anchor_index + 1])
+            if (
+                downstream_dynamic_add is not None
+                and {downstream_dynamic_add[2], downstream_dynamic_add[3]} == {lhs_a, lhs_b}
+            ):
+                return str(downstream_dynamic_add[1])
+            downstream_static_add = _parse_static_binary_add_align_assign(lines[anchor_index + 1])
+            if (
+                downstream_static_add is not None
+                and {downstream_static_add[2], downstream_static_add[3]} == {lhs_a, lhs_b}
+            ):
+                return str(downstream_static_add[1])
+            return None
+
+        def _has_channel_first_consumer(seed_name: str, search_start: int) -> bool:
+            pending: List[Tuple[str, int, int]] = [(str(seed_name), int(search_start), 0)]
+            seen: Set[Tuple[str, int]] = set()
+            while pending:
+                current_name, current_start, depth = pending.pop(0)
+                alias_names = _collect_local_aliases(current_name, current_start)
+                for lookahead in range(current_start, len(lines)):
+                    direct_conv_match = direct_conv_assign_re.match(lines[lookahead])
+                    if (
+                        direct_conv_match is not None
+                        and str(direct_conv_match.group("input")) in alias_names
+                    ):
+                        consumer_lhs = str(direct_conv_match.group("lhs"))
+                        candidate_module = str(direct_conv_match.group("module"))
+                        candidate_channels = context.conv_block_in_channels.get(candidate_module, None)
+                        consumer_is_cf = _fast_precanonicalize_is_cf_like(
+                            consumer_lhs,
+                            dynamic_cf_like_names,
+                            context,
+                        )
+                        consumer_is_nhwc = _fast_precanonicalize_is_nhwc_like(
+                            consumer_lhs,
+                            dynamic_nhwc_like_names,
+                            context,
+                        )
+                        if (
+                            candidate_channels is not None
+                            and int(candidate_channels) == int(preferred_channel_count)
+                            and consumer_is_cf
+                            and not consumer_is_nhwc
+                        ):
+                            return True
+                if depth >= 1:
+                    continue
+                for candidate_index in range(current_start, min(len(lines), current_start + 24)):
+                    downstream_anchor = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[candidate_index])
+                    if downstream_anchor is None:
+                        continue
+                    if current_name not in {str(downstream_anchor[3]), str(downstream_anchor[4])}:
+                        continue
+                    if int(preferred_channel_count) not in list(downstream_anchor[5])[1:]:
+                        continue
+                    downstream_add_lhs = _resolve_binary_add_lhs(
+                        candidate_index,
+                        str(downstream_anchor[1]),
+                        str(downstream_anchor[2]),
+                    )
+                    if downstream_add_lhs is None:
+                        continue
+                    key = (downstream_add_lhs, depth + 1)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    pending.append((downstream_add_lhs, candidate_index + 1, depth + 1))
+            return False
+
+        alias_names = _collect_local_aliases(add_lhs, index + 2)
+        if _has_channel_first_consumer(add_lhs, index + 2):
+            normalized_cf_shape = _normalize_cf_rank4_shape(
+                current_shape,
+                preferred_channel_count=preferred_channel_count,
+            )
+            changed = False
+            rewritten_anchor = (
+                f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor("
+                f"{input_a}, {input_b}, {repr(normalized_cf_shape)})"
+            )
+            if rewritten_anchor != lines[index]:
+                lines[index] = rewritten_anchor
+                dynamic_cf_like_names.update({lhs0, lhs1})
+                dynamic_nhwc_like_names.difference_update({lhs0, lhs1})
+                context.static_shapes[lhs0] = list(normalized_cf_shape)
+                context.static_shapes[lhs1] = list(normalized_cf_shape)
+                changed = True
+            if parsed_dynamic_add is not None:
+                rewritten_add = (
+                    f"{parsed_dynamic_add[0]}{parsed_dynamic_add[1]} = _align_tensor_to_target_shape("
+                    f"torch.add({parsed_dynamic_add[2]}, {parsed_dynamic_add[3]}), {repr(normalized_cf_shape)})"
+                )
+                if rewritten_add != lines[index + 1]:
+                    lines[index + 1] = rewritten_add
+                    dynamic_cf_like_names.update(alias_names)
+                    dynamic_nhwc_like_names.difference_update(alias_names)
+                    for alias_name in alias_names:
+                        context.static_shapes[alias_name] = list(normalized_cf_shape)
+                    changed = True
+            elif parsed_static_add is not None:
+                rewritten_add = (
+                    f"{parsed_static_add[0]}{parsed_static_add[1]} = _align_tensor_to_target_shape("
+                    f"torch.add({parsed_static_add[2]}, {parsed_static_add[3]}), {repr(normalized_cf_shape)})"
+                )
+                if rewritten_add != lines[index + 1]:
+                    lines[index + 1] = rewritten_add
+                    dynamic_cf_like_names.update(alias_names)
+                    dynamic_nhwc_like_names.difference_update(alias_names)
+                    for alias_name in alias_names:
+                        context.static_shapes[alias_name] = list(normalized_cf_shape)
+                    changed = True
+            return changed
     normalized_shape = _normalize_nhwc_rank4_shape(
         current_shape,
         preferred_channel_count=preferred_channel_count,
@@ -33573,6 +33733,819 @@ def _rewrite_structural_channel_last_pool_pad_pairs(
         if rewritten_pad_line != lines[index]:
             lines[index] = rewritten_pad_line
             changed = True
+    return changed
+
+
+def _rewrite_structural_direct_conv_cf_add_targets(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    helper_def_re = re.compile(
+        r"^(?P<indent>\s*)def (?P<name>[A-Za-z0-9_]+)\("
+    )
+    helper_direct_call_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<helper>[A-Za-z0-9_]+)\(.+\)$"
+    )
+    helper_unpack_call_re = re.compile(
+        r"^(?P<indent>\s*)\(?\s*(?P<lhses>[A-Za-z0-9_, ]+)\s*\)?\s*=\s*self\.(?P<helper>[A-Za-z0-9_]+)\(.+\)$"
+    )
+    relu_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.relu\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    direct_conv_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+
+    def _is_cf_like(name: str) -> bool:
+        return _fast_precanonicalize_is_cf_like(
+            name,
+            dynamic_cf_like_names,
+            context,
+        )
+
+    def _is_nhwc_like(name: str) -> bool:
+        return _fast_precanonicalize_is_nhwc_like(
+            name,
+            dynamic_nhwc_like_names,
+            context,
+        )
+
+    def _has_mixed_layout_add_evidence(
+        add_index: int,
+        input_a: str,
+        input_b: str,
+    ) -> bool:
+        if (_is_cf_like(input_a) and _is_nhwc_like(input_b)) or (_is_cf_like(input_b) and _is_nhwc_like(input_a)):
+            return True
+        for back in range(max(0, add_index - 4), add_index):
+            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if (
+                binary_anchor_assign is None
+                or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+                != {input_a, input_b}
+            ):
+                continue
+            anchor_input_a = str(binary_anchor_assign[3])
+            anchor_input_b = str(binary_anchor_assign[4])
+            if (_is_cf_like(anchor_input_a) and _is_nhwc_like(anchor_input_b)) or (
+                _is_cf_like(anchor_input_b) and _is_nhwc_like(anchor_input_a)
+            ):
+                return True
+        return False
+
+    def _find_enclosing_helper(index: int) -> Tuple[str, int, int] | None:
+        def_index: int | None = None
+        def_name: str | None = None
+        def_indent = 0
+        for candidate_index in range(index, -1, -1):
+            helper_def_match = helper_def_re.match(lines[candidate_index])
+            if helper_def_match is None:
+                continue
+            def_index = candidate_index
+            def_name = str(helper_def_match.group("name"))
+            def_indent = len(str(helper_def_match.group("indent")))
+            break
+        if def_index is None or def_name is None:
+            return None
+        end_index = len(lines)
+        for candidate_index in range(def_index + 1, len(lines)):
+            next_def_match = helper_def_re.match(lines[candidate_index])
+            if next_def_match is None:
+                continue
+            next_indent = len(str(next_def_match.group("indent")))
+            if next_indent <= def_indent:
+                end_index = candidate_index
+                break
+        return def_name, def_index, end_index
+
+    def _find_returned_output_indexes(
+        helper_name: str,
+        helper_index: int,
+        helper_end_index: int,
+        alias_names: Set[str],
+    ) -> List[int]:
+        returned_indexes: List[int] = []
+        for candidate_index in range(helper_index + 1, helper_end_index):
+            stripped = str(lines[candidate_index]).strip()
+            if not stripped.startswith("return "):
+                continue
+            return_expr = stripped[len("return ") :].strip()
+            if re.fullmatch(r"[A-Za-z0-9_]+", return_expr) is not None:
+                if return_expr in alias_names:
+                    return [0]
+                continue
+            parts = _split_top_level_csv_exprs(_strip_outer_parentheses(return_expr))
+            for part_index, part in enumerate(parts):
+                if part.strip() in alias_names:
+                    returned_indexes.append(part_index)
+            if returned_indexes:
+                return returned_indexes
+        return []
+
+    def _resolve_stage_boundary_consumer(
+        add_index: int,
+        alias_names: Set[str],
+        preferred_channel_count: int,
+    ) -> str | None:
+        enclosing_helper = _find_enclosing_helper(add_index)
+        if enclosing_helper is None:
+            return None
+        helper_name, helper_index, helper_end_index = enclosing_helper
+        returned_output_indexes = _find_returned_output_indexes(
+            helper_name,
+            helper_index,
+            helper_end_index,
+            alias_names,
+        )
+        if not returned_output_indexes:
+            return None
+        for candidate_index in range(helper_end_index, len(lines)):
+            direct_call_match = helper_direct_call_re.match(lines[candidate_index])
+            if (
+                direct_call_match is not None
+                and str(direct_call_match.group("helper")) == helper_name
+                and 0 in returned_output_indexes
+            ):
+                caller_output = str(direct_call_match.group("lhs"))
+                for candidate_module in context.module_input_consumers.get(caller_output, []):
+                    candidate_channels = context.conv_block_in_channels.get(candidate_module, None)
+                    if candidate_channels is not None and int(candidate_channels) == int(preferred_channel_count):
+                        return str(candidate_module)
+            unpack_call_match = helper_unpack_call_re.match(lines[candidate_index])
+            if unpack_call_match is None or str(unpack_call_match.group("helper")) != helper_name:
+                continue
+            lhs_values = [value.strip() for value in str(unpack_call_match.group("lhses")).split(",") if value.strip()]
+            for returned_index in returned_output_indexes:
+                if returned_index >= len(lhs_values):
+                    continue
+                caller_output = lhs_values[returned_index]
+                for candidate_module in context.module_input_consumers.get(caller_output, []):
+                    candidate_channels = context.conv_block_in_channels.get(candidate_module, None)
+                    if candidate_channels is not None and int(candidate_channels) == int(preferred_channel_count):
+                        return str(candidate_module)
+        return None
+
+    for index, line in enumerate(lines):
+        parsed_add = _parse_static_binary_add_align_assign(line)
+        if parsed_add is None:
+            continue
+        indent, lhs, input_a, input_b, current_shape = parsed_add
+        if len(current_shape) != 4:
+            continue
+        unique_channel_count = _infer_unique_channel_count_from_rank4_shape(current_shape)
+        if unique_channel_count is not None and int(unique_channel_count) == int(current_shape[1]):
+            continue
+        if not _has_mixed_layout_add_evidence(index, input_a, input_b):
+            continue
+        preferred_channel_count = _infer_structural_rank4_channel_count(
+            lhs,
+            current_shape,
+            dynamic_cf_like_names,
+            dynamic_nhwc_like_names,
+            context,
+        )
+        if preferred_channel_count is None:
+            continue
+        normalized_shape = _normalize_cf_rank4_shape(
+            current_shape,
+            preferred_channel_count=int(preferred_channel_count),
+        )
+        if normalized_shape == current_shape:
+            continue
+        alias_names: Set[str] = {lhs}
+        consumer_module: str | None = None
+        for lookahead in range(index + 1, min(len(lines), index + 6)):
+            direct_conv_match = direct_conv_assign_re.match(lines[lookahead])
+            if (
+                direct_conv_match is not None
+                and str(direct_conv_match.group("input")) in alias_names
+            ):
+                consumer_module = str(direct_conv_match.group("module"))
+                break
+            relu_match = relu_assign_re.match(lines[lookahead])
+            if (
+                relu_match is not None
+                and str(relu_match.group("input")) in alias_names
+            ):
+                alias_names.add(str(relu_match.group("lhs")))
+                continue
+            alias_assign = _parse_simple_assignment_line(lines[lookahead])
+            if alias_assign is None:
+                continue
+            rhs_expr = str(alias_assign[2]).strip()
+            if (
+                re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr) is not None
+                and rhs_expr in alias_names
+            ):
+                alias_names.add(str(alias_assign[1]))
+        if consumer_module is None:
+            for alias_name in alias_names:
+                for candidate_module in context.module_input_consumers.get(alias_name, []):
+                    candidate_channels = context.conv_block_in_channels.get(candidate_module, None)
+                    if candidate_channels is None or int(candidate_channels) != int(preferred_channel_count):
+                        continue
+                    consumer_module = str(candidate_module)
+                    break
+                if consumer_module is not None:
+                    break
+        if consumer_module is None:
+            consumer_module = _resolve_stage_boundary_consumer(
+                index,
+                alias_names,
+                int(preferred_channel_count),
+            )
+        if consumer_module is None:
+            continue
+        consumer_channels = context.conv_block_in_channels.get(consumer_module, None)
+        if consumer_channels is None or int(consumer_channels) != int(preferred_channel_count):
+            continue
+        lines[index] = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape("
+            f"torch.add({input_a}, {input_b}), {repr(normalized_shape)})"
+        )
+        dynamic_cf_like_names.update(alias_names)
+        dynamic_nhwc_like_names.discard(lhs)
+        context.static_shapes[lhs] = list(normalized_shape)
+        changed = True
+        for back in range(max(0, index - 4), index):
+            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if (
+                binary_anchor_assign is None
+                or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+                != {input_a, input_b}
+            ):
+                continue
+            lines[back] = (
+                f"{binary_anchor_assign[0]}{binary_anchor_assign[1]}, {binary_anchor_assign[2]} = "
+                f"_align_binary_inputs_to_anchor({binary_anchor_assign[3]}, {binary_anchor_assign[4]}, "
+                f"{repr(normalized_shape)})"
+            )
+            context.static_shapes[str(binary_anchor_assign[1])] = list(normalized_shape)
+            context.static_shapes[str(binary_anchor_assign[2])] = list(normalized_shape)
+            dynamic_cf_like_names.update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
+            break
+    return changed
+
+
+def _rewrite_structural_concat_conv_cf_branch_targets(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    direct_conv_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    relu_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.relu\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+
+    def _parse_resize_assign(
+        line: str,
+    ) -> Tuple[str, str, str, Tuple[int, int], List[int], str, bool, bool, bool] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        parsed = _parse_apply_resize_input_size_shape_and_channel_last(rhs)
+        if parsed is None:
+            return None
+        input_name, size_value, shape_value, channel_last = parsed
+        if size_value is None or shape_value is None:
+            return None
+        stripped = rhs.strip()
+        if not stripped.startswith("_apply_resize(") or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len("_apply_resize(") : -1])
+        method_expr: str | None = None
+        align_expr: str | None = None
+        hpc_expr: str | None = None
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "method":
+                method_expr = value
+            elif key == "align_corners":
+                align_expr = value
+            elif key == "half_pixel_centers":
+                hpc_expr = value
+        if (
+            method_expr is None
+            or align_expr not in {"True", "False"}
+            or hpc_expr not in {"True", "False"}
+            or not (method_expr.startswith("'") and method_expr.endswith("'"))
+        ):
+            return None
+        return (
+            indent,
+            lhs,
+            input_name,
+            (int(size_value[0]), int(size_value[1])),
+            [int(v) for v in list(shape_value)],
+            method_expr[1:-1],
+            align_expr == "True",
+            hpc_expr == "True",
+            channel_last,
+        )
+
+    def _is_cf_like(name: str) -> bool:
+        return _fast_precanonicalize_is_cf_like(
+            name,
+            dynamic_cf_like_names,
+            context,
+        )
+
+    def _is_nhwc_like(name: str) -> bool:
+        return _fast_precanonicalize_is_nhwc_like(
+            name,
+            dynamic_nhwc_like_names,
+            context,
+        )
+
+    def _has_mixed_layout_add_evidence(
+        add_index: int,
+        input_a: str,
+        input_b: str,
+    ) -> bool:
+        if (_is_cf_like(input_a) and _is_nhwc_like(input_b)) or (_is_cf_like(input_b) and _is_nhwc_like(input_a)):
+            return True
+        for back in range(max(0, add_index - 4), add_index):
+            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if (
+                binary_anchor_assign is None
+                or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+                != {input_a, input_b}
+            ):
+                continue
+            anchor_input_a = str(binary_anchor_assign[3])
+            anchor_input_b = str(binary_anchor_assign[4])
+            if (_is_cf_like(anchor_input_a) and _is_nhwc_like(anchor_input_b)) or (
+                _is_cf_like(anchor_input_b) and _is_nhwc_like(anchor_input_a)
+            ):
+                return True
+        return False
+
+    assignments_by_lhs: Dict[str, List[int]] = {}
+    for idx, current_line in enumerate(lines):
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is not None:
+            assignments_by_lhs.setdefault(str(assign[1]), []).append(idx)
+
+    def _find_assignment_before(name: str, upper_bound: int) -> int | None:
+        for candidate_index in reversed(assignments_by_lhs.get(name, [])):
+            if candidate_index < upper_bound:
+                return candidate_index
+        return None
+
+    def _rewrite_rank4_add_target(
+        add_index: int,
+        normalized_shape: List[int],
+        alias_names: Set[str],
+    ) -> bool:
+        parsed_add = _parse_static_binary_add_align_assign(lines[add_index])
+        if parsed_add is None:
+            return False
+        indent, lhs, input_a, input_b, current_shape = parsed_add
+        unique_channel_count = _infer_unique_channel_count_from_rank4_shape(current_shape)
+        if unique_channel_count is not None and int(unique_channel_count) == int(current_shape[1]):
+            return False
+        if current_shape == normalized_shape:
+            return False
+        lines[add_index] = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape("
+            f"torch.add({input_a}, {input_b}), {repr(normalized_shape)})"
+        )
+        dynamic_cf_like_names.update(alias_names | {lhs})
+        dynamic_nhwc_like_names.difference_update(alias_names | {lhs})
+        for alias_name in alias_names | {lhs}:
+            context.static_shapes[str(alias_name)] = list(normalized_shape)
+        for back in range(max(0, add_index - 4), add_index):
+            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if (
+                binary_anchor_assign is None
+                or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+                != {input_a, input_b}
+            ):
+                continue
+            lines[back] = (
+                f"{binary_anchor_assign[0]}{binary_anchor_assign[1]}, {binary_anchor_assign[2]} = "
+                f"_align_binary_inputs_to_anchor({binary_anchor_assign[3]}, {binary_anchor_assign[4]}, "
+                f"{repr(normalized_shape)})"
+            )
+            context.static_shapes[str(binary_anchor_assign[1])] = list(normalized_shape)
+            context.static_shapes[str(binary_anchor_assign[2])] = list(normalized_shape)
+            dynamic_cf_like_names.update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
+            dynamic_nhwc_like_names.difference_update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
+            break
+        return True
+
+    def _resolve_branch(
+        name: str,
+        upper_bound: int,
+    ) -> Tuple[str, int, object, Set[str]] | None:
+        alias_names: Set[str] = {str(name)}
+        current_name = str(name)
+        current_upper_bound = int(upper_bound)
+        for _ in range(12):
+            assign_index = _find_assignment_before(current_name, current_upper_bound)
+            if assign_index is None:
+                return None
+            current_line = lines[assign_index]
+            resize_assign = _parse_resize_assign(current_line)
+            if resize_assign is not None and str(resize_assign[1]) == current_name:
+                alias_names.add(str(resize_assign[1]))
+                return ("resize", assign_index, resize_assign, alias_names)
+            static_add_assign = _parse_static_binary_add_align_assign(current_line)
+            if (
+                static_add_assign is not None
+                and str(static_add_assign[1]) == current_name
+                and _has_mixed_layout_add_evidence(
+                    assign_index,
+                    str(static_add_assign[2]),
+                    str(static_add_assign[3]),
+                )
+            ):
+                alias_names.add(str(static_add_assign[1]))
+                return ("add", assign_index, static_add_assign, alias_names)
+            relu_assign = relu_assign_re.match(current_line)
+            if (
+                relu_assign is not None
+                and str(relu_assign.group("lhs")) == current_name
+            ):
+                alias_names.add(current_name)
+                current_name = str(relu_assign.group("input"))
+                current_upper_bound = assign_index
+                continue
+            simple_assign = _parse_simple_assignment_line(current_line)
+            rhs_expr = str(simple_assign[2]).strip() if simple_assign is not None else None
+            if (
+                simple_assign is not None
+                and str(simple_assign[1]) == current_name
+                and re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr or "") is not None
+                and rhs_expr != current_name
+            ):
+                alias_names.add(current_name)
+                current_name = str(rhs_expr)
+                current_upper_bound = assign_index
+                continue
+            return None
+        return None
+
+    def _preferred_channel_count_for_branch(
+        branch_name: str,
+        shape: List[int],
+    ) -> int | None:
+        if len(shape) == 4:
+            if _is_cf_like(branch_name):
+                return int(shape[1])
+            if _is_nhwc_like(branch_name):
+                return int(shape[3])
+            unique_channel_count = _infer_unique_channel_count_from_rank4_shape(shape)
+            if unique_channel_count is not None:
+                return int(unique_channel_count)
+        return _infer_structural_rank4_channel_count(
+            branch_name,
+            shape,
+            dynamic_cf_like_names,
+            dynamic_nhwc_like_names,
+            context,
+        )
+
+    for index, line in enumerate(lines):
+        assign = _parse_simple_assignment_line(line)
+        torch_cat_args = _parse_torch_cat_inputs_and_dim(assign[2]) if assign is not None else None
+        if (
+            assign is None
+            or torch_cat_args is None
+            or torch_cat_args[1] != 1
+        ):
+            continue
+        cat_inputs = [name.strip() for name in torch_cat_args[0] if name.strip()]
+        if len(cat_inputs) < 2:
+            continue
+        consumer_module: str | None = None
+        for lookahead in range(index + 1, min(len(lines), index + 5)):
+            direct_conv_match = direct_conv_assign_re.match(lines[lookahead])
+            if (
+                direct_conv_match is not None
+                and str(direct_conv_match.group("input")) == str(assign[1])
+            ):
+                consumer_module = str(direct_conv_match.group("module"))
+                break
+        if consumer_module is None:
+            for candidate_module in context.module_input_consumers.get(str(assign[1]), []):
+                if candidate_module in context.conv_block_in_channels:
+                    consumer_module = str(candidate_module)
+                    break
+        if consumer_module is None:
+            continue
+        conv_in_channels = context.conv_block_in_channels.get(consumer_module, None)
+        if conv_in_channels is None:
+            continue
+        branch_specs: List[Tuple[str, int, object, Set[str], List[int], int]] = []
+        valid = True
+        for cat_input in cat_inputs:
+            resolved_branch = _resolve_branch(cat_input, index + 1)
+            if resolved_branch is None:
+                valid = False
+                break
+            branch_kind, branch_index, branch_parsed, branch_alias_names = resolved_branch
+            branch_shape = (
+                list(branch_parsed[4])
+                if branch_kind == "resize"
+                else list(branch_parsed[4])
+            )
+            if len(branch_shape) != 4:
+                valid = False
+                break
+            preferred_channel_count = _preferred_channel_count_for_branch(cat_input, branch_shape)
+            if preferred_channel_count is None:
+                valid = False
+                break
+            branch_specs.append(
+                (
+                    branch_kind,
+                    branch_index,
+                    branch_parsed,
+                    set(branch_alias_names),
+                    list(branch_shape),
+                    int(preferred_channel_count),
+                )
+            )
+        if not valid:
+            continue
+        if sum(spec[5] for spec in branch_specs) != int(conv_in_channels):
+            continue
+        branch_changed = False
+        for branch_kind, branch_index, branch_parsed, branch_alias_names, branch_shape, preferred_channel_count in branch_specs:
+            normalized_branch_shape = _normalize_cf_rank4_shape(
+                branch_shape,
+                preferred_channel_count=int(preferred_channel_count),
+                out_hw=branch_parsed[3] if branch_kind == "resize" else None,
+            )
+            if branch_kind == "resize":
+                resize_indent, resize_lhs, resize_input, resize_size, _, resize_method, resize_align, resize_hpc, _ = branch_parsed
+                rewritten_resize = (
+                    f"{resize_indent}{resize_lhs} = _apply_resize("
+                    f"{resize_input}, [{resize_size[0]}, {resize_size[1]}], "
+                    f"method='{resize_method}', target_shape={repr(normalized_branch_shape)}, "
+                    f"align_corners={resize_align}, half_pixel_centers={resize_hpc}, channel_last=False)"
+                )
+                if rewritten_resize != lines[branch_index]:
+                    lines[branch_index] = rewritten_resize
+                    branch_changed = True
+                dynamic_cf_like_names.update(branch_alias_names | {resize_lhs})
+                dynamic_nhwc_like_names.difference_update(branch_alias_names | {resize_lhs})
+                for alias_name in branch_alias_names | {resize_lhs}:
+                    context.static_shapes[str(alias_name)] = list(normalized_branch_shape)
+                resize_input_branch = _resolve_branch(str(resize_input), branch_index + 1)
+                if resize_input_branch is not None and resize_input_branch[0] == "add":
+                    input_branch_shape = list(resize_input_branch[2][4])
+                    normalized_input_shape = _normalize_cf_rank4_shape(
+                        input_branch_shape,
+                        preferred_channel_count=int(preferred_channel_count),
+                    )
+                    if _rewrite_rank4_add_target(
+                        int(resize_input_branch[1]),
+                        normalized_input_shape,
+                        set(resize_input_branch[3]),
+                    ):
+                        branch_changed = True
+            else:
+                if _rewrite_rank4_add_target(
+                    branch_index,
+                    normalized_branch_shape,
+                    branch_alias_names,
+                ):
+                    branch_changed = True
+        if branch_changed:
+            changed = True
+    return changed
+
+
+def _rewrite_structural_concat_resize_input_cf_add_targets(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    direct_conv_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    relu_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.relu\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    assignments_by_lhs: Dict[str, List[int]] = {}
+    for idx, current_line in enumerate(lines):
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is not None:
+            assignments_by_lhs.setdefault(str(assign[1]), []).append(idx)
+
+    def _find_assignment_before(name: str, upper_bound: int) -> int | None:
+        for candidate_index in reversed(assignments_by_lhs.get(name, [])):
+            if candidate_index < upper_bound:
+                return candidate_index
+        return None
+
+    def _parse_resize_assign(
+        line: str,
+    ) -> Tuple[str, str, str, Tuple[int, int], List[int], str, bool, bool, bool] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        parsed = _parse_apply_resize_input_size_shape_and_channel_last(rhs)
+        if parsed is None:
+            return None
+        input_name, size_value, shape_value, channel_last = parsed
+        if size_value is None or shape_value is None:
+            return None
+        stripped = rhs.strip()
+        if not stripped.startswith("_apply_resize(") or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len("_apply_resize(") : -1])
+        method_expr: str | None = None
+        align_expr: str | None = None
+        hpc_expr: str | None = None
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                continue
+            key, value = part.split("=", 1)
+            if key.strip() == "method":
+                method_expr = value.strip()
+            elif key.strip() == "align_corners":
+                align_expr = value.strip()
+            elif key.strip() == "half_pixel_centers":
+                hpc_expr = value.strip()
+        if (
+            method_expr is None
+            or align_expr not in {"True", "False"}
+            or hpc_expr not in {"True", "False"}
+            or not (method_expr.startswith("'") and method_expr.endswith("'"))
+        ):
+            return None
+        return (
+            indent,
+            lhs,
+            input_name,
+            (int(size_value[0]), int(size_value[1])),
+            [int(v) for v in list(shape_value)],
+            method_expr[1:-1],
+            align_expr == "True",
+            hpc_expr == "True",
+            channel_last,
+        )
+
+    def _resolve_resize_assign(name: str, upper_bound: int) -> Tuple[int, Tuple[str, str, str, Tuple[int, int], List[int], str, bool, bool, bool]] | None:
+        current_name = str(name)
+        current_upper_bound = int(upper_bound)
+        for _ in range(8):
+            assign_index = _find_assignment_before(current_name, current_upper_bound)
+            if assign_index is None:
+                return None
+            resize_assign = _parse_resize_assign(lines[assign_index])
+            if resize_assign is not None and str(resize_assign[1]) == current_name:
+                return assign_index, resize_assign
+            simple_assign = _parse_simple_assignment_line(lines[assign_index])
+            rhs_expr = str(simple_assign[2]).strip() if simple_assign is not None else ""
+            if (
+                simple_assign is not None
+                and re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr) is not None
+                and str(simple_assign[1]) == current_name
+                and rhs_expr != current_name
+            ):
+                current_name = rhs_expr
+                current_upper_bound = assign_index
+                continue
+            return None
+        return None
+
+    def _resolve_add_assign(name: str, upper_bound: int) -> Tuple[int, Tuple[str, str, str, str, List[int]]] | None:
+        current_name = str(name)
+        current_upper_bound = int(upper_bound)
+        for _ in range(8):
+            assign_index = _find_assignment_before(current_name, current_upper_bound)
+            if assign_index is None:
+                return None
+            parsed_add = _parse_static_binary_add_align_assign(lines[assign_index])
+            if parsed_add is not None and str(parsed_add[1]) == current_name:
+                return assign_index, parsed_add
+            relu_assign = relu_assign_re.match(lines[assign_index])
+            if relu_assign is not None and str(relu_assign.group("lhs")) == current_name:
+                current_name = str(relu_assign.group("input"))
+                current_upper_bound = assign_index
+                continue
+            return None
+        return None
+
+    for index, line in enumerate(lines):
+        assign = _parse_simple_assignment_line(line)
+        torch_cat_args = _parse_torch_cat_inputs_and_dim(assign[2]) if assign is not None else None
+        if assign is None or torch_cat_args is None or torch_cat_args[1] != 1:
+            continue
+        consumer_module: str | None = None
+        for lookahead in range(index + 1, min(len(lines), index + 5)):
+            direct_conv_match = direct_conv_assign_re.match(lines[lookahead])
+            if direct_conv_match is not None and str(direct_conv_match.group("input")) == str(assign[1]):
+                consumer_module = str(direct_conv_match.group("module"))
+                break
+        if consumer_module is None:
+            for candidate_module in context.module_input_consumers.get(str(assign[1]), []):
+                if candidate_module in context.conv_block_in_channels:
+                    consumer_module = str(candidate_module)
+                    break
+        if consumer_module is None:
+            continue
+        conv_in_channels = context.conv_block_in_channels.get(consumer_module)
+        if conv_in_channels is None:
+            continue
+        cat_inputs = [name.strip() for name in torch_cat_args[0] if name.strip()]
+        inferred_branch_channels: List[int] = []
+        valid = True
+        for cat_input in cat_inputs:
+            resolved_resize = _resolve_resize_assign(cat_input, index + 1)
+            if resolved_resize is not None:
+                resize_shape = list(resolved_resize[1][4])
+                preferred_channel_count = (
+                    int(resize_shape[3])
+                    if resolved_resize[1][8]
+                    else int(resize_shape[1])
+                )
+                inferred_branch_channels.append(preferred_channel_count)
+                continue
+            resolved_add = _resolve_add_assign(cat_input, index + 1)
+            if resolved_add is None:
+                valid = False
+                break
+            add_shape = list(resolved_add[1][4])
+            preferred_channel_count = _infer_structural_rank4_channel_count(
+                cat_input,
+                add_shape,
+                dynamic_cf_like_names,
+                dynamic_nhwc_like_names,
+                context,
+            )
+            if preferred_channel_count is None:
+                valid = False
+                break
+            inferred_branch_channels.append(int(preferred_channel_count))
+        if not valid or sum(inferred_branch_channels) != int(conv_in_channels):
+            continue
+        for cat_input in cat_inputs:
+            resolved_resize = _resolve_resize_assign(cat_input, index + 1)
+            if resolved_resize is None:
+                continue
+            resize_index, resize_assign = resolved_resize
+            if resize_assign[8]:
+                continue
+            preferred_channel_count = int(resize_assign[4][1])
+            resolved_add = _resolve_add_assign(str(resize_assign[2]), resize_index + 1)
+            if resolved_add is None:
+                continue
+            add_index, parsed_add = resolved_add
+            current_shape = list(parsed_add[4])
+            unique_channel_count = _infer_unique_channel_count_from_rank4_shape(current_shape)
+            if unique_channel_count is not None and int(unique_channel_count) == int(current_shape[1]):
+                continue
+            normalized_shape = _normalize_cf_rank4_shape(
+                current_shape,
+                preferred_channel_count=preferred_channel_count,
+            )
+            if normalized_shape == current_shape:
+                continue
+            lines[add_index] = (
+                f"{parsed_add[0]}{parsed_add[1]} = _align_tensor_to_target_shape("
+                f"torch.add({parsed_add[2]}, {parsed_add[3]}), {repr(normalized_shape)})"
+            )
+            context.static_shapes[str(parsed_add[1])] = list(normalized_shape)
+            dynamic_cf_like_names.add(str(parsed_add[1]))
+            dynamic_nhwc_like_names.discard(str(parsed_add[1]))
+            changed = True
+            for back in range(max(0, add_index - 4), add_index):
+                binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+                if (
+                    binary_anchor_assign is None
+                    or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+                    != {str(parsed_add[2]), str(parsed_add[3])}
+                ):
+                    continue
+                lines[back] = (
+                    f"{binary_anchor_assign[0]}{binary_anchor_assign[1]}, {binary_anchor_assign[2]} = "
+                    f"_align_binary_inputs_to_anchor({binary_anchor_assign[3]}, {binary_anchor_assign[4]}, {repr(normalized_shape)})"
+                )
+                context.static_shapes[str(binary_anchor_assign[1])] = list(normalized_shape)
+                context.static_shapes[str(binary_anchor_assign[2])] = list(normalized_shape)
+                dynamic_cf_like_names.update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
+                dynamic_nhwc_like_names.difference_update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
+                break
     return changed
 
 
@@ -33817,6 +34790,27 @@ def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
                         dynamic_cf_like_names.add(str(permute_assign[1]))
                         changed = True
                     break
+    if _rewrite_structural_concat_conv_cf_branch_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_concat_resize_input_cf_add_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_direct_conv_cf_add_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if _rewrite_structural_channel_last_pool_pad_pairs(
         lines,
         dynamic_nhwc_like_names,
@@ -33909,6 +34903,27 @@ def _apply_structural_final_model_repairs(model_path: Path) -> None:
                     dynamic_cf_like_names.add(str(bridge_lhs))
                     changed = True
                 break
+    if _rewrite_structural_concat_conv_cf_branch_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_concat_resize_input_cf_add_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_concat_resize_input_cf_add_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if _rewrite_structural_channel_last_pool_pad_pairs(
         lines,
         dynamic_nhwc_like_names,
@@ -39615,7 +40630,7 @@ def _temporarily_rewrite_generated_model_source_for_exported_program(
         )
 
         _rewrite_native_generated_model_postprocesses(model_path)
-        _apply_structural_final_model_repairs(model_path)
+        _reapply_post_export_final_model_repairs(package_path)
         yield
     finally:
         current_source = model_path.read_text(encoding="utf-8")
@@ -42125,7 +43140,7 @@ def _export_pytorch_package_from_model_ir_impl(
 
             final_model_path = Path(output_folder_path) / "model.py"
             _rewrite_native_generated_model_postprocesses(final_model_path)
-            _apply_structural_final_model_repairs(final_model_path)
+            _reapply_post_export_final_model_repairs(Path(output_folder_path))
         if native_load_specs is not None:
             state_dict = _build_native_generated_state_dict(
                 package_path=output_folder_path,
