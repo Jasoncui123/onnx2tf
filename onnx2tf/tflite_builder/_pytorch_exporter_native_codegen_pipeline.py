@@ -449,6 +449,9 @@ def _rewrite_invalid_constant_reshape_targets(model_file: Path) -> None:
     reshape_re = re.compile(
         r"torch\.reshape\(self\.(?P<attr>[A-Za-z0-9_]+), \[(?P<shape>[0-9,\s]+)\]\)"
     )
+    nested_reshape_re = re.compile(
+        r"torch\.reshape\(self\.(?P<attr>[A-Za-z0-9_]+)\.reshape\(\[(?P<inner>[0-9,\s]+)\]\), \[(?P<outer>[0-9,\s]+)\]\)"
+    )
     registered_shapes: dict[str, list[int]] = {}
     for line in lines:
         register_match = register_buffer_re.match(line)
@@ -468,6 +471,33 @@ def _rewrite_invalid_constant_reshape_targets(model_file: Path) -> None:
 
     changed = False
     for index, line in enumerate(lines):
+        nested_reshape_match = nested_reshape_re.search(line)
+        if nested_reshape_match is not None:
+            registered_shape = registered_shapes.get(str(nested_reshape_match.group("attr")), None)
+            if registered_shape is not None:
+                inner_shape = [
+                    int(token.strip())
+                    for token in str(nested_reshape_match.group("inner")).split(",")
+                    if token.strip()
+                ]
+                outer_shape = [
+                    int(token.strip())
+                    for token in str(nested_reshape_match.group("outer")).split(",")
+                    if token.strip()
+                ]
+                if _numel(outer_shape) != _numel(registered_shape):
+                    replacement_shape = (
+                        [int(v) for v in list(inner_shape)]
+                        if _numel(inner_shape) == _numel(registered_shape)
+                        else [int(v) for v in list(registered_shape)]
+                    )
+                    lines[index] = (
+                        line[: nested_reshape_match.start()]
+                        + f"self.{nested_reshape_match.group('attr')}.reshape({repr(replacement_shape)})"
+                        + line[nested_reshape_match.end() :]
+                    )
+                    changed = True
+                    continue
         reshape_match = reshape_re.search(line)
         if reshape_match is None:
             continue
@@ -485,6 +515,118 @@ def _rewrite_invalid_constant_reshape_targets(model_file: Path) -> None:
             line[: reshape_match.start()]
             + f"torch.reshape(self.{reshape_match.group('attr')}, {repr([int(v) for v in list(registered_shape)])})"
             + line[reshape_match.end() :]
+        )
+        changed = True
+    if changed:
+        model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rewrite_channel_first_const_binary_target_shapes(model_file: Path) -> None:
+    if not model_file.exists():
+        return
+    lines = model_file.read_text(encoding="utf-8").splitlines()
+    binary_with_const_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
+        r"torch\.(?P<op>add|sub|mul|div|maximum|minimum)\((?P<input>[A-Za-z0-9_]+), "
+        r"(?P<const_expr>"
+        r"(?:self\.(?P<const_attr_method>[A-Za-z0-9_]+)\.reshape\(\[\s*1\s*,\s*(?P<c_method>\d+)\s*,\s*1\s*,\s*1\s*\]\))"
+        r"|(?:torch\.reshape\(\s*self\.(?P<const_attr_func>[A-Za-z0-9_]+)\s*,\s*\[\s*1\s*,\s*(?P<c_func>\d+)\s*,\s*1\s*,\s*1\s*\]\s*\))"
+        r")\), \[(?P<shape>[0-9,\s]+)\]\)\s*$"
+    )
+
+    def _normalize_cf_target_shape(shape: list[int], channel_count: int) -> list[int] | None:
+        if len(shape) != 4:
+            return None
+        dims = [int(v) for v in list(shape[1:])]
+        if int(channel_count) not in dims:
+            return None
+        channel_index = dims.index(int(channel_count))
+        remaining = [int(v) for idx, v in enumerate(dims) if idx != channel_index]
+        if len(remaining) != 2:
+            return None
+        return [int(shape[0]), int(channel_count), int(remaining[0]), int(remaining[1])]
+
+    changed = False
+    for index, line in enumerate(lines):
+        binary_with_const_match = binary_with_const_re.match(line)
+        if binary_with_const_match is None:
+            continue
+        input_name = str(binary_with_const_match.group("input"))
+        if not (input_name.endswith("_cf") or input_name.endswith("_out_cf")):
+            continue
+        target_shape = [
+            int(token.strip())
+            for token in str(binary_with_const_match.group("shape")).split(",")
+            if token.strip()
+        ]
+        channel_count = int(
+            binary_with_const_match.group("c_method")
+            or binary_with_const_match.group("c_func")
+        )
+        normalized_shape = _normalize_cf_target_shape(target_shape, channel_count)
+        if normalized_shape is None or normalized_shape == target_shape:
+            continue
+        lines[index] = (
+            f"{binary_with_const_match.group('indent')}{binary_with_const_match.group('lhs')} = "
+            f"_align_tensor_to_target_shape(torch.{binary_with_const_match.group('op')}("
+            f"{input_name}, {binary_with_const_match.group('const_expr')}), "
+            f"{repr(normalized_shape)})"
+        )
+        changed = True
+    if changed:
+        model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rewrite_channel_first_rank4_flatten_to_nwc(model_file: Path) -> None:
+    if not model_file.exists():
+        return
+    lines = model_file.read_text(encoding="utf-8").splitlines()
+    static_shape_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?:_align_tensor_to_target_shape\(.+, \[(?P<align_shape>[0-9,\s]+)\]\)|"
+        r"_apply_pool2d\(.+target_shape=\[(?P<pool_shape>[0-9,\s]+)\], is_max_pool=(?:True|False), channel_last=False\)|"
+        r"_apply_resize\(.+target_shape=\[(?P<resize_shape>[0-9,\s]+)\].*channel_last=False\))\s*$"
+    )
+    reshape_rank3_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\("
+        r"(?P<src>[A-Za-z0-9_]+), "
+        r"_resolve_reshape_shape\(\[(?P<n>\d+), (?P<m>-?\d+), (?P<c>\d+)\], (?P=src), allow_zero=False\)\)\s*$"
+    )
+    static_shapes: dict[str, list[int]] = {}
+    changed = False
+    for index, line in enumerate(lines):
+        static_shape_match = static_shape_re.match(line)
+        if static_shape_match is not None:
+            shape_text = (
+                static_shape_match.group("align_shape")
+                or static_shape_match.group("pool_shape")
+                or static_shape_match.group("resize_shape")
+                or ""
+            )
+            static_shapes[str(static_shape_match.group("lhs"))] = [
+                int(token.strip())
+                for token in str(shape_text).split(",")
+                if token.strip()
+            ]
+            continue
+        reshape_match = reshape_rank3_re.match(line)
+        if reshape_match is None:
+            continue
+        src_shape = static_shapes.get(str(reshape_match.group("src")), None)
+        if src_shape is None or len(src_shape) != 4:
+            continue
+        target_batch = int(reshape_match.group("n"))
+        target_flat = int(reshape_match.group("m"))
+        target_channels = int(reshape_match.group("c"))
+        if target_batch != int(src_shape[0]) or target_channels != int(src_shape[1]):
+            continue
+        spatial_product = int(src_shape[2]) * int(src_shape[3])
+        if target_flat not in {-1, spatial_product}:
+            continue
+        lines[index] = (
+            f"{reshape_match.group('indent')}{reshape_match.group('lhs')} = torch.reshape("
+            f"{reshape_match.group('src')}.permute(0, 2, 3, 1).contiguous(), "
+            f"_resolve_reshape_shape([{target_batch}, {target_flat}, {target_channels}], "
+            f"{reshape_match.group('src')}, allow_zero=False))"
         )
         changed = True
     if changed:
@@ -592,6 +734,8 @@ def _rewrite_native_generated_model_postprocesses(model_file: Path) -> None:
     _rewrite_binary_aligned_target_shapes(model_file)
     _rewrite_binary_conv_bridge_target_shapes(model_file)
     _rewrite_invalid_constant_reshape_targets(model_file)
+    _rewrite_channel_first_const_binary_target_shapes(model_file)
+    _rewrite_channel_first_rank4_flatten_to_nwc(model_file)
 
 
 def _resolve_static_split_axis(

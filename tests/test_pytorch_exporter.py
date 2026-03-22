@@ -35,6 +35,8 @@ from onnx2tf.tflite_builder.model_writer import write_model_file
 from onnx2tf.tflite_builder._pytorch_exporter_native_codegen_pipeline import (
     _rewrite_binary_aligned_target_shapes,
     _rewrite_binary_conv_bridge_target_shapes,
+    _rewrite_channel_first_const_binary_target_shapes,
+    _rewrite_channel_first_rank4_flatten_to_nwc,
     _rewrite_channel_first_pool_target_shapes,
     _rewrite_invalid_constant_reshape_targets,
 )
@@ -3112,6 +3114,36 @@ def test_canonicalize_generated_model_source_materializes_runtime_cf_alias_befor
     assert (
         "onnx_shape1019 = _align_tensor_to_target_shape("
         "onnx_shape1019_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])"
+        in rewritten
+    )
+
+
+def test_rewrite_channel_first_rank4_flatten_to_nwc(
+    tmp_path,
+) -> None:
+    model_path = tmp_path / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, onnx_shape601: torch.Tensor):",
+                "        onnx_shape601 = _align_tensor_to_target_shape(torch.add(onnx_shape601, onnx_shape601), [1, 448, 7, 7])",
+                "        in324 = torch.reshape(onnx_shape601, _resolve_reshape_shape([1, -1, 448], onnx_shape601, allow_zero=False))",
+                "        return in324",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _rewrite_channel_first_rank4_flatten_to_nwc(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "in324 = torch.reshape(onnx_shape601.permute(0, 2, 3, 1).contiguous(), "
+        "_resolve_reshape_shape([1, -1, 448], onnx_shape601, allow_zero=False))"
         in rewritten
     )
 
@@ -9634,7 +9666,7 @@ def test_apply_fast_precanonicalize_repairs_restores_nhwc_alias_before_channel_l
     assert "cv0_out_nhwc = cv0_out_nhwc_cf\n" not in rewritten
 
 
-def test_apply_fast_precanonicalize_repairs_normalizes_cf_bn_mul_target_shape_with_reshaped_const(
+def test_rewrite_channel_first_const_binary_target_shapes_normalizes_cf_bn_mul_target_shape_with_reshaped_const(
     tmp_path,
 ) -> None:
     package_dir = tmp_path / "fast_precanon_cf_bn_mul_pkg"
@@ -9659,7 +9691,7 @@ def test_apply_fast_precanonicalize_repairs_normalizes_cf_bn_mul_target_shape_wi
         encoding="utf-8",
     )
 
-    _apply_fast_precanonicalize_repairs(package_dir)
+    _rewrite_channel_first_const_binary_target_shapes(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "batch_normalization53_mul_out = _align_tensor_to_target_shape(torch.mul(t453_cf, torch.reshape(self.const_BatchNormalization_53_bn_mul, [1, 48, 1, 1])), [1, 48, 80, 80])" in rewritten
@@ -34841,6 +34873,55 @@ def test_rewrite_invalid_constant_reshape_targets_uses_registered_shape(tmp_path
 
     rewritten = model_file.read_text(encoding="utf-8")
     assert "torch.reshape(self.const_demo, [1, 512, 1, 2])" in rewritten
+
+
+def test_rewrite_invalid_constant_reshape_targets_drops_invalid_outer_nested_reshape(tmp_path) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        "\n".join(
+            [
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        self.register_buffer('const_demo', torch.zeros([1, 1, 48], dtype=torch.float32), persistent=False)",
+                "    def forward(self, x):",
+                "        y = torch.mul(x, torch.reshape(self.const_demo.reshape([1, 48, 1, 1]), [1, 56, 48, 56]))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _rewrite_invalid_constant_reshape_targets(model_file)
+
+    rewritten = model_file.read_text(encoding="utf-8")
+    assert "self.const_demo.reshape([1, 48, 1, 1])" in rewritten
+    assert "torch.reshape(self.const_demo.reshape([1, 48, 1, 1]), [1, 56, 48, 56])" not in rewritten
+
+
+def test_rewrite_channel_first_const_binary_target_shapes_with_method_reshape(tmp_path) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        "\n".join(
+            [
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        self.register_buffer('const_onnx__Mul_806', torch.zeros([1, 1, 48], dtype=torch.float32), persistent=False)",
+                "    def forward(self, onnx_mul291_cf):",
+                "        onnx_add292 = _align_tensor_to_target_shape(torch.mul(onnx_mul291_cf, self.const_onnx__Mul_806.reshape([1, 48, 1, 1])), [1, 56, 56, 48])",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _rewrite_channel_first_const_binary_target_shapes(model_file)
+
+    rewritten = model_file.read_text(encoding="utf-8")
+    assert (
+        "onnx_add292 = _align_tensor_to_target_shape("
+        "torch.mul(onnx_mul291_cf, self.const_onnx__Mul_806.reshape([1, 48, 1, 1])), "
+        "[1, 48, 56, 56])"
+    ) in rewritten
 
 
 def test_rewrite_channel_first_pool_target_shapes_uses_input_channel_dim(tmp_path) -> None:

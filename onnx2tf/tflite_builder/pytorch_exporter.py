@@ -24469,6 +24469,25 @@ def _canonicalize_generated_model_source_for_raw_export(
                 or resolved_src_alias.endswith("_nhwc_cf")
                 or resolved_src_alias_tensor_name.endswith("_nhwc_cf")
             )
+            src_cf_flatten_to_nwc_matches = (
+                src_exact_shape is not None
+                and len(src_exact_shape) == 4
+                and len(target_shape) == 3
+                and src_runtime_is_cf
+                and int(target_shape[0]) == int(src_exact_shape[0])
+                and int(target_shape[2]) == int(src_exact_shape[1])
+                and int(target_shape[1]) == int(src_exact_shape[2] * src_exact_shape[3])
+            )
+            if src_cf_flatten_to_nwc_matches:
+                indent = str(rank3_reshape_from_rank4_source_assign[0])
+                lines[index] = (
+                    f"{indent}{lhs} = torch.reshape("
+                    f"{src}.permute(0, 2, 3, 1).contiguous(), "
+                    f"{target_shape})"
+                )
+                changed = True
+                line = lines[index]
+                continue
             if (
                 src_exact_shape is not None
                 and len(src_exact_shape) == 4
@@ -29246,10 +29265,10 @@ def _repair_binary_alignment_layout(
         preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
             arg_b,
             dynamic_cf_like_names,
-        dynamic_nhwc_like_names,
-        context,
-        shape_hint=current_shape,
-    )
+            dynamic_nhwc_like_names,
+            context,
+            shape_hint=current_shape,
+        )
     if _fast_precanonicalize_rank4_layout_hint(
         current_shape,
         preferred_channel_count=preferred_channel_count,
