@@ -89,6 +89,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _rewrite_channel_last_binary_bridge_chains,
     _rewrite_channel_last_gap_means_to_reduce_mean,
     _onnx_repair_inferred_shapes_in_place,
+    _patch_generated_runtime_pool2d_channel_last_recovery,
     _sanitize_dynamo_exported_onnx_metadata,
     _has_alike_fast_repair_signature,
     _has_humanseg_fast_repair_signature,
@@ -25646,6 +25647,83 @@ def test_canonicalize_generated_model_source_restores_rank3_reshape_materialize_
     assert "in31 = torch.reshape(cv6_out, [1, 66, 256])" not in rewritten
 
 
+def test_canonicalize_generated_model_source_rewrites_nhwc_cf_flatten_to_channel_first_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nhwc_cf_flatten_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self) -> None:",
+                "        super().__init__()",
+                "        self.conv_block_53 = _Conv2dBlock(",
+                "            in_channels=64,",
+                "            out_channels=256,",
+                "        )",
+                "",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        cv172_out_nhwc_cf = self.conv_block_53(x)",
+                "        t_684 = cv172_out_nhwc_cf",
+                "        t_725 = torch.reshape(t_684, [1, 256, 900])",
+                "        return t_725",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="nhwc_cf_flatten")
+    model_ir.tensors["x"] = TensorIR(
+        name="x",
+        dtype="FLOAT32",
+        shape=[1, 64, 25, 36],
+        shape_signature=[1, 64, 25, 36],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["t_684"] = TensorIR(
+        name="t_684",
+        dtype="FLOAT32",
+        shape=[1, 256, 25, 36],
+        shape_signature=[1, 256, 25, 36],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["t_725"] = TensorIR(
+        name="t_725",
+        dtype="FLOAT32",
+        shape=[1, 256, 900],
+        shape_signature=[1, 256, 900],
+        logical_layout="NWC",
+    )
+    model_ir.tensors["shape"] = TensorIR(
+        name="shape",
+        dtype="INT32",
+        shape=[3],
+        shape_signature=[3],
+        data=np.asarray([1, 256, 900], dtype=np.int32),
+        logical_layout="SCALAR_OR_VECTOR",
+    )
+    model_ir.inputs = ["x"]
+    model_ir.outputs = ["t_725"]
+    model_ir.operators = [
+        OperatorIR(
+            op_type="RESHAPE",
+            inputs=["t_684", "shape"],
+            outputs=["t_725"],
+            options={"newShape": [1, 256, 900]},
+        )
+    ]
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "t_725 = torch.reshape(t_684.permute(0, 3, 1, 2).contiguous(), [1, 256, 900])" in rewritten
+    assert "t_725 = torch.reshape(t_684, [1, 256, 900])" not in rewritten
+
+
 def test_target_shape_values_keep_internal_channel_last_tensor_shape() -> None:
     model_ir = ModelIR(name="internal_channel_last_target_shape")
     model_ir.inputs = ["x"]
@@ -42766,6 +42844,17 @@ def test_repair_channel_last_gap_conv_inputs_accepts_keyword_tuple_dims() -> Non
     ]
 
 
+def test_repair_channel_last_gap_conv_inputs_ignores_scalar_dim_mean() -> None:
+    lines = [
+        "        gap = torch.mean(features, dim=1, keepdim=True)",
+        "        y = self.conv_block_66(gap)",
+    ]
+
+    repaired = _repair_channel_last_gap_conv_inputs(lines)
+
+    assert repaired == lines
+
+
 def test_repair_channel_last_gap_conv_inputs_accepts_helper_reduce_mean() -> None:
     lines = [
         "        gap = _reduce_mean(_torch_permute(input=features_cf, perm=(0, 2, 3, 1)), _normalize_axes([1, 2], features_cf.ndim), keepdims=True)",
@@ -42820,6 +42909,17 @@ def test_fold_channel_first_gap_conv_bridges_accepts_helper_permute_input() -> N
     ]
 
 
+def test_fold_channel_first_gap_conv_bridges_ignores_scalar_dim_mean() -> None:
+    lines = [
+        "mid = torch.mean(features_cf, dim=2, keepdim=True)",
+        "y = self.conv_block_0(mid.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+    repaired = _fold_channel_first_gap_conv_bridges(lines)
+
+    assert repaired == lines
+
+
 def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_handles_compact_assignments() -> None:
     lines = [
         "gap=torch.mean(features_cf, dim=[2, 3], keepdim=True)",
@@ -42844,6 +42944,17 @@ def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_accepts_keyw
     assert repaired == [
         "gap_nhwc = torch.mean(features_cf.permute(0, 2, 3, 1).contiguous(), dim=[1, 2], keepdim=True)",
     ]
+
+
+def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_ignores_scalar_dim_mean() -> None:
+    lines = [
+        "mid = torch.mean(features_cf, dim=2, keepdim=True)",
+        "mid_nhwc = _torch_permute(mid, [0, 2, 3, 1])",
+    ]
+
+    repaired = _rewrite_channel_first_gap_outputs_to_explicit_channel_last(lines)
+
+    assert repaired == lines
 
 
 def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_accepts_helper_and_functional_permute() -> None:
@@ -44835,3 +44946,77 @@ def test_export_pytorch_package_channel_last_prelu_supports_dynamo_and_exported_
     assert Path(dynamo_onnx_path).exists()
     assert exported_program_path is not None
     assert Path(exported_program_path).exists()
+
+
+def test_patch_generated_runtime_pool2d_channel_last_recovery_fixes_mixed_layout_pool(tmp_path) -> None:
+    package_dir = tmp_path / "mixed_layout_pool_runtime"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "runtime.py").write_text(
+        "from typing import List, Optional\n\n"
+        "import torch\n"
+        "import torch.nn.functional as F\n\n"
+        "def _tensor_static_shape_list(value: torch.Tensor):\n"
+        "    return True, [int(v) for v in list(value.shape)]\n\n"
+        "def _optional_static_shape_list(target_shape: Optional[List[int]]):\n"
+        "    if target_shape is None:\n"
+        "        return False, []\n"
+        "    return True, [int(v) for v in list(target_shape)]\n\n"
+        "def _align_tensor_to_target_shape(value: torch.Tensor, target_shape: Optional[List[int]]) -> torch.Tensor:\n"
+        "    if target_shape is None:\n"
+        "        return value\n"
+        "    target = [int(v) for v in list(target_shape)]\n"
+        "    actual = [int(v) for v in list(value.shape)]\n"
+        "    if actual == target:\n"
+        "        return value\n"
+        "    if len(actual) == 4 and len(target) == 4 and [actual[0], actual[3], actual[1], actual[2]] == target:\n"
+        "        return value.permute(0, 3, 1, 2).contiguous()\n"
+        "    return value\n\n"
+        "def _apply_pool2d(x: torch.Tensor, filter_height: int, filter_width: int, stride_h: int, stride_w: int, padding: str, target_shape: Optional[List[int]], is_max_pool: bool, channel_last: Optional[bool] = None) -> torch.Tensor:\n"
+        "    resize_as_channel_last = bool(channel_last) if channel_last is not None else False\n"
+        "    if channel_last is None:\n"
+        "        has_actual_shape, actual_shape = _tensor_static_shape_list(x)\n"
+        "        if has_actual_shape:\n"
+        "            resize_as_channel_last = bool(\n"
+        "                x.ndim == 4\n"
+        "                and actual_shape[1] > actual_shape[-1]\n"
+        "                and actual_shape[2] > actual_shape[-1]\n"
+        "            )\n"
+        "    has_target_shape, target = _optional_static_shape_list(target_shape)\n"
+        "    if resize_as_channel_last and x.ndim == 4 and has_target_shape and len(target) == 4:\n"
+        "        has_actual_shape, actual_shape = _tensor_static_shape_list(x)\n"
+        "        if has_actual_shape and int(target[0]) == int(actual_shape[0]) and int(target[-1]) != int(actual_shape[-1]) and int(target[1]) == int(actual_shape[-1]):\n"
+        "            target = [int(target[0]), int(target[2]), int(target[3]), int(target[1])]\n"
+        "    if channel_last is None and x.ndim == 4 and has_target_shape and len(target) == 4:\n"
+        "        has_actual_shape, actual_shape = _tensor_static_shape_list(x)\n"
+        "        if has_actual_shape and ((actual_shape[-1] == target[1] and actual_shape[1] != target[1]) or (actual_shape[-1] == target[-1] and actual_shape[1] != target[-1])):\n"
+        "            resize_as_channel_last = True\n"
+        "    pool_input = x.permute(0, 3, 1, 2).contiguous() if resize_as_channel_last and x.ndim == 4 else x\n"
+        "    y = F.max_pool2d(pool_input, kernel_size=(filter_height, filter_width), stride=(stride_h, stride_w), padding=0)\n"
+        "    if resize_as_channel_last and y.ndim == 4:\n"
+        "        y = y.permute(0, 2, 3, 1).contiguous()\n"
+        "    return _align_tensor_to_target_shape(y, target if has_target_shape else target_shape)\n",
+        encoding="utf-8",
+    )
+
+    _patch_generated_runtime_pool2d_channel_last_recovery(package_dir)
+
+    runtime_source = (package_dir / "runtime.py").read_text(encoding="utf-8")
+    assert "if not resize_as_channel_last and x.ndim == 4 and has_target_shape and len(target) == 4:" in runtime_source
+
+    runtime_module = _import_generated_runtime_module(str(package_dir))
+    x = torch.arange(1 * 6 * 8 * 4, dtype=torch.float32).reshape(1, 6, 8, 4)
+    out = runtime_module._apply_pool2d(
+        x,
+        filter_height=3,
+        filter_width=3,
+        stride_h=2,
+        stride_w=2,
+        padding="VALID",
+        target_shape=[1, 4, 2, 3],
+        is_max_pool=True,
+        channel_last=False,
+    )
+    ref = F.max_pool2d(x.permute(0, 3, 1, 2).contiguous(), kernel_size=(3, 3), stride=(2, 2), padding=0)
+    assert tuple(out.shape) == (1, 2, 3, 4)
+    assert torch.equal(out, ref.permute(0, 2, 3, 1).contiguous())

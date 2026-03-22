@@ -7199,7 +7199,9 @@ def _fold_channel_first_gap_conv_bridges(
             dim_value = ast.literal_eval(dim_expr)
         except Exception:
             return None
-        if list(dim_value) != [2, 3]:
+        if not isinstance(dim_value, (list, tuple)):
+            return None
+        if [int(v) for v in list(dim_value)] != [2, 3]:
             return None
         if keepdim_expr is not None and keepdim_expr != "True":
             return None
@@ -7305,7 +7307,9 @@ def _rewrite_channel_first_gap_outputs_to_explicit_channel_last(
             dim_value = ast.literal_eval(dim_expr)
         except Exception:
             return None
-        if list(dim_value) != [2, 3]:
+        if not isinstance(dim_value, (list, tuple)):
+            return None
+        if [int(v) for v in list(dim_value)] != [2, 3]:
             return None
         if keepdim_expr is not None and keepdim_expr != "True":
             return None
@@ -7659,7 +7663,9 @@ def _repair_channel_last_gap_conv_inputs(
             dim_value = ast.literal_eval(dim_expr)
         except Exception:
             return None
-        if list(dim_value) != [1, 2]:
+        if not isinstance(dim_value, (list, tuple)):
+            return None
+        if [int(v) for v in list(dim_value)] != [1, 2]:
             return None
         if keepdim_expr is not None and keepdim_expr != "True":
             return None
@@ -22791,6 +22797,20 @@ def _canonicalize_generated_model_source_for_raw_export(
             return int(exact_shape[1])
         return None
 
+    def _resolve_codegen_alias_source(name: str) -> str:
+        resolved_name = str(name)
+        visited_aliases: set[str] = set()
+        while resolved_name not in visited_aliases:
+            visited_aliases.add(resolved_name)
+            next_name = (
+                cf_materialized_alias_sources.get(resolved_name)
+                or generic_alias_sources.get(resolved_name)
+            )
+            if next_name is None:
+                break
+            resolved_name = next_name
+        return resolved_name
+
     def _function_end_index(line_index: int) -> int:
         if line_index < 0 or line_index >= len(function_end_by_index):
             return len(lines)
@@ -24423,6 +24443,8 @@ def _canonicalize_generated_model_source_for_raw_export(
             target_shape = [int(value) for value in rank3_reshape_from_rank4_source_assign[3]]
             src_exact_shape = _model_ir_exact_shape(src)
             lhs_exact_shape = _model_ir_exact_shape(lhs)
+            resolved_src_alias = _resolve_codegen_alias_source(src)
+            resolved_src_alias_tensor_name = _resolve_model_ir_tensor_name(resolved_src_alias)
             src_tensor = (
                 model_ir.tensors.get(_resolve_model_ir_tensor_name(src), None)
                 if model_ir is not None
@@ -24441,6 +24463,31 @@ def _canonicalize_generated_model_source_for_raw_export(
                 src_tensor is not None
                 and is_channel_last_logical_layout(src_layout)
             )
+            src_nhwc_cf_channel_count = _infer_cf_channel_count(resolved_src_alias)
+            src_nhwc_cf_flatten_shape_matches = (
+                src.endswith("_nhwc_cf")
+                or resolved_src_alias.endswith("_nhwc_cf")
+                or resolved_src_alias_tensor_name.endswith("_nhwc_cf")
+            )
+            if (
+                src_exact_shape is not None
+                and len(src_exact_shape) == 4
+                and len(target_shape) == 3
+                and src_nhwc_cf_channel_count is not None
+                and src_nhwc_cf_flatten_shape_matches
+                and int(target_shape[0]) == int(src_exact_shape[0])
+                and int(target_shape[1]) == int(src_nhwc_cf_channel_count)
+                and int(target_shape[2]) == int(src_exact_shape[2] * src_exact_shape[3])
+            ):
+                indent = str(rank3_reshape_from_rank4_source_assign[0])
+                lines[index] = (
+                    f"{indent}{lhs} = torch.reshape("
+                    f"{src}.permute(0, 3, 1, 2).contiguous(), "
+                    f"{target_shape})"
+                )
+                changed = True
+                line = lines[index]
+                continue
             if (
                 src_exact_shape is not None
                 and lhs_exact_shape is not None
@@ -39821,6 +39868,39 @@ def _write_generated_package_common_files(
     )
 
 
+def _patch_generated_runtime_pool2d_channel_last_recovery(package_dir: Path) -> None:
+    runtime_path = package_dir / "runtime.py"
+    if not runtime_path.exists():
+        return
+    lines = runtime_path.read_text(encoding="utf-8").splitlines()
+    if any("int(actual_shape[-1]) == int(target[1])" in line for line in lines):
+        return
+    in_apply_pool2d = False
+    insert_at: Optional[int] = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("def _apply_pool2d("):
+            in_apply_pool2d = True
+            continue
+        if not in_apply_pool2d:
+            continue
+        if stripped.startswith("def "):
+            break
+        if stripped.startswith("if resize_as_channel_last and x.ndim == 4 and has_target_shape and len(target) == 4:"):
+            insert_at = index
+            break
+    if insert_at is None:
+        return
+    insertion = [
+        "    if not resize_as_channel_last and x.ndim == 4 and has_target_shape and len(target) == 4:",
+        "        has_actual_shape, actual_shape = _tensor_static_shape_list(x)",
+        "        if has_actual_shape and int(actual_shape[-1]) == int(target[1]) and int(actual_shape[1]) != int(target[1]):",
+        "            resize_as_channel_last = True",
+    ]
+    lines[insert_at:insert_at] = insertion
+    runtime_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _write_wrapper_model_file(output_folder_path: str) -> None:
     package_dir = Path(output_folder_path)
     (package_dir / "model.py").write_text(
@@ -39967,7 +40047,7 @@ def _write_native_model_file(
     package_dir = Path(output_folder_path)
     _ensure_direct_codegen_supported(model_ir)
     producer_index, consumer_index = _build_model_ir_producer_consumer_index(model_ir)
-    return _write_native_model_file_impl(
+    load_specs = _write_native_model_file_impl(
         _NativeModelFileWriterContext(
             output_folder_path,
             model_ir,
@@ -39980,6 +40060,8 @@ def _write_native_model_file(
             consumer_index,
         )
     )
+    _patch_generated_runtime_pool2d_channel_last_recovery(package_dir)
+    return load_specs
 
 
 def _write_native_model_file_impl(
