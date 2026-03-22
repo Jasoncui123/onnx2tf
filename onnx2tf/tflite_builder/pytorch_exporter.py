@@ -21473,24 +21473,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         function_end = _function_end_index(start_index)
         reachable_names: Set[str] = {str(source_name)}
         for future_index in range(start_index + 1, function_end):
-            alias_match = generic_alias_re.match(lines[future_index])
             alias_assign = _parse_simple_assignment_line(lines[future_index])
             if (
-                (
-                    alias_match is not None
-                    and str(alias_match.group("rhs")) in reachable_names
-                )
-                or (
-                    alias_assign is not None
-                    and _is_simple_identifier_expr(alias_assign[2])
-                    and _strip_outer_parentheses(str(alias_assign[2]).strip()) in reachable_names
-                )
+                alias_assign is not None
+                and _is_simple_identifier_expr(alias_assign[2])
+                and _strip_outer_parentheses(str(alias_assign[2]).strip()) in reachable_names
             ):
-                alias_name = (
-                    str(alias_match.group("lhs"))
-                    if alias_match is not None
-                    else str(alias_assign[1])
-                )
+                alias_name = str(alias_assign[1])
                 reachable_names.add(alias_name)
                 output_name = public_output_name_by_var_name.get(alias_name, None)
                 if output_name is not None:
@@ -22837,12 +22826,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         visited_names: set[str] = set()
         for candidate in range(line_index - 1, function_start, -1):
             assign_line = lines[candidate]
-            generic_alias_match = generic_alias_re.match(assign_line)
+            generic_alias_assign = _parse_simple_assignment_line(assign_line)
             if (
-                generic_alias_match is not None
-                and str(generic_alias_match.group("lhs")) == resolved_name
+                generic_alias_assign is not None
+                and str(generic_alias_assign[1]) == resolved_name
+                and _is_simple_identifier_expr(generic_alias_assign[2])
             ):
-                rhs = str(generic_alias_match.group("rhs"))
+                rhs = _strip_outer_parentheses(str(generic_alias_assign[2]).strip())
                 if rhs in visited_names:
                     break
                 visited_names.add(rhs)
@@ -23847,15 +23837,19 @@ def _canonicalize_generated_model_source_for_raw_export(
                     pair_sources[1]
                 )
             continue
-        raw_generic_alias_match = raw_generic_alias_re.match(line)
-        if raw_generic_alias_match is not None:
-            rhs_name = str(raw_generic_alias_match.group("rhs"))
+        raw_generic_alias_assign = _parse_simple_assignment_line(line)
+        if (
+            raw_generic_alias_assign is not None
+            and _is_simple_identifier_expr(raw_generic_alias_assign[2])
+        ):
+            raw_generic_alias_lhs = str(raw_generic_alias_assign[1])
+            rhs_name = _strip_outer_parentheses(str(raw_generic_alias_assign[2]).strip())
             aliased_attr = raw_pidnet_const_alias_sources.get(rhs_name, None)
             if aliased_attr is not None:
-                raw_pidnet_const_alias_sources[str(raw_generic_alias_match.group("lhs"))] = aliased_attr
+                raw_pidnet_const_alias_sources[raw_generic_alias_lhs] = aliased_attr
             aliased_pair = raw_pidnet_const_pair_alias_sources.get(rhs_name, None)
             if aliased_pair is not None:
-                raw_pidnet_const_pair_alias_sources[str(raw_generic_alias_match.group("lhs"))] = aliased_pair
+                raw_pidnet_const_pair_alias_sources[raw_generic_alias_lhs] = aliased_pair
         transposed_const_use_match = transposed_const_use_re.match(line)
         if transposed_const_use_match is None:
             continue
@@ -24060,10 +24054,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         if binary_align_match is not None:
             cf_aliases.add(str(binary_align_match.group("lhs0")))
             cf_aliases.add(str(binary_align_match.group("lhs1")))
-        generic_alias_match = generic_alias_re.match(lines[index])
-        if generic_alias_match is not None:
-            lhs = str(generic_alias_match.group("lhs"))
-            rhs = str(generic_alias_match.group("rhs"))
+        generic_alias_assign = _parse_simple_assignment_line(lines[index])
+        if (
+            generic_alias_assign is not None
+            and _is_simple_identifier_expr(generic_alias_assign[2])
+        ):
+            lhs = str(generic_alias_assign[1])
+            rhs = _strip_outer_parentheses(str(generic_alias_assign[2]).strip())
             next_reshape_assign = None
             next_rank3_reshape_assign = None
             for lookahead_index in range(index + 1, min(index + 5, len(lines))):
@@ -24120,7 +24117,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                     or is_channel_first_logical_layout(rhs_layout)
                 )
             ):
-                indent = str(generic_alias_match.group("indent"))
+                indent = str(generic_alias_assign[0])
                 lines[index] = (
                     f"{indent}{lhs} = _align_tensor_to_target_shape("
                     f"{rhs}.permute(0, 2, 3, 1).contiguous(), {lhs_exact_shape})"
@@ -24134,7 +24131,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and _is_known_cf_name(rhs, set())
                 and next_reshape_assign is not None
             ):
-                indent = str(generic_alias_match.group("indent"))
+                indent = str(generic_alias_assign[0])
                 lines[index] = f"{indent}{lhs} = {rhs}.permute(0, 2, 3, 1).contiguous()"
                 changed = True
                 cf_materialized_alias_sources[lhs] = rhs
@@ -24145,7 +24142,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and _is_known_cf_name(rhs, set())
                 and next_rank3_reshape_assign is not None
             ):
-                indent = str(generic_alias_match.group("indent"))
+                indent = str(generic_alias_assign[0])
                 if nhwc_target_shape is not None and len(nhwc_target_shape) == 4:
                     lines[index] = (
                         f"{indent}{lhs} = _align_tensor_to_target_shape("
@@ -24173,7 +24170,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                     and int(rank3_target_shape[1])
                     == int(np.prod(nhwc_target_shape[1:3], dtype=np.int64))
                 ):
-                    indent = str(generic_alias_match.group("indent"))
+                    indent = str(generic_alias_assign[0])
                     lines[index] = (
                         f"{indent}{lhs} = _align_tensor_to_target_shape("
                         f"{rhs}.permute(0, 2, 3, 1).contiguous(), {nhwc_target_shape})"
@@ -24759,34 +24756,38 @@ def _canonicalize_generated_model_source_for_raw_export(
     while index + 7 < len(lines):
         rank3_input_match = rank3_resize_input_re.match(lines[index])
         tmp_x0_match = generic_expr_assign_re.match(lines[index + 1])
-        tmp_y0_match = generic_alias_re.match(lines[index + 2])
+        tmp_y0_assign = _parse_simple_assignment_line(lines[index + 2])
         rank3_matmul_match = rank3_matmul_re.match(lines[index + 3])
         rank4_reshape_match = rank4_singleton_reshape_re.match(lines[index + 4])
         tmp_x1_match = generic_expr_assign_re.match(lines[index + 5])
-        tmp_y1_match = generic_alias_re.match(lines[index + 6])
+        tmp_y1_assign = _parse_simple_assignment_line(lines[index + 6])
         rank4_matmul_match = rank4_singleton_matmul_re.match(lines[index + 7])
         if (
             rank3_input_match is None
             or tmp_x0_match is None
-            or tmp_y0_match is None
+            or tmp_y0_assign is None
+            or not _is_simple_identifier_expr(tmp_y0_assign[2])
             or rank3_matmul_match is None
             or rank4_reshape_match is None
             or tmp_x1_match is None
-            or tmp_y1_match is None
+            or tmp_y1_assign is None
+            or not _is_simple_identifier_expr(tmp_y1_assign[2])
             or rank4_matmul_match is None
         ):
             index += 1
             continue
+        tmp_y0_rhs = _strip_outer_parentheses(str(tmp_y0_assign[2]).strip())
+        tmp_y1_rhs = _strip_outer_parentheses(str(tmp_y1_assign[2]).strip())
         rank3_input_lhs = str(rank3_input_match.group("lhs"))
         rank3_input_src = str(rank3_input_match.group("src"))
         if (
-            str(tmp_y0_match.group("rhs")) != rank3_input_lhs
+            tmp_y0_rhs != rank3_input_lhs
             or str(rank3_matmul_match.group("x")) != str(tmp_x0_match.group("lhs"))
-            or str(rank3_matmul_match.group("y")) != str(tmp_y0_match.group("lhs"))
+            or str(rank3_matmul_match.group("y")) != str(tmp_y0_assign[1])
             or str(rank4_reshape_match.group("src")) != str(rank3_matmul_match.group("lhs"))
-            or str(tmp_y1_match.group("rhs")) != str(rank4_reshape_match.group("lhs"))
+            or tmp_y1_rhs != str(rank4_reshape_match.group("lhs"))
             or str(rank4_matmul_match.group("x")) != str(tmp_x1_match.group("lhs"))
-            or str(rank4_matmul_match.group("y")) != str(tmp_y1_match.group("lhs"))
+            or str(rank4_matmul_match.group("y")) != str(tmp_y1_assign[1])
         ):
             index += 1
             continue
@@ -27250,11 +27251,14 @@ def _canonicalize_generated_model_source_for_raw_export(
                     lines[insert_index:insert_index] = load_state_dict_lines
                     changed = True
     for index, line in enumerate(lines):
-        generic_alias_match = generic_alias_re.match(line)
-        if generic_alias_match is None:
+        generic_alias_assign = _parse_simple_assignment_line(line)
+        if (
+            generic_alias_assign is None
+            or not _is_simple_identifier_expr(generic_alias_assign[2])
+        ):
             continue
-        lhs = str(generic_alias_match.group("lhs"))
-        rhs = str(generic_alias_match.group("rhs"))
+        lhs = str(generic_alias_assign[1])
+        rhs = _strip_outer_parentheses(str(generic_alias_assign[2]).strip())
         reshape_consumer_found = False
         for lookahead_index in range(index + 1, min(index + 6, len(lines))):
             candidate_reshape_assign = _parse_rank4_reshape_consumer_assign(lines[lookahead_index])
@@ -27280,7 +27284,7 @@ def _canonicalize_generated_model_source_for_raw_export(
             and is_channel_last_logical_layout(lhs_layout)
             and (_is_known_cf_name(rhs, set()) or rhs.endswith("_cf") or rhs.endswith("_nhwc_cf"))
         ):
-            indent = str(generic_alias_match.group("indent"))
+            indent = str(generic_alias_assign[0])
             rewritten_line = (
                 f"{indent}{lhs} = _align_tensor_to_target_shape("
                 f"{rhs}.permute(0, 2, 3, 1).contiguous(), {lhs_exact_shape})"
@@ -27294,7 +27298,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         rhs_exact_shape = _model_ir_exact_shape(rhs)
         if rhs_exact_shape is None or len(rhs_exact_shape) != 4:
             rhs_exact_shape = None
-        indent = str(generic_alias_match.group("indent"))
+        indent = str(generic_alias_assign[0])
         rewritten_line = f"{indent}{lhs} = {rhs}.permute(0, 2, 3, 1).contiguous()"
         if rewritten_line != line:
             lines[index] = rewritten_line
@@ -27826,16 +27830,17 @@ def _canonicalize_generated_model_source_for_raw_export(
         )
         changed = True
     for index in range(len(lines) - 1):
-        generic_alias_match = generic_alias_re.match(lines[index])
+        generic_alias_assign = _parse_simple_assignment_line(lines[index])
         rank3_reshape_assign = _parse_rank3_reshape_from_rank4_source_assign(lines[index + 1])
         if (
-            generic_alias_match is None
+            generic_alias_assign is None
+            or not _is_simple_identifier_expr(generic_alias_assign[2])
             or rank3_reshape_assign is None
-            or str(rank3_reshape_assign[2]) != str(generic_alias_match.group("lhs"))
+            or str(rank3_reshape_assign[2]) != str(generic_alias_assign[1])
         ):
             continue
-        lhs = str(generic_alias_match.group("lhs"))
-        rhs = str(generic_alias_match.group("rhs"))
+        lhs = str(generic_alias_assign[1])
+        rhs = _strip_outer_parentheses(str(generic_alias_assign[2]).strip())
         if "_nhwc" not in lhs or not _is_known_cf_name(rhs, singleton_cf_vars):
             continue
         lhs_exact_shape = _model_ir_exact_shape(lhs)
@@ -27869,7 +27874,7 @@ def _canonicalize_generated_model_source_for_raw_export(
             or int(rank3_target_shape[1]) != int(np.prod(nhwc_target_shape[1:3], dtype=np.int64))
         ):
             continue
-        indent = str(generic_alias_match.group("indent"))
+        indent = str(generic_alias_assign[0])
         lines[index] = (
             f"{indent}{lhs} = _align_tensor_to_target_shape("
             f"{rhs}.permute(0, 2, 3, 1).contiguous(), {nhwc_target_shape})"
@@ -29136,6 +29141,56 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     dynamic_apply_pool2d_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=_tensor_shape_list\((?P<shape_input>[A-Za-z0-9_]+)\), is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
     )
+    def _parse_dynamic_apply_pool2d_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, str, str, bool] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "_apply_pool2d("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parsed = _parse_apply_pool2d_input_channel_last_and_is_max(rhs)
+        if parsed is None or parsed[2] is None or parsed[1]:
+            return None
+        input_name, _, is_max_pool = parsed
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        target_shape_expr: str | None = None
+        rest_parts: List[str] = []
+        positional_index = 0
+        for part in parts:
+            keyword_match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part)
+            if keyword_match is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "target_shape":
+                    target_shape_expr = value
+                    continue
+                if key in {"input", "is_max_pool", "channel_last"}:
+                    continue
+                rest_parts.append(part.strip())
+                continue
+            if positional_index == 0:
+                positional_index += 1
+                continue
+            rest_parts.append(part.strip())
+            positional_index += 1
+        target_shape_match = (
+            re.fullmatch(r"_tensor_shape_list\(\s*([A-Za-z0-9_]+)\s*\)", target_shape_expr or "")
+        )
+        if target_shape_match is None:
+            return None
+        return (
+            indent,
+            lhs,
+            input_name,
+            ", ".join(rest_parts),
+            str(target_shape_match.group(1)),
+            bool(is_max_pool),
+        )
     const_pad_assign_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pads>[0-9,\s]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
@@ -29732,24 +29787,9 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 )
                 cf_like_names.add(resize_lhs_name)
                 changed = True
-        apply_pool2d_match = apply_pool2d_re.match(line)
         apply_pool2d_assign = _parse_apply_pool2d_assign_with_shape(line)
-        if apply_pool2d_match is not None or apply_pool2d_assign is not None:
-            if apply_pool2d_assign is not None:
-                pool_indent, pool_lhs_name, pool_input_name, pool_rest, pool_shape, pool_is_max, pool_channel_last = apply_pool2d_assign
-            else:
-                pool_indent = str(apply_pool2d_match.group("indent"))
-                pool_lhs_name = str(apply_pool2d_match.group("lhs"))
-                pool_input_name = str(apply_pool2d_match.group("input"))
-                pool_rest = str(apply_pool2d_match.group("rest"))
-                pool_shape = [
-                    int(apply_pool2d_match.group("n")),
-                    int(apply_pool2d_match.group("h")),
-                    int(apply_pool2d_match.group("w")),
-                    int(apply_pool2d_match.group("c")),
-                ]
-                pool_is_max = str(apply_pool2d_match.group("is_max")) == "True"
-                pool_channel_last = str(apply_pool2d_match.group("channel_last")) == "True"
+        if apply_pool2d_assign is not None:
+            pool_indent, pool_lhs_name, pool_input_name, pool_rest, pool_shape, pool_is_max, pool_channel_last = apply_pool2d_assign
             if (
                 not pool_channel_last
                 and pool_is_max
@@ -29769,9 +29809,8 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 nhwc_like_names.add(pool_lhs_name)
                 changed = True
                 line = lines[index]
-                apply_pool2d_match = apply_pool2d_re.match(line)
                 apply_pool2d_assign = _parse_apply_pool2d_assign_with_shape(line)
-        if apply_pool2d_match is not None or apply_pool2d_assign is not None:
+        if apply_pool2d_assign is not None:
             rewritten_pool_line, pool_lhs = _repair_cf_pool_target_shape(
                 line,
                 index,
@@ -29911,18 +29950,17 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 )
                 cf_like_names.add(pool_lhs_name)
                 changed = True
-        dynamic_apply_pool2d_match = dynamic_apply_pool2d_re.match(line)
-        if dynamic_apply_pool2d_match is not None:
-            input_name = str(dynamic_apply_pool2d_match.group("input"))
-            lhs = str(dynamic_apply_pool2d_match.group("lhs"))
+        dynamic_apply_pool2d_assign = _parse_dynamic_apply_pool2d_assign(line)
+        if dynamic_apply_pool2d_assign is not None:
+            dynamic_pool_indent, lhs, input_name, dynamic_pool_rest, dynamic_pool_shape_input, dynamic_pool_is_max = dynamic_apply_pool2d_assign
             if (
-                str(dynamic_apply_pool2d_match.group("is_max")) == "False"
+                not dynamic_pool_is_max
                 and (
                     input_name in cf_like_names
                     or input_name.endswith("_cf")
                     or input_name.endswith("_out_cf")
                 )
-                and str(dynamic_apply_pool2d_match.group("shape_input")) == input_name
+                and dynamic_pool_shape_input == input_name
             ):
                 repaired_target_shape: list[int] | None = None
                 for lookahead in range(index + 1, min(len(lines), index + 4)):
@@ -29962,10 +30000,10 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         break
                 if repaired_target_shape is not None:
                     lines[index] = (
-                        f"{dynamic_apply_pool2d_match.group('indent')}{lhs} = _apply_pool2d("
-                        f"{input_name}, {dynamic_apply_pool2d_match.group('rest')}, "
+                        f"{dynamic_pool_indent}{lhs} = _apply_pool2d("
+                        f"{input_name}, {dynamic_pool_rest}, "
                         f"target_shape={repr(repaired_target_shape)}, "
-                        f"is_max_pool={dynamic_apply_pool2d_match.group('is_max')}, channel_last=False)"
+                        f"is_max_pool={dynamic_pool_is_max}, channel_last=False)"
                     )
                     cf_like_names.add(lhs)
                 changed = True
@@ -36104,9 +36142,6 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
         r"target_shape=[\[\(]1, \d+, \d+, \d+[\]\)], align_corners=(?:True|False), "
         r"half_pixel_centers=(?:True|False), channel_last=True\)$"
     )
-    generic_alias_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<rhs>[A-Za-z0-9_]+)\s*\)*$"
-    )
     apply_concat_re = re.compile(
         r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_concat\((?:[\[\(](?P<inputs>.+)[\]\)]|inputs=[\[\(](?P<inputs_kw>.+)[\]\)]), axis=(?:1|3), "
         r"target_shape=[\[\(][0-9, ]+[\]\)], fused='[^']+'\)$"
@@ -36118,9 +36153,18 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
         if resize_match is not None:
             resize_like_inputs.add(str(resize_match.group("lhs")))
             continue
-        alias_match = generic_alias_re.match(current_line)
-        if alias_match is not None and str(alias_match.group("rhs")) in resize_like_inputs:
-            resize_like_inputs.add(str(alias_match.group("lhs")))
+        alias_assign = _parse_simple_assignment_line(current_line)
+        alias_rhs = (
+            _strip_outer_parentheses(str(alias_assign[2]).strip())
+            if alias_assign is not None
+            else ""
+        )
+        if (
+            alias_assign is not None
+            and re.fullmatch(r"[A-Za-z0-9_]+", alias_rhs) is not None
+            and alias_rhs in resize_like_inputs
+        ):
+            resize_like_inputs.add(str(alias_assign[1]))
             continue
         for candidate in re.findall(r"\b[A-Za-z0-9_]+\b", current_line):
             if candidate.endswith("_resize_out_nhwc") or candidate.endswith("_upup_resize_out_nhwc"):
@@ -36156,9 +36200,6 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
 
 
 def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
-    generic_alias_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<src>[A-Za-z0-9_]+)\s*\)*$"
-    )
     return_single_re = re.compile(
         r"^\s*return (?P<value>[A-Za-z0-9_]+)$"
     )
@@ -36175,9 +36216,17 @@ def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
             continue
         if stripped_line.startswith("return ") and _resolve_nhwc_to_nchw_bridge_source(stripped_line[len("return ") :]) is not None:
             return True
-        alias_match = generic_alias_re.match(current_line)
-        if alias_match is not None:
-            alias_assignments[str(alias_match.group("lhs"))] = str(alias_match.group("src"))
+        alias_assign = _parse_simple_assignment_line(current_line)
+        alias_rhs = (
+            _strip_outer_parentheses(str(alias_assign[2]).strip())
+            if alias_assign is not None
+            else ""
+        )
+        if (
+            alias_assign is not None
+            and re.fullmatch(r"[A-Za-z0-9_]+", alias_rhs) is not None
+        ):
+            alias_assignments[str(alias_assign[1])] = alias_rhs
             continue
         if "=" in current_line:
             lhs, rhs = current_line.split("=", 1)
@@ -36210,9 +36259,6 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
         r"target_shape=[\[\(]1, \d+, \d+, \d+[\]\)], align_corners=(?:True|False), "
         r"half_pixel_centers=(?:True|False), channel_last=True\)$"
     )
-    generic_alias_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<rhs>[A-Za-z0-9_]+)\s*\)*$"
-    )
     apply_concat_re = re.compile(
         r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_concat\((?:[\[\(](?P<inputs>.+)[\]\)]|inputs=[\[\(](?P<inputs_kw>.+)[\]\)]), axis=(?:1|3), "
         r"target_shape=[\[\(][0-9, ]+[\]\)], fused='[^']+'\)$"
@@ -36226,9 +36272,18 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
             if lhs != "":
                 resize_like_outputs.add(lhs)
             continue
-        alias_match = generic_alias_re.match(current_line)
-        if alias_match is not None and str(alias_match.group("rhs")) in resize_like_outputs:
-            resize_like_outputs.add(str(alias_match.group("lhs")))
+        alias_assign = _parse_simple_assignment_line(current_line)
+        alias_rhs = (
+            _strip_outer_parentheses(str(alias_assign[2]).strip())
+            if alias_assign is not None
+            else ""
+        )
+        if (
+            alias_assign is not None
+            and re.fullmatch(r"[A-Za-z0-9_]+", alias_rhs) is not None
+            and alias_rhs in resize_like_outputs
+        ):
+            resize_like_outputs.add(str(alias_assign[1]))
             continue
         for candidate in re.findall(r"\b[A-Za-z0-9_]+\b", current_line):
             if candidate.endswith("_resize_out_nhwc") or candidate.endswith("_upup_resize_out_nhwc"):
@@ -36524,14 +36579,22 @@ def _has_efficientformer_attention_signature(lines: Sequence[str]) -> bool:
                 f"self.{self_const_alias_match.group('const_attr')}"
             )
             continue
-        generic_alias_match = generic_alias_re.match(current_line)
-        if generic_alias_match is not None:
-            input_name = str(generic_alias_match.group("input"))
+        generic_alias_assign = _parse_simple_assignment_line(current_line)
+        alias_rhs = (
+            _strip_outer_parentheses(str(generic_alias_assign[2]).strip())
+            if generic_alias_assign is not None
+            else ""
+        )
+        if (
+            generic_alias_assign is not None
+            and re.fullmatch(r"[A-Za-z0-9_]+", alias_rhs) is not None
+        ):
+            input_name = alias_rhs
             if not input_name.startswith("self."):
-                local_alias_sources[str(generic_alias_match.group("lhs"))] = _resolve_local_alias(input_name)
+                local_alias_sources[str(generic_alias_assign[1])] = _resolve_local_alias(input_name)
             aliased_const = const_alias_sources.get(input_name, None)
             if aliased_const is not None:
-                const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_const
+                const_alias_sources[str(generic_alias_assign[1])] = aliased_const
             continue
         align_assign = _parse_align_tensor_target_shape_assign(current_line)
         if align_assign is None:
@@ -37327,14 +37390,22 @@ def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
                 f"self.{self_const_alias_match.group('const_attr')}"
             )
             continue
-        generic_alias_match = generic_alias_re.match(current_line)
-        if generic_alias_match is not None:
-            input_name = str(generic_alias_match.group("input"))
+        generic_alias_assign = _parse_simple_assignment_line(current_line)
+        alias_rhs = (
+            _strip_outer_parentheses(str(generic_alias_assign[2]).strip())
+            if generic_alias_assign is not None
+            else ""
+        )
+        if (
+            generic_alias_assign is not None
+            and re.fullmatch(r"[A-Za-z0-9_]+", alias_rhs) is not None
+        ):
+            input_name = alias_rhs
             if not input_name.startswith("self."):
-                local_alias_sources[str(generic_alias_match.group("lhs"))] = _resolve_local_alias(input_name)
+                local_alias_sources[str(generic_alias_assign[1])] = _resolve_local_alias(input_name)
             aliased_const = const_alias_sources.get(input_name, None)
             if aliased_const is not None:
-                const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_const
+                const_alias_sources[str(generic_alias_assign[1])] = aliased_const
             continue
         gather_match = gather_re.match(current_line)
         if gather_match is not None:
