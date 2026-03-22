@@ -7875,6 +7875,78 @@ def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain(
     assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_with_generic_mask_const(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_mask_generic_const_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_bn_mul', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_bn_add', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_mask_generic', torch.zeros([1, 64, 64, 2], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, cv265_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize267_out = _apply_resize(cv265_out_cf, [64, 64], method='bilinear', target_shape=[1, 64, 64, 2], align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        bn_mul_out = _align_tensor_to_target_shape(torch.mul(resize267_out, self.const_bn_mul), [1, 64, 64, 2])",
+                "        t_753 = _align_tensor_to_target_shape(torch.add(bn_mul_out, self.const_bn_add), [1, 64, 64, 2])",
+                "        t_756 = _apply_softmax(t_753, axis=3, beta=1.0, target_shape=[1, 64, 64, 2])",
+                "        t_757 = _reduce_max(t_756, _normalize_axes([3], t_756.ndim), False)",
+                "        t_771 = _align_tensor_to_target_shape(torch.sub(torch.as_tensor(1.0, dtype=torch.float32, device=_module_device(self)), t_757), [1, 64, 64])",
+                "        t_772 = torch.reshape(t_771, [1, 64, 64, 1])",
+                "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs(t_772, self.const_mask_generic, [1, 2, 64, 64])",
+                "        return _binary_rhs_196",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_align_binary_inputs(t_772, self.const_mask_generic.permute(0, 3, 1, 2).contiguous(), [1, 2, 64, 64])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_does_not_rewrite_nonmask_binary_align_const(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_nonmask_const_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_mask_generic', torch.zeros([1, 64, 64, 3], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, t_772: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs(t_772, self.const_mask_generic, [1, 3, 64, 64])",
+                "        return _binary_rhs_196",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_align_binary_inputs(t_772, self.const_mask_generic, [1, 3, 64, 64])" in rewritten
+    assert "self.const_mask_generic.permute(0, 3, 1, 2).contiguous()" not in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_malformed_cf_resize_target(
     tmp_path,
 ) -> None:
@@ -7918,6 +7990,71 @@ def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_malformed_cf_r
     assert "resize267_out = _apply_resize(cv265_out_cf, [80, 80], method='bilinear', target_shape=[1, 2, 80, 80], align_corners=True, half_pixel_centers=False, channel_last=False)" in rewritten
     assert "batch_normalization268_mul_out = _align_tensor_to_target_shape(torch.mul(resize267_out, torch.reshape(self.const_BatchNormalization_268_bn_mul, [1, 2, 1, 1])), [1, 2, 80, 80])" in rewritten
     assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_restores_nhwc_alias_before_channel_last_prelu(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_nhwc_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "",
+                "    def forward(self, data: torch.Tensor) -> torch.Tensor:",
+                "        cv0_out_nhwc_cf = self.conv_block_0(data)",
+                "        cv0_out_nhwc = cv0_out_nhwc_cf",
+                "        cv3_in_nhwc = self.prelu_0(cv0_out_nhwc.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()",
+                "        return cv3_in_nhwc",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "cv0_out_nhwc = cv0_out_nhwc_cf.permute(0, 2, 3, 1).contiguous()" in rewritten
+    assert "cv0_out_nhwc = cv0_out_nhwc_cf\n" not in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_normalizes_cf_bn_mul_target_shape_with_reshaped_const(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_cf_bn_mul_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_53_bn_mul', torch.zeros([1, 48, 1, 1], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, t453_cf: torch.Tensor) -> torch.Tensor:",
+                "        batch_normalization53_mul_out = _align_tensor_to_target_shape(torch.mul(t453_cf, torch.reshape(self.const_BatchNormalization_53_bn_mul, [1, 48, 1, 1])), [1, 80, 48, 80])",
+                "        return batch_normalization53_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "batch_normalization53_mul_out = _align_tensor_to_target_shape(torch.mul(t453_cf, torch.reshape(self.const_BatchNormalization_53_bn_mul, [1, 48, 1, 1])), [1, 48, 80, 80])" in rewritten
+    assert "[1, 80, 48, 80]" not in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_propagates_cf_aliases_to_softmax_and_concat(
@@ -8580,6 +8717,32 @@ def test_should_skip_expensive_raw_canonicalize_for_sinet_semantic_signature_wit
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_skip_expensive_raw_canonicalize_for_sinet_with_const_alias_and_method_bn_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "sinet_alias_method_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scale_cf, stage_cf, gate_cf):",
+                "        mask_buf = (self.semantic_mask_buf)",
+                "        bn_scale_cf = scale_cf.reshape((1, 128, 1, 1))",
+                "        gathered = stage_cf[:, [7, 39, 8, 40, 9, 41], :, :]",
+                "        gate_lhs, gate_rhs = _align_binary_inputs(gate_cf, mask_buf.permute(0, 3, 1, 2).contiguous(), (1, 2, 96, 96))",
+                "        return bn_scale_cf, gathered, gate_lhs, gate_rhs",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_not_skip_expensive_raw_canonicalize_for_incomplete_sinet_like_package(
     tmp_path,
 ) -> None:
@@ -8808,6 +8971,59 @@ def test_should_skip_expensive_raw_canonicalize_for_iat_llie_with_generic_conv_i
                 "        img_high = _align_tensor_to_target_shape(torch.add(c, d), [1, 180, 320, 3])",
                 "        out = _torch_permute(layout_bridge, [0, 3, 1, 2])",
                 "        return stem_cf, mix64, tail_cf, img_high, out",
+                "",
+            ]
+        ),
+        encoding='utf-8',
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_iat_llie_with_generic_output_bridge_name(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_generic_output_bridge_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_in, tail_in, a, b, c, d, layout_bridge):",
+                "        stem_cf = self.conv_block_3(stem_in.permute(0, 3, 1, 2).contiguous())",
+                "        mix64 = _align_tensor_to_target_shape(torch.add(a, b), [1, 45, 80, 64])",
+                "        tail_cf = self.conv_block_19(tail_in.permute(0, 3, 1, 2).contiguous())",
+                "        img_high = _align_tensor_to_target_shape(torch.add(c, d), [1, 180, 320, 3])",
+                "        public_output = _torch_permute(layout_bridge, [0, 3, 1, 2])",
+                "        return stem_cf, mix64, tail_cf, img_high, public_output",
+                "",
+            ]
+        ),
+        encoding='utf-8',
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_iat_llie_with_direct_return_permute_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_direct_return_permute_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_in, tail_in, a, b, c, d, layout_bridge):",
+                "        stem_cf = self.conv_block_3(stem_in.permute(0, 3, 1, 2).contiguous())",
+                "        mix64 = _align_tensor_to_target_shape(torch.add(a, b), [1, 45, 80, 64])",
+                "        tail_cf = self.conv_block_19(tail_in.permute(0, 3, 1, 2).contiguous())",
+                "        img_high = _align_tensor_to_target_shape(torch.add(c, d), [1, 180, 320, 3])",
+                "        return stem_cf, mix64, tail_cf, img_high, _torch_permute(layout_bridge, [0, 3, 1, 2])",
                 "",
             ]
         ),
@@ -9668,8 +9884,54 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_with_generic_output
                 "class Model(torch.nn.Module):",
                 "    def forward(self, stem_cf, decoder_resize_out_nhwc, pred_map):",
                 "        decoder_merge = torch.cat([stem_cf, decoder_resize_out_nhwc], dim=1)",
-                "        out = pred_map",
-                "        return out",
+                "        public_output = pred_map",
+                "        return public_output",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_with_direct_return_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_direct_return_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_cf, decoder_resize_out_nhwc, pred_map):",
+                "        decoder_merge = torch.cat([stem_cf, decoder_resize_out_nhwc], dim=1)",
+                "        return pred_map",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_with_direct_return_permute_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_direct_return_permute_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_cf, decoder_resize_out_nhwc, pred_map):",
+                "        decoder_merge = torch.cat([stem_cf, decoder_resize_out_nhwc], dim=1)",
+                "        return _torch_permute(pred_map, [0, 3, 1, 2])",
                 "",
             ]
         ),
@@ -12934,6 +13196,31 @@ def test_should_skip_expensive_raw_canonicalize_for_bread_semantic_signature(
                 "class Model(torch.nn.Module):",
                 "    def forward(self, encoder_cf, upsample_resize_out_nhwc, out_nhwc):",
                 "        decoder_merge = torch.cat([encoder_cf, upsample_resize_out_nhwc], dim=1)",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_bread_with_generic_resize_assignment_name(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_generic_resize_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, encoder_cf, decoder_in, out_nhwc):",
+                "        decoder_up = _apply_resize(decoder_in, [180, 320], method='bilinear', target_shape=[1, 180, 320, 64], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        decoder_merge = torch.cat([encoder_cf, decoder_up], dim=1)",
                 "        out = out_nhwc",
                 "        return out",
                 "",

@@ -25969,6 +25969,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     const_channel_counts: Dict[str, int] = dict(repair_context.const_channel_counts)
     conv_block_out_channels: Dict[str, int] = dict(repair_context.conv_block_out_channels)
     module_output_producers: Dict[str, str] = dict(repair_context.module_output_producers)
+    registered_buffer_shapes: Dict[str, List[int]] = {}
     register_buffer_re = re.compile(
         r"^\s*self\.register_buffer\('(?P<name>[A-Za-z0-9_]+)', torch\.zeros\(\[(?P<shape>[0-9, ]+)\], dtype=torch\.[A-Za-z0-9_]+\), persistent=(?:True|False)\)$"
     )
@@ -25995,6 +25996,9 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     )
     prelu_assign_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.prelu_[0-9]+\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+    channel_last_prelu_consumer_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.prelu_[0-9]+\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)\.permute\(0, 2, 3, 1\)\.contiguous\(\)$"
     )
     permuted_conv_input_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
@@ -26060,13 +26064,31 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     tensor786_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>const_tensor786_expand_x80_x2_af49), \[1, 2, 80, 80\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\("
+        r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 2, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
+    for line in lines:
+        register_buffer_match = register_buffer_re.match(line)
+        if register_buffer_match is None:
+            continue
+        shape_values = _parse_int_list_literal(str(register_buffer_match.group("shape")))
+        if len(shape_values) == 4:
+            registered_buffer_shapes[str(register_buffer_match.group("name"))] = shape_values
     for index, line in enumerate(lines[:-1]):
         simple_alias_match = simple_alias_re.match(line)
         if simple_alias_match is not None:
             next_rank3_reshape_match = (
                 rank3_reshape_re.match(lines[index + 1])
+                if index + 1 < len(lines)
+                else None
+            )
+            next_channel_last_prelu_consumer_match = (
+                channel_last_prelu_consumer_re.match(lines[index + 1])
+                if index + 1 < len(lines)
+                else None
+            )
+            next_permuted_conv_input_match = (
+                permuted_conv_input_re.match(lines[index + 1])
                 if index + 1 < len(lines)
                 else None
             )
@@ -26127,6 +26149,40 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                     f"{simple_alias_match.group('rhs')}.permute(0, 2, 3, 1).contiguous()"
                 )
                 nhwc_like_names.add(str(simple_alias_match.group("lhs")))
+                changed = True
+                line = lines[index]
+                simple_alias_match = None
+            elif (
+                "_nhwc" in str(simple_alias_match.group("lhs"))
+                and (
+                    rhs_name in cf_like_names
+                    or rhs_name.endswith("_cf")
+                    or rhs_name.endswith("_out_cf")
+                )
+                and (
+                    (
+                        next_channel_last_prelu_consumer_match is not None
+                        and str(next_channel_last_prelu_consumer_match.group("input")) == str(simple_alias_match.group("lhs"))
+                    )
+                    or (
+                        next_permuted_conv_input_match is not None
+                        and str(next_permuted_conv_input_match.group("input")) == str(simple_alias_match.group("lhs"))
+                    )
+                )
+            ):
+                lhs_name = str(simple_alias_match.group("lhs"))
+                lhs_exact_shape = repair_context.static_shapes.get(lhs_name)
+                if lhs_exact_shape is not None and len(lhs_exact_shape) == 4:
+                    lines[index] = (
+                        f"{simple_alias_match.group('indent')}{lhs_name} = "
+                        f"_align_tensor_to_target_shape({simple_alias_match.group('rhs')}.permute(0, 2, 3, 1).contiguous(), {lhs_exact_shape})"
+                    )
+                else:
+                    lines[index] = (
+                        f"{simple_alias_match.group('indent')}{lhs_name} = "
+                        f"{simple_alias_match.group('rhs')}.permute(0, 2, 3, 1).contiguous()"
+                    )
+                nhwc_like_names.add(lhs_name)
                 changed = True
                 line = lines[index]
                 simple_alias_match = None
@@ -26695,6 +26751,39 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 )
                 cf_like_names.add(str(aligned_bn_const_match.group("lhs")))
                 changed = True
+        aligned_bn_const_reshaped_match = aligned_bn_const_reshaped_re.match(line)
+        if aligned_bn_const_reshaped_match is not None:
+            input_name = str(aligned_bn_const_reshaped_match.group("input"))
+            const_attr = str(aligned_bn_const_reshaped_match.group("const_attr"))
+            reshape_channel_count = int(aligned_bn_const_reshaped_match.group("reshape_c"))
+            if (
+                (
+                    input_name in cf_like_names
+                    or input_name.endswith("_cf")
+                    or input_name.endswith("_out_cf")
+                )
+                and (
+                    "BatchNormalization" in const_attr
+                    or "batch_normalization" in const_attr
+                )
+            ):
+                normalized_shape = _normalize_cf_rank4_shape(
+                    [
+                        int(aligned_bn_const_reshaped_match.group("n")),
+                        int(aligned_bn_const_reshaped_match.group("c0")),
+                        int(aligned_bn_const_reshaped_match.group("h")),
+                        int(aligned_bn_const_reshaped_match.group("w")),
+                    ],
+                    preferred_channel_count=reshape_channel_count,
+                )
+                lines[index] = (
+                    f"{aligned_bn_const_reshaped_match.group('indent')}{aligned_bn_const_reshaped_match.group('lhs')} = "
+                    f"_align_tensor_to_target_shape(torch.{aligned_bn_const_reshaped_match.group('op')}("
+                    f"{input_name}, torch.reshape(self.{const_attr}, [1, {reshape_channel_count}, 1, 1])), "
+                    f"{repr(normalized_shape)})"
+                )
+                cf_like_names.add(str(aligned_bn_const_reshaped_match.group("lhs")))
+                changed = True
         local_response_norm_match = local_response_norm_re.match(line)
         if local_response_norm_match is not None:
             input_name = str(local_response_norm_match.group("input"))
@@ -26746,13 +26835,18 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
             changed = True
         tensor786_align_match = tensor786_align_re.match(line)
         if tensor786_align_match is not None:
-            lines[index] = (
-                f"{tensor786_align_match.group('indent')}{tensor786_align_match.group('lhs0')}, "
-                f"{tensor786_align_match.group('lhs1')} = _align_binary_inputs("
-                f"{tensor786_align_match.group('input')}, "
-                f"self.{tensor786_align_match.group('const_attr')}.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])"
-            )
-            changed = True
+            buffer_shape = registered_buffer_shapes.get(str(tensor786_align_match.group("const_attr")))
+            target_height = int(tensor786_align_match.group("h"))
+            target_width = int(tensor786_align_match.group("w"))
+            if buffer_shape == [1, target_height, target_width, 2]:
+                lines[index] = (
+                    f"{tensor786_align_match.group('indent')}{tensor786_align_match.group('lhs0')}, "
+                    f"{tensor786_align_match.group('lhs1')} = _align_binary_inputs("
+                    f"{tensor786_align_match.group('input')}, "
+                    f"self.{tensor786_align_match.group('const_attr')}.permute(0, 3, 1, 2).contiguous(), "
+                    f"[1, 2, {target_height}, {target_width}])"
+                )
+                changed = True
         prelu_match = prelu_assign_re.match(line)
         if prelu_match is not None:
             input_name = str(prelu_match.group("input"))
@@ -31485,16 +31579,65 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
 
 
 def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
-    return _any_line_matches(lines, r"^\s*out = [A-Za-z0-9_]+$") or _any_line_matches(
-        lines,
-        r"^\s*out = _torch_permute\([A-Za-z0-9_]+, \[0, 3, 1, 2\]\)$",
+    alias_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)$"
     )
+    permute_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+    )
+    return_single_re = re.compile(
+        r"^\s*return (?P<value>[A-Za-z0-9_]+)$"
+    )
+    return_permute_re = re.compile(
+        r"^\s*return _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+    )
+
+    returned_values: Set[str] = set()
+    for line in lines:
+        current_line = str(line)
+        return_match = return_single_re.match(current_line)
+        if return_match is not None:
+            returned_values.add(str(return_match.group("value")))
+            continue
+        if return_permute_re.match(current_line) is not None:
+            return True
+    if not returned_values:
+        return False
+    for line in lines:
+        current_line = str(line)
+        alias_match = alias_assign_re.match(current_line)
+        if alias_match is not None and str(alias_match.group("lhs")) in returned_values:
+            return True
+        permute_match = permute_assign_re.match(current_line)
+        if permute_match is not None and str(permute_match.group("lhs")) in returned_values:
+            return True
+    if returned_values:
+        return True
+    return False
 
 
 def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
+    resize_assign_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _apply_resize\([A-Za-z0-9_]+, \[\d+, \d+\], method='[^']+', "
+        r"target_shape=\[1, \d+, \d+, \d+\], align_corners=(?:True|False), "
+        r"half_pixel_centers=(?:True|False), channel_last=True\)$"
+    )
     torch_cat_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
     )
+
+    resize_like_outputs: Set[str] = set()
+    for line in lines:
+        current_line = str(line)
+        resize_match = resize_assign_re.match(current_line)
+        if resize_match is not None:
+            lhs = current_line.split("=", 1)[0].strip()
+            if lhs != "":
+                resize_like_outputs.add(lhs)
+            continue
+        for candidate in re.findall(r"\b[A-Za-z0-9_]+\b", current_line):
+            if candidate.endswith("_resize_out_nhwc") or candidate.endswith("_upup_resize_out_nhwc"):
+                resize_like_outputs.add(candidate)
 
     decoder_merge_count = 0
     for line in lines:
@@ -31505,12 +31648,12 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
         inputs = [input_name.strip() for input_name in str(concat_match.group("inputs")).split(",") if input_name.strip()]
         if len(inputs) != 2:
             continue
-        resize_like_inputs = [
+        resize_inputs = [
             input_name
             for input_name in inputs
-            if input_name.endswith("_resize_out_nhwc") or input_name.endswith("_upup_resize_out_nhwc")
+            if input_name in resize_like_outputs
         ]
-        if len(resize_like_inputs) != 1:
+        if len(resize_inputs) != 1:
             continue
         decoder_merge_count += 1
     return decoder_merge_count == 1 and _has_bread_output_bridge_signature(lines)
@@ -31794,13 +31937,26 @@ def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
     align_add_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
-    output_bridge_re = re.compile(
-        r"^\s*out = _torch_permute\([A-Za-z0-9_]+, \[0, 3, 1, 2\]\)$"
+    permute_bridge_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+    )
+    alias_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*(?P<input>[A-Za-z0-9_]+)\s*$"
+    )
+    return_single_re = re.compile(r"^\s*return\s+(?P<value>[A-Za-z0-9_]+)\s*$")
+    return_permute_re = re.compile(
+        r"^\s*return\s+_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)\s*$"
+    )
+    return_inline_permute_re = re.compile(
+        r"^\s*return\b.*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\).*$"
     )
 
     seen_modules: Set[str] = set()
     seen_rank4_rgb = False
     seen_rank4_channel64 = False
+    permute_bridge_values: Set[str] = set()
+    returned_values: Set[str] = set()
+    alias_assignments: Dict[str, str] = {}
     for line in lines:
         current_line = str(line)
         conv_match = permuted_conv_re.match(current_line)
@@ -31813,11 +31969,49 @@ def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
                 seen_rank4_channel64 = True
             if int(align_match.group("d3")) == 3:
                 seen_rank4_rgb = True
+            continue
+        permute_bridge_match = permute_bridge_assign_re.match(current_line)
+        if permute_bridge_match is not None:
+            permute_bridge_values.add(str(permute_bridge_match.group("lhs")))
+            continue
+        alias_assign_match = alias_assign_re.match(current_line)
+        if alias_assign_match is not None:
+            alias_assignments[str(alias_assign_match.group("lhs"))] = str(alias_assign_match.group("input"))
+            continue
+        return_permute_match = return_permute_re.match(current_line)
+        if return_permute_match is not None:
+            permute_bridge_values.add(str(return_permute_match.group("input")))
+            continue
+        return_inline_permute_match = return_inline_permute_re.match(current_line)
+        if return_inline_permute_match is not None:
+            permute_bridge_values.add(str(return_inline_permute_match.group("input")))
+            continue
+        return_single_match = return_single_re.match(current_line)
+        if return_single_match is not None:
+            returned_values.add(str(return_single_match.group("value")))
+
+    has_output_bridge = False
+    if permute_bridge_values:
+        has_output_bridge = True
+    else:
+        pending_values = set(returned_values)
+        seen_values: Set[str] = set()
+        while pending_values:
+            current_value = pending_values.pop()
+            if current_value in seen_values:
+                continue
+            seen_values.add(current_value)
+            if current_value in permute_bridge_values:
+                has_output_bridge = True
+                break
+            aliased_value = alias_assignments.get(current_value, None)
+            if aliased_value is not None:
+                pending_values.add(aliased_value)
     return (
         len(seen_modules) >= 2
         and seen_rank4_channel64
         and seen_rank4_rgb
-        and _any_line_matches(lines, output_bridge_re.pattern)
+        and has_output_bridge
     )
 
 
@@ -32020,17 +32214,92 @@ def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
         r"^\s*[A-Za-z0-9_]+ = [A-Za-z0-9_]+\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
     )
     reshape_bn_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, \[1, (?P<channels>\d+), 1, 1\]\)$"
+        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\([A-Za-z0-9_]+, [\[\(]1, (?P<channels>\d+), 1, 1[\]\)]\)$"
+    )
+    reshape_bn_method_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = [A-Za-z0-9_]+\.(?:reshape|view)\([\[\(]1, (?P<channels>\d+), 1, 1[\]\)]\)$"
     )
     mask_align_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs\([A-Za-z0-9_]+, self\.[A-Za-z0-9_]+\.permute\(0, 3, 1, 2\)\.contiguous\(\), \[1, 2, (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs(?:_to_anchor)?\([A-Za-z0-9_]+, (?P<const_expr>.+), [\[\(]1, 2, (?P<h>\d+), (?P<w>\d+)[\]\)]\)$"
     )
 
     has_interleaved_cf_gather = False
     has_bn_reshape = False
     has_mask_align = False
+    local_alias_sources: Dict[str, str] = {}
+    const_alias_sources: Dict[str, str] = {}
+
+    generic_alias_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*$"
+    )
+    self_const_alias_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*self\.(?P<const_attr>[A-Za-z0-9_]+)\s*\)*$"
+    )
+
+    def _resolve_local_alias(expr: str) -> str:
+        resolved = str(expr).strip()
+        seen: Set[str] = set()
+        while resolved not in seen:
+            seen.add(resolved)
+            aliased = local_alias_sources.get(resolved, None)
+            if aliased is None or aliased == resolved:
+                break
+            resolved = aliased
+        return resolved
+
+    def _strip_outer_parentheses(expr: str) -> str:
+        stripped = str(expr).strip()
+        while stripped.startswith("(") and stripped.endswith(")"):
+            inner = stripped[1:-1].strip()
+            if inner == "":
+                break
+            depth = 0
+            valid = True
+            for char in inner:
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    if depth == 0:
+                        valid = False
+                        break
+                    depth -= 1
+            if not valid or depth != 0:
+                break
+            stripped = inner
+        return stripped
+
+    def _resolve_mask_const_expr(expr: str) -> str | None:
+        resolved = _strip_outer_parentheses(str(expr))
+        permute_suffix = ".permute(0, 3, 1, 2).contiguous()"
+        if resolved.endswith(permute_suffix):
+            resolved = _strip_outer_parentheses(resolved[: -len(permute_suffix)])
+        resolved = _resolve_local_alias(resolved)
+        if resolved.startswith("self."):
+            return resolved[len("self.") :]
+        aliased_const = const_alias_sources.get(resolved, None)
+        if aliased_const is None:
+            return None
+        if aliased_const.startswith("self."):
+            return aliased_const[len("self.") :]
+        return None
+
     for line in lines:
         current_line = str(line)
+        self_const_alias_match = self_const_alias_re.match(current_line)
+        if self_const_alias_match is not None:
+            const_alias_sources[str(self_const_alias_match.group("lhs"))] = (
+                f"self.{self_const_alias_match.group('const_attr')}"
+            )
+            continue
+        generic_alias_match = generic_alias_re.match(current_line)
+        if generic_alias_match is not None:
+            input_name = str(generic_alias_match.group("input"))
+            if not input_name.startswith("self."):
+                local_alias_sources[str(generic_alias_match.group("lhs"))] = _resolve_local_alias(input_name)
+            aliased_const = const_alias_sources.get(input_name, None)
+            if aliased_const is not None:
+                const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_const
+            continue
         gather_match = gather_re.match(current_line)
         if gather_match is not None:
             raw_indices = [
@@ -32042,10 +32311,18 @@ def _has_sinet_skip_signature(lines: Sequence[str]) -> bool:
                 has_interleaved_cf_gather = True
                 continue
         reshape_match = reshape_bn_re.match(current_line)
+        if reshape_match is None:
+            reshape_match = reshape_bn_method_re.match(current_line)
         if reshape_match is not None and int(reshape_match.group("channels")) >= 32:
             has_bn_reshape = True
             continue
-        if mask_align_re.match(current_line) is not None:
+        mask_align_match = mask_align_re.match(current_line)
+        if (
+            mask_align_match is not None
+            and _resolve_mask_const_expr(str(mask_align_match.group("const_expr"))) is not None
+            and int(mask_align_match.group("h")) > 0
+            and int(mask_align_match.group("w")) > 0
+        ):
             has_mask_align = True
     return has_interleaved_cf_gather and has_bn_reshape and has_mask_align
 
