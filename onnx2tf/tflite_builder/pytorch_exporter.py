@@ -28061,11 +28061,41 @@ def _build_fast_precanonicalize_repair_context(
                 consumers.setdefault(token, []).append(index)
             simple_alias_match = simple_alias_re.match(line)
             if simple_alias_match is not None:
-                aliases[str(simple_alias_match.group("lhs"))] = str(simple_alias_match.group("rhs"))
+                alias_lhs = str(simple_alias_match.group("lhs"))
+                alias_rhs = str(simple_alias_match.group("rhs"))
+                aliases[alias_lhs] = alias_rhs
+                if (
+                    alias_rhs in cf_like_names
+                    or alias_rhs.endswith("_cf")
+                    or alias_rhs.endswith("_out_cf")
+                ):
+                    cf_like_names.add(alias_lhs)
+                if alias_rhs in nhwc_like_names or "_nhwc" in alias_rhs:
+                    nhwc_like_names.add(alias_lhs)
             if lhs_name.endswith("_cf") or lhs_name.endswith("_out_cf"):
                 cf_like_names.add(lhs_name)
             if "_nhwc" in lhs_name:
                 nhwc_like_names.add(lhs_name)
+            permute_assign = _parse_torch_permute_assign(line)
+            if permute_assign is not None and str(permute_assign[1]) == lhs_name:
+                perm_values = [int(v) for v in list(permute_assign[3])]
+                if perm_values == [0, 2, 3, 1]:
+                    nhwc_like_names.add(lhs_name)
+                elif perm_values == [0, 3, 1, 2]:
+                    cf_like_names.add(lhs_name)
+            local_response_norm_input = _parse_local_response_norm_input_expr(rhs_expr)
+            if local_response_norm_input is not None:
+                if (
+                    local_response_norm_input in cf_like_names
+                    or local_response_norm_input.endswith("_cf")
+                    or local_response_norm_input.endswith("_out_cf")
+                ):
+                    cf_like_names.add(lhs_name)
+                if (
+                    local_response_norm_input in nhwc_like_names
+                    or "_nhwc" in local_response_norm_input
+                ):
+                    nhwc_like_names.add(lhs_name)
             apply_concat_args = _parse_apply_concat_inputs_axis_and_shape(rhs_expr)
             if apply_concat_args is not None:
                 _, axis, shape_values = apply_concat_args
@@ -28689,6 +28719,12 @@ def _repair_cf_pool_target_shape(
     if apply_pool2d_match is None:
         return None, None
     indent, lhs_name, input_name, rest, current_shape, is_max_pool, channel_last = apply_pool2d_match
+    input_is_immediate_nhwc_bridge = _has_immediate_rank4_permute_source(
+        lines,
+        index,
+        input_name,
+        [0, 2, 3, 1],
+    )
     consumer_layout = _fast_precanonicalize_infer_consumer_layout(
         lhs_name,
         index,
@@ -28710,22 +28746,38 @@ def _repair_cf_pool_target_shape(
             dynamic_nhwc_like_names,
             context,
         )
+    if (
+        input_is_immediate_nhwc_bridge
+        and channel_last
+        and _fast_precanonicalize_rank4_layout_hint(
+            current_shape,
+            preferred_channel_count=preferred_channel_count,
+        ) == "nhwc"
+    ):
+        return None, lhs_name
     should_repair = (
         not channel_last
-        or _fast_precanonicalize_is_cf_like(input_name, dynamic_cf_like_names, context)
-        or consumer_layout == "cf"
+        or (
+            not input_is_immediate_nhwc_bridge
+            and _fast_precanonicalize_is_cf_like(input_name, dynamic_cf_like_names, context)
+        )
+        or (not input_is_immediate_nhwc_bridge and consumer_layout == "cf")
     )
     if not should_repair:
         return None, None
-    if _fast_precanonicalize_rank4_layout_hint(
-        current_shape,
-        preferred_channel_count=preferred_channel_count,
-    ) == "cf":
-        return None, lhs_name
-    normalized_shape = _normalize_cf_rank4_shape(
+    current_layout_hint = _fast_precanonicalize_rank4_layout_hint(
         current_shape,
         preferred_channel_count=preferred_channel_count,
     )
+    if current_layout_hint == "cf":
+        if not channel_last:
+            return None, lhs_name
+        normalized_shape = list(current_shape)
+    else:
+        normalized_shape = _normalize_cf_rank4_shape(
+            current_shape,
+            preferred_channel_count=preferred_channel_count,
+        )
     rewritten = (
         f"{indent}{lhs_name} = _apply_pool2d("
         f"{input_name}, {rest}, target_shape={repr(normalized_shape)}, "
@@ -29809,6 +29861,66 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 nhwc_like_names.add(pool_lhs_name)
                 changed = True
                 line = lines[index]
+        apply_pool2d_assign = _parse_apply_pool2d_assign_with_shape(line)
+        if apply_pool2d_assign is not None:
+            pool_indent, pool_lhs_name, pool_input_name, pool_rest, pool_shape, pool_is_max, pool_channel_last = apply_pool2d_assign
+            input_is_immediate_nhwc_bridge = _has_immediate_rank4_permute_source(
+                lines,
+                index,
+                pool_input_name,
+                [0, 2, 3, 1],
+            )
+            input_is_immediate_cf_bridge = _has_immediate_rank4_permute_source(
+                lines,
+                index,
+                pool_input_name,
+                [0, 3, 1, 2],
+            )
+            if (
+                not pool_channel_last
+                and (
+                    input_is_immediate_nhwc_bridge
+                    or (
+                        not input_is_immediate_cf_bridge
+                        and _fast_precanonicalize_is_nhwc_like(
+                            pool_input_name,
+                            nhwc_like_names,
+                            repair_context,
+                        )
+                        and not _fast_precanonicalize_is_cf_like(
+                            pool_input_name,
+                            cf_like_names,
+                            repair_context,
+                        )
+                    )
+                )
+            ):
+                preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
+                    pool_lhs_name,
+                    cf_like_names,
+                    nhwc_like_names,
+                    repair_context,
+                )
+                if preferred_channel_count is None:
+                    preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
+                        pool_input_name,
+                        cf_like_names,
+                        nhwc_like_names,
+                        repair_context,
+                    )
+                normalized_shape = _normalize_nhwc_rank4_shape(
+                    pool_shape,
+                    preferred_channel_count=preferred_channel_count,
+                )
+                lines[index] = (
+                    f"{pool_indent}{pool_lhs_name} = _apply_pool2d("
+                    f"{pool_input_name}, {pool_rest}, "
+                    f"target_shape={repr(normalized_shape)}, "
+                    f"is_max_pool={pool_is_max}, channel_last=True)"
+                )
+                nhwc_like_names.add(pool_lhs_name)
+                changed = True
+                line = lines[index]
                 apply_pool2d_assign = _parse_apply_pool2d_assign_with_shape(line)
         if apply_pool2d_assign is not None:
             rewritten_pool_line, pool_lhs = _repair_cf_pool_target_shape(
@@ -29953,6 +30065,46 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         dynamic_apply_pool2d_assign = _parse_dynamic_apply_pool2d_assign(line)
         if dynamic_apply_pool2d_assign is not None:
             dynamic_pool_indent, lhs, input_name, dynamic_pool_rest, dynamic_pool_shape_input, dynamic_pool_is_max = dynamic_apply_pool2d_assign
+            input_is_immediate_nhwc_bridge = _has_immediate_rank4_permute_source(
+                lines,
+                index,
+                input_name,
+                [0, 2, 3, 1],
+            )
+            input_is_immediate_cf_bridge = _has_immediate_rank4_permute_source(
+                lines,
+                index,
+                input_name,
+                [0, 3, 1, 2],
+            )
+            if (
+                dynamic_pool_shape_input == input_name
+                and (
+                    input_is_immediate_nhwc_bridge
+                    or (
+                        not input_is_immediate_cf_bridge
+                        and _fast_precanonicalize_is_nhwc_like(
+                            input_name,
+                            nhwc_like_names,
+                            repair_context,
+                        )
+                        and not _fast_precanonicalize_is_cf_like(
+                            input_name,
+                            cf_like_names,
+                            repair_context,
+                        )
+                    )
+                )
+            ):
+                lines[index] = (
+                    f"{dynamic_pool_indent}{lhs} = _apply_pool2d("
+                    f"{input_name}, {dynamic_pool_rest}, "
+                    f"target_shape=_tensor_shape_list({dynamic_pool_shape_input}), "
+                    f"is_max_pool={dynamic_pool_is_max}, channel_last=True)"
+                )
+                nhwc_like_names.add(lhs)
+                changed = True
+                continue
             if (
                 not dynamic_pool_is_max
                 and (
@@ -31327,8 +31479,16 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                 is_max_pool,
             ) = parsed_pidnet_cf_pool
             if (
-                _pidnet_is_cf_like_name(input_name)
-                or _pidnet_has_cf_layout_consumer(lhs_name, start_index=index)
+                not _has_immediate_rank4_permute_source(
+                    lines,
+                    index,
+                    input_name,
+                    [0, 2, 3, 1],
+                )
+                and (
+                    _pidnet_is_cf_like_name(input_name)
+                    or _pidnet_has_cf_layout_consumer(lhs_name, start_index=index)
+                )
             ):
                 lines[index] = (
                     f"{pool_indent}{lhs_name} = _apply_pool2d("
@@ -35609,6 +35769,95 @@ def _parse_simple_assignment_line(line: str) -> Tuple[str, str, str] | None:
     )
 
 
+def _parse_torch_permute_assign(
+    line: str,
+) -> Tuple[str, str, str, List[int]] | None:
+    assign = _parse_simple_assignment_line(line)
+    if assign is None:
+        return None
+    indent, lhs, rhs = assign
+    stripped = rhs.strip()
+    if stripped.endswith(".contiguous()"):
+        stripped = stripped[: -len(".contiguous()")].strip()
+
+    def _parse_permute_like_args(args_expr: str) -> Tuple[str, List[int]] | None:
+        parts = _split_top_level_csv_exprs(args_expr)
+        input_expr: str | None = None
+        perm_expr: str | None = None
+        if len(parts) == 2 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input_expr = parts[0].strip()
+            perm_expr = parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input", kwargs.get("x"))
+            perm_expr = kwargs.get("perm", kwargs.get("dims"))
+        if input_expr is None or perm_expr is None:
+            return None
+        if re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None:
+            return None
+        try:
+            perm_value = ast.literal_eval(perm_expr)
+        except Exception:
+            return None
+        if not isinstance(perm_value, (list, tuple)):
+            return None
+        try:
+            perm = [int(v) for v in list(perm_value)]
+        except Exception:
+            return None
+        return input_expr, perm
+
+    for prefix in ("_torch_permute(", "torch.permute("):
+        if stripped.startswith(prefix) and stripped.endswith(")"):
+            parsed = _parse_permute_like_args(stripped[len(prefix) : -1])
+            if parsed is not None:
+                return indent, lhs, parsed[0], parsed[1]
+    method_match = re.fullmatch(
+        r"(?P<input>[A-Za-z0-9_]+)\.permute\((?P<perm>.+)\)",
+        stripped,
+    )
+    if method_match is None:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9_]+", str(method_match.group("input"))) is None:
+        return None
+    try:
+        perm = [
+            int(v)
+            for v in _normalize_permute_dims_expr(str(method_match.group("perm"))).split(",")
+        ]
+    except Exception:
+        return None
+    return indent, lhs, str(method_match.group("input")), perm
+
+
+def _has_immediate_rank4_permute_source(
+    lines: Sequence[str],
+    index: int,
+    tensor_name: str,
+    expected_perm: Sequence[int],
+) -> bool:
+    lookback = index - 1
+    while lookback >= 0:
+        candidate_line = str(lines[lookback]).strip()
+        if candidate_line == "":
+            lookback -= 1
+            continue
+        permute_assign = _parse_torch_permute_assign(lines[lookback])
+        return (
+            permute_assign is not None
+            and permute_assign[1] == str(tensor_name)
+            and list(permute_assign[3]) == [int(v) for v in list(expected_perm)]
+        )
+    return False
+
+
 def _parse_channel_last_gather_slice_assign(line: str) -> Tuple[str, str, str] | None:
     assign = _parse_simple_assignment_line(line)
     if assign is None:
@@ -35621,6 +35870,28 @@ def _parse_channel_last_gather_slice_assign(line: str) -> Tuple[str, str, str] |
     if slice_match is None:
         return None
     return lhs, str(slice_match.group("input")), str(slice_match.group("indices")).strip()
+
+
+def _parse_local_response_norm_input_expr(expr: str) -> str | None:
+    stripped = str(expr).strip()
+    prefix = "F.local_response_norm("
+    if not stripped.startswith(prefix) or not stripped.endswith(")"):
+        return None
+    parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+    input_expr: str | None = None
+    positional_index = 0
+    for part in parts:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+            key, value = part.split("=", 1)
+            if key.strip() == "input":
+                input_expr = value.strip()
+            continue
+        if positional_index == 0:
+            input_expr = part.strip()
+        positional_index += 1
+    if input_expr is None or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None:
+        return None
+    return input_expr
 
 
 def _extract_prefixed_call_exprs(text: str, prefix: str) -> List[str]:
