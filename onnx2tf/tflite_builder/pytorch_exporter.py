@@ -31573,6 +31573,83 @@ def _is_bread_resize_like_expr(expr: str, known_resize_outputs: Set[str]) -> boo
     return False
 
 
+def _parse_binary_add_args(expr: str) -> Tuple[str, str] | None:
+    parts = _split_top_level_csv_exprs(str(expr))
+    if len(parts) == 2 and all("=" not in part for part in parts):
+        return parts[0].strip(), parts[1].strip()
+
+    kwargs: Dict[str, str] = {}
+    for part in parts:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        kwargs[key.strip()] = value.strip()
+    input_expr = kwargs.get("input", None)
+    other_expr = kwargs.get("other", None)
+    if input_expr is None or other_expr is None:
+        return None
+    return input_expr, other_expr
+
+
+def _normalize_permute_dims_expr(expr: str) -> str:
+    stripped = str(expr).strip()
+    if (
+        (stripped.startswith("(") and stripped.endswith(")"))
+        or (stripped.startswith("[") and stripped.endswith("]"))
+    ):
+        stripped = stripped[1:-1].strip()
+    return re.sub(r"\s+", "", stripped)
+
+
+def _resolve_nhwc_to_nchw_bridge_source(expr: str) -> str | None:
+    stripped = str(expr).strip()
+    if stripped.endswith(".contiguous()"):
+        stripped = stripped[: -len(".contiguous()")].strip()
+
+    functional_match = re.match(
+        r"^torch\.permute\((?P<args>.+)\)$",
+        stripped,
+    )
+    if functional_match is not None:
+        parts = _split_top_level_csv_exprs(str(functional_match.group("args")))
+        if len(parts) == 2 and "=" not in parts[0] and "=" not in parts[1]:
+            source_expr = parts[0].strip()
+            dims_expr = _normalize_permute_dims_expr(parts[1])
+            if re.match(r"^[A-Za-z0-9_]+$", source_expr) is not None and dims_expr == "0,3,1,2":
+                return source_expr
+            return None
+
+        kwargs: Dict[str, str] = {}
+        for part in parts:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            kwargs[key.strip()] = value.strip()
+        source_expr = kwargs.get("input", None)
+        if source_expr is None:
+            source_expr = kwargs.get("x", None)
+        dims_expr = kwargs.get("dims", None)
+        if source_expr is None or dims_expr is None:
+            return None
+        if re.match(r"^[A-Za-z0-9_]+$", source_expr) is None:
+            return None
+        if _normalize_permute_dims_expr(dims_expr) != "0,3,1,2":
+            return None
+        return source_expr
+
+    method_match = re.match(
+        r"^(?P<src>[A-Za-z0-9_]+)\.permute\((?P<dims>.+)\)$",
+        stripped,
+    )
+    if method_match is not None:
+        dims_expr = _normalize_permute_dims_expr(str(method_match.group("dims")))
+        if dims_expr == "0,3,1,2":
+            return str(method_match.group("src"))
+        return None
+
+    return None
+
+
 def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
     resize_assign_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\([A-Za-z0-9_]+, \[\d+, \d+\], method='[^']+', "
@@ -32077,16 +32154,22 @@ def _has_humanseg_skip_signature(lines: Sequence[str]) -> bool:
 
 def _has_version_rfb_skip_signature(lines: Sequence[str]) -> bool:
     align_add_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<args>.+)\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     permuted_conv_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = self\.conv_block_\d+\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+        r"^\s*[A-Za-z0-9_]+ = self\.conv_block_\d+\((?P<src_expr>.+)\)$"
     )
     axis1_concat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[[A-Za-z0-9_, ]+\], axis=1, target_shape=\[1, \d+, 2\], fused='NONE'\)$"
+        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>.+)\], axis=1, target_shape=\[1, \d+, 2\], fused='NONE'\)$"
     )
     axis2_boxes_concat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[[A-Za-z0-9_, ]+\], axis=2, target_shape=\[1, \d+, 4\], fused='NONE'\)$"
+        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>.+)\], axis=2, target_shape=\[1, \d+, 4\], fused='NONE'\)$"
+    )
+    axis1_torch_cat_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>.+)\], dim=1\)$"
+    )
+    axis2_torch_cat_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>.+)\], dim=2\)$"
     )
 
     align_add_lhs: Set[str] = set()
@@ -32094,27 +32177,50 @@ def _has_version_rfb_skip_signature(lines: Sequence[str]) -> bool:
         match = align_add_re.match(str(line))
         if match is None:
             continue
+        if _parse_binary_add_args(str(match.group("args"))) is None:
+            continue
         if int(match.group("d3")) == 64:
             align_add_lhs.add(str(match.group("lhs")))
     if not align_add_lhs:
         return False
-    if not _any_line_matches(lines, axis1_concat_re.pattern):
+    has_axis1_concat = False
+    has_axis2_boxes_concat = False
+    for line in lines:
+        current_line = str(line)
+        axis1_match = axis1_concat_re.match(current_line)
+        if axis1_match is None:
+            axis1_match = axis1_torch_cat_re.match(current_line)
+        if axis1_match is not None:
+            inputs = _split_top_level_csv_exprs(str(axis1_match.group("inputs")))
+            if len(inputs) >= 2:
+                has_axis1_concat = True
+        axis2_match = axis2_boxes_concat_re.match(current_line)
+        if axis2_match is None:
+            axis2_match = axis2_torch_cat_re.match(current_line)
+        if axis2_match is not None:
+            inputs = _split_top_level_csv_exprs(str(axis2_match.group("inputs")))
+            if len(inputs) >= 2:
+                has_axis2_boxes_concat = True
+    if not has_axis1_concat:
         return False
-    if not _any_line_matches(lines, axis2_boxes_concat_re.pattern):
+    if not has_axis2_boxes_concat:
         return False
     for line in lines:
         match = permuted_conv_re.match(str(line))
-        if match is not None and str(match.group("src")) in align_add_lhs:
+        if match is None:
+            continue
+        source_name = _resolve_nhwc_to_nchw_bridge_source(str(match.group("src_expr")))
+        if source_name in align_add_lhs:
             return True
     return False
 
 
 def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
     permuted_conv_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = self\.conv_block_(?P<module>\d+)\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+        r"^\s*[A-Za-z0-9_]+ = self\.conv_block_(?P<module>\d+)\((?P<src_expr>.+)\)$"
     )
     align_add_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\((?P<args>.+)\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     permute_bridge_assign_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
@@ -32140,10 +32246,14 @@ def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
         current_line = str(line)
         conv_match = permuted_conv_re.match(current_line)
         if conv_match is not None:
+            if _resolve_nhwc_to_nchw_bridge_source(str(conv_match.group("src_expr"))) is None:
+                continue
             seen_modules.add(str(conv_match.group("module")))
             continue
         align_match = align_add_re.match(current_line)
         if align_match is not None:
+            if _parse_binary_add_args(str(align_match.group("args"))) is None:
+                continue
             if int(align_match.group("d3")) == 64:
                 seen_rank4_channel64 = True
             if int(align_match.group("d3")) == 3:
@@ -32776,6 +32886,10 @@ def _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_path: 
         return False
     model_source = model_path.read_text(encoding="utf-8")
     model_lines = _model_source_lines(model_source)
+    if _has_version_rfb_skip_signature(model_lines):
+        return True
+    if _has_iat_llie_skip_signature(model_lines):
+        return True
     if _has_bread_decoder_merge_signature(model_lines) and _has_bread_output_bridge_signature(model_lines):
         return True
     if _has_nhwc_stem_pool_bridge_signature(model_lines):

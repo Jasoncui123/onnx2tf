@@ -8929,6 +8929,240 @@ def test_should_skip_expensive_raw_canonicalize_for_version_rfb_semantic_signatu
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_version_rfb_semantic_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_semantic_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add_lhs, add_rhs, cls0, cls1, box0, box1):",
+                "        detector_add = _align_tensor_to_target_shape(torch.add(add_lhs, add_rhs), [1, 80, 80, 64])",
+                "        detector_conv = self.conv_block_17(detector_add.permute(0, 3, 1, 2).contiguous())",
+                "        scores = _apply_concat([cls0, cls1], axis=1, target_shape=[1, 12800, 2], fused='NONE')",
+                "        boxes = _apply_concat([box0, box1], axis=2, target_shape=[1, 12800, 4], fused='NONE')",
+                "        return detector_conv, scores, boxes",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_version_rfb_with_inline_concat_inputs(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_inline_concat_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, a, b, c0, c1, b0, b1):",
+                "        merge_features = _align_tensor_to_target_shape(torch.add(a, b), [1, 60, 80, 64])",
+                "        head_out = self.conv_block_25(merge_features.permute(0, 3, 1, 2).contiguous())",
+                "        scores = _apply_concat([c0, _align_tensor_to_target_shape(c1, [1, 17640, 2])], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
+                "        boxes = _apply_concat([b0, _align_tensor_to_target_shape(b1, [1, 17640, 4])], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
+                "        return scores, boxes, head_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_version_rfb_with_inline_concat_inputs(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_inline_concat_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add_lhs, add_rhs, cls0, cls1, box0, box1):",
+                "        detector_add = _align_tensor_to_target_shape(torch.add(add_lhs, add_rhs), [1, 80, 80, 64])",
+                "        detector_conv = self.conv_block_17(detector_add.permute(0, 3, 1, 2).contiguous())",
+                "        scores = _apply_concat([cls0, _align_tensor_to_target_shape(cls1, [1, 12800, 2])], axis=1, target_shape=[1, 12800, 2], fused='NONE')",
+                "        boxes = _apply_concat([box0, _align_tensor_to_target_shape(box1, [1, 12800, 4])], axis=2, target_shape=[1, 12800, 4], fused='NONE')",
+                "        return detector_conv, scores, boxes",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_version_rfb_with_keyword_add(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_keyword_add_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, a, b, c0, c1, b0, b1):",
+                "        merge_features = _align_tensor_to_target_shape(torch.add(other=b, input=a), [1, 60, 80, 64])",
+                "        head_out = self.conv_block_25(merge_features.permute(0, 3, 1, 2).contiguous())",
+                "        scores = _apply_concat([c0, c1], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
+                "        boxes = _apply_concat([b0, b1], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
+                "        return scores, boxes, head_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_version_rfb_with_keyword_add(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_keyword_add_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add_lhs, add_rhs, cls0, cls1, box0, box1):",
+                "        detector_add = _align_tensor_to_target_shape(torch.add(input=add_lhs, other=add_rhs), [1, 80, 80, 64])",
+                "        detector_conv = self.conv_block_17(detector_add.permute(0, 3, 1, 2).contiguous())",
+                "        scores = _apply_concat([cls0, cls1], axis=1, target_shape=[1, 12800, 2], fused='NONE')",
+                "        boxes = _apply_concat([box0, box1], axis=2, target_shape=[1, 12800, 4], fused='NONE')",
+                "        return detector_conv, scores, boxes",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_version_rfb_with_functional_permute_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_functional_permute_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, a, b, c0, c1, b0, b1):",
+                "        merge_features = _align_tensor_to_target_shape(torch.add(a, b), [1, 60, 80, 64])",
+                "        head_out = self.conv_block_25(torch.permute(input=merge_features, dims=[0, 3, 1, 2]).contiguous())",
+                "        scores = _apply_concat([c0, c1], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
+                "        boxes = _apply_concat([b0, b1], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
+                "        return scores, boxes, head_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_version_rfb_with_functional_permute_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_functional_permute_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add_lhs, add_rhs, cls0, cls1, box0, box1):",
+                "        detector_add = _align_tensor_to_target_shape(torch.add(add_lhs, add_rhs), [1, 80, 80, 64])",
+                "        detector_conv = self.conv_block_17(torch.permute(detector_add, (0, 3, 1, 2)).contiguous())",
+                "        scores = _apply_concat([cls0, cls1], axis=1, target_shape=[1, 12800, 2], fused='NONE')",
+                "        boxes = _apply_concat([box0, box1], axis=2, target_shape=[1, 12800, 4], fused='NONE')",
+                "        return detector_conv, scores, boxes",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_version_rfb_with_torch_cat_heads(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_torch_cat_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, a, b, c0, c1, b0, b1):",
+                "        merge_features = _align_tensor_to_target_shape(torch.add(a, b), [1, 60, 80, 64])",
+                "        head_out = self.conv_block_25(merge_features.permute(0, 3, 1, 2).contiguous())",
+                "        scores = torch.cat([c0, c1], dim=1)",
+                "        boxes = torch.cat([b0, b1], dim=2)",
+                "        return scores, boxes, head_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_version_rfb_with_torch_cat_heads(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_torch_cat_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add_lhs, add_rhs, cls0, cls1, box0, box1):",
+                "        detector_add = _align_tensor_to_target_shape(torch.add(add_lhs, add_rhs), [1, 80, 80, 64])",
+                "        detector_conv = self.conv_block_17(detector_add.permute(0, 3, 1, 2).contiguous())",
+                "        scores = torch.cat([cls0, cls1], dim=1)",
+                "        boxes = torch.cat([box0, box1], dim=2)",
+                "        return detector_conv, scores, boxes",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_skip_expensive_raw_canonicalize_for_version_rfb_with_generic_conv_and_boxes_names(
     tmp_path,
 ) -> None:
@@ -8980,6 +9214,141 @@ def test_should_skip_expensive_raw_canonicalize_for_iat_llie_semantic_signature(
     )
 
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_iat_llie_semantic_signature(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_semantic_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add64_lhs, add64_rhs, add3_lhs, add3_rhs, out_nhwc):",
+                "        feature64 = _align_tensor_to_target_shape(torch.add(add64_lhs, add64_rhs), [1, 180, 320, 64])",
+                "        feature3 = _align_tensor_to_target_shape(torch.add(add3_lhs, add3_rhs), [1, 180, 320, 3])",
+                "        head0 = self.conv_block_7(feature64.permute(0, 3, 1, 2).contiguous())",
+                "        head1 = self.conv_block_19(feature3.permute(0, 3, 1, 2).contiguous())",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return head0, head1, out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_iat_llie_with_keyword_add(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_keyword_add_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_in, tail_in, a, b, c, d, out_public_layout_bridge):",
+                "        cv25_in_cf = self.conv_block_0(stem_in.permute(0, 3, 1, 2).contiguous())",
+                "        mix64 = _align_tensor_to_target_shape(torch.add(other=b, input=a), [1, 45, 80, 64])",
+                "        cv108_out_cf = self.conv_block_16(tail_in.permute(0, 3, 1, 2).contiguous())",
+                "        img_high = _align_tensor_to_target_shape(torch.add(input=c, other=d), [1, 180, 320, 3])",
+                "        out = _torch_permute(out_public_layout_bridge, [0, 3, 1, 2])",
+                "        return cv25_in_cf, mix64, cv108_out_cf, img_high, out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_iat_llie_with_keyword_add(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_keyword_add_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add64_lhs, add64_rhs, add3_lhs, add3_rhs, out_nhwc):",
+                "        feature64 = _align_tensor_to_target_shape(torch.add(other=add64_rhs, input=add64_lhs), [1, 180, 320, 64])",
+                "        feature3 = _align_tensor_to_target_shape(torch.add(input=add3_lhs, other=add3_rhs), [1, 180, 320, 3])",
+                "        head0 = self.conv_block_7(feature64.permute(0, 3, 1, 2).contiguous())",
+                "        head1 = self.conv_block_19(feature3.permute(0, 3, 1, 2).contiguous())",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return head0, head1, out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_iat_llie_with_functional_permute_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_functional_permute_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_in, tail_in, a, b, c, d, out_public_layout_bridge):",
+                "        cv25_in_cf = self.conv_block_0(torch.permute(stem_in, (0, 3, 1, 2)).contiguous())",
+                "        mix64 = _align_tensor_to_target_shape(torch.add(a, b), [1, 45, 80, 64])",
+                "        cv108_out_cf = self.conv_block_16(torch.permute(input=tail_in, dims=[0, 3, 1, 2]).contiguous())",
+                "        img_high = _align_tensor_to_target_shape(torch.add(c, d), [1, 180, 320, 3])",
+                "        out = _torch_permute(out_public_layout_bridge, [0, 3, 1, 2])",
+                "        return cv25_in_cf, mix64, cv108_out_cf, img_high, out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_iat_llie_with_functional_permute_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_functional_permute_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add64_lhs, add64_rhs, add3_lhs, add3_rhs, out_nhwc):",
+                "        feature64 = _align_tensor_to_target_shape(torch.add(add64_lhs, add64_rhs), [1, 180, 320, 64])",
+                "        feature3 = _align_tensor_to_target_shape(torch.add(add3_lhs, add3_rhs), [1, 180, 320, 3])",
+                "        head0 = self.conv_block_7(torch.permute(feature64, (0, 3, 1, 2)).contiguous())",
+                "        head1 = self.conv_block_19(torch.permute(input=feature3, dims=[0, 3, 1, 2]).contiguous())",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return head0, head1, out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
 def test_should_skip_expensive_raw_canonicalize_for_iat_llie_with_generic_conv_indices(
