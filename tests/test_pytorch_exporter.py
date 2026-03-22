@@ -259,6 +259,30 @@ def test_rewrite_channel_last_binary_bridge_chains_handles_nchw_target_shape() -
     ]
 
 
+def test_rewrite_channel_last_binary_bridge_chains_accepts_helper_permute_bridges() -> None:
+    lines = [
+        "in_public_layout_bridge = _torch_permute(input=in_t, perm=(0, 2, 3, 1))",
+        "_binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(in_public_layout_bridge, self.const_tensor_623_nhwc, [1, 3, 64, 64])",
+        "cv65_in = _align_tensor_to_target_shape(torch.sub(_binary_lhs_1, _binary_rhs_1), [1, 3, 64, 64])",
+        "cv65_out_nhwc_cf = self.conv_block_0(_torch_permute(input=cv65_in, perm=(0, 3, 1, 2)))",
+    ]
+
+    rewritten = _rewrite_channel_last_binary_bridge_chains(
+        lines,
+        derive_local_var_name=lambda base_name: f"{base_name}_tmp",
+        channel_first_constant_expr_for_buffer_attr=lambda buffer_expr, target_shape: (
+            "self.const_tensor623_nhwc_ch_first1_x3_x1_x1"
+            if buffer_expr == "self.const_tensor_623_nhwc" and list(target_shape) == [1, 3, 1, 1]
+            else None
+        ),
+    )
+
+    assert rewritten == [
+        "cv65_in_cf_tmp = torch.sub(in_t, self.const_tensor623_nhwc_ch_first1_x3_x1_x1)",
+        "cv65_out_nhwc_cf = self.conv_block_0(cv65_in_cf_tmp)",
+    ]
+
+
 def test_fold_channel_last_affine_conv_bridges_handles_compact_assignments() -> None:
     lines = [
         "x_nhwc=_align_tensor_to_target_shape(x_cf.permute(0, 2, 3, 1).contiguous(), [1, 8, 8, 4])",
@@ -296,6 +320,35 @@ def test_fold_channel_last_affine_conv_bridges_accepts_keyword_tuple_shapes() ->
         "_binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(input=mul0, other=self.const_add_any, target_shape=(1, 8, 8, 4))",
         "add0 = _align_tensor_to_target_shape(input=torch.add(input=_binary_lhs_1, other=_binary_rhs_1), target_shape=(1, 8, 8, 4))",
         "y = self.conv_block_0(add0.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+    rewritten = _fold_channel_last_affine_conv_bridges(
+        lines,
+        derive_local_var_name=lambda base_name: f"{base_name}_tmp",
+        channel_first_constant_expr_for_buffer_attr=lambda buffer_expr, target_shape: (
+            "self.const_mul_cf"
+            if buffer_expr == "self.const_mul_any" and list(target_shape) == [1, 4, 1, 1]
+            else "self.const_add_cf"
+            if buffer_expr == "self.const_add_any" and list(target_shape) == [1, 4, 1, 1]
+            else None
+        ),
+    )
+
+    assert rewritten == [
+        "mul0_cf_tmp = torch.mul(x_cf, self.const_mul_cf)",
+        "add0_cf_tmp = torch.add(mul0_cf_tmp, self.const_add_cf)",
+        "y = self.conv_block_0(add0_cf_tmp)",
+    ]
+
+
+def test_fold_channel_last_affine_conv_bridges_accepts_helper_permute_bridges() -> None:
+    lines = [
+        "x_nhwc = _align_tensor_to_target_shape(input=_torch_permute(input=x_cf, perm=(0, 2, 3, 1)), target_shape=(1, 8, 8, 4))",
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs(input=x_nhwc, other=self.const_mul_any, target_shape=(1, 8, 8, 4))",
+        "mul0 = _align_tensor_to_target_shape(input=torch.mul(input=_binary_lhs_0, other=_binary_rhs_0), target_shape=(1, 8, 8, 4))",
+        "_binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(input=mul0, other=self.const_add_any, target_shape=(1, 8, 8, 4))",
+        "add0 = _align_tensor_to_target_shape(input=torch.add(input=_binary_lhs_1, other=_binary_rhs_1), target_shape=(1, 8, 8, 4))",
+        "y = self.conv_block_0(_torch_permute(input=add0, perm=(0, 3, 1, 2)))",
     ]
 
     rewritten = _fold_channel_last_affine_conv_bridges(
@@ -367,6 +420,22 @@ def test_rewrite_channel_last_gap_means_to_reduce_mean_accepts_keyword_tuple_inl
     rewritten = _rewrite_channel_last_gap_means_to_reduce_mean(lines)
 
     assert rewritten == [
+        "gap_nhwc = _reduce_mean(features_cf.permute(0, 2, 3, 1).contiguous(), _normalize_axes([1, 2], features_cf.permute(0, 2, 3, 1).contiguous().ndim), keepdims=True)",
+    ]
+
+
+def test_rewrite_channel_last_gap_means_to_reduce_mean_accepts_helper_and_functional_permute() -> None:
+    lines = [
+        "t_1780 = _align_tensor_to_target_shape(input=torch.permute(input=t1780_cf, dims=(0, 2, 1)).contiguous(), target_shape=(1, 4096, 180))",
+        "t1781_cf = torch.mean(input=t_1780, dim=(2,), keepdim=True)",
+        "gap_nhwc = torch.mean(input=_torch_permute(input=features_cf, perm=(0, 2, 3, 1)), dim=(1, 2), keepdim=True)",
+    ]
+
+    rewritten = _rewrite_channel_last_gap_means_to_reduce_mean(lines)
+
+    assert rewritten == [
+        "t_1780 = _align_tensor_to_target_shape(input=torch.permute(input=t1780_cf, dims=(0, 2, 1)).contiguous(), target_shape=(1, 4096, 180))",
+        "t1781_cf = torch.mean(t1780_cf, dim=1, keepdim=True)",
         "gap_nhwc = _reduce_mean(features_cf.permute(0, 2, 3, 1).contiguous(), _normalize_axes([1, 2], features_cf.permute(0, 2, 3, 1).contiguous().ndim), keepdims=True)",
     ]
 
@@ -8955,6 +9024,53 @@ def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_with_compact_r
     assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_with_keyword_sub_and_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_mask_keyword_tail_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_268_bn_mul', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_BatchNormalization_268_bn_add', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_tensor786_expand_x80_x2_af49', torch.zeros([1, 80, 80, 2], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, cv265_out_cf: torch.Tensor, t_791: torch.Tensor) -> torch.Tensor:",
+                "        resize267_out = _apply_resize(cv265_out_cf, [80, 80], method='bilinear', target_shape=[1, 80, 80, 2], align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        batch_normalization268_mul_out = _align_tensor_to_target_shape(torch.mul(resize267_out, self.const_BatchNormalization_268_bn_mul), [1, 80, 80, 2])",
+                "        t_753 = _align_tensor_to_target_shape(torch.add(batch_normalization268_mul_out, self.const_BatchNormalization_268_bn_add), [1, 80, 80, 2])",
+                "        t_756 = _apply_softmax(t_753, axis=3, beta=1.0, target_shape=[1, 80, 80, 2])",
+                "        t_757 = _reduce_max(t_756, _normalize_axes([3], t_756.ndim), False)",
+                "        t_771 = _align_tensor_to_target_shape(input=torch.sub(input=torch.as_tensor(1.0, dtype=torch.float32, device=_module_device(self)), other=t_757), target_shape=(1, 80, 80))",
+                "        t_772 = torch.reshape(input=t_771, shape=(1, 80, 80, 1))",
+                "        _binary_lhs_196, _binary_rhs_196 = _align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49, [1, 2, 80, 80])",
+                "        t_786 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_196, _binary_rhs_196), [1, 2, 80, 80])",
+                "        return t_786",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "t_771 = _align_tensor_to_target_shape(torch.sub(torch.as_tensor(1.0, dtype=torch.float32, "
+        "device=_module_device(self)), t_757), [1, 1, 80, 80])"
+        in rewritten
+    )
+    assert "t_772 = t_771" in rewritten
+    assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_with_compact_tuple_lhs_binary_align(
     tmp_path,
 ) -> None:
@@ -9507,6 +9623,42 @@ def test_apply_fast_precanonicalize_repairs_normalizes_cf_resize_target_shape_by
     ) in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_normalizes_cf_resize_target_shape_with_reordered_keyword_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_resize_topology_reordered_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_bn_mul', torch.zeros([1, 1, 1, 5], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, features_cf: torch.Tensor) -> torch.Tensor:",
+                "        resize_out = _apply_resize(target_shape=(1, 48, 5, 64), input=features_cf, size=(48, 64), method='bilinear', half_pixel_centers=True, channel_last=False, align_corners=False)",
+                "        bn_out = _align_tensor_to_target_shape(torch.mul(resize_out, self.const_bn_mul), [1, 5, 48, 64])",
+                "        return bn_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize_out = _apply_resize(features_cf, [48, 64], method='bilinear', "
+        "target_shape=[1, 5, 48, 64], align_corners=False, "
+        "half_pixel_centers=True, channel_last=False)"
+    ) in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_keeps_already_correct_cf_resize_target_shape(
     tmp_path,
 ) -> None:
@@ -9576,6 +9728,47 @@ def test_apply_fast_precanonicalize_repairs_repairs_cf_pool_and_binary_alignment
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "pooled = _apply_pool2d(features_cf_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)" in rewritten
+    assert "merged = _align_tensor_to_target_shape(torch.add(pooled, residual_cf), [1, 24, 104, 104])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_repairs_cf_pool_and_binary_alignment_with_reordered_keyword_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_pool_binary_topology_reordered_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=24,",
+                "            out_channels=32,",
+                "        )",
+                "",
+                "    def forward(self, features_cf: torch.Tensor, residual_cf: torch.Tensor) -> torch.Tensor:",
+                "        features_cf_padded = F.pad(features_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        pooled = _apply_pool2d(channel_last=False, stride_w=2, input=features_cf_padded, target_shape=(1, 104, 104, 24), filter_height=3, padding='VALID', is_max_pool=True, stride_h=2, filter_width=3)",
+                "        merged = _align_tensor_to_target_shape(torch.add(pooled, residual_cf), [1, 104, 104, 24])",
+                "        out = self.conv_block_0(merged)",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "pooled = _apply_pool2d(features_cf_padded, stride_w=2, filter_height=3, padding='VALID', "
+        "stride_h=2, filter_width=3, target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)"
+    ) in rewritten
     assert "merged = _align_tensor_to_target_shape(torch.add(pooled, residual_cf), [1, 24, 104, 104])" in rewritten
 
 
@@ -41051,6 +41244,20 @@ def test_fold_channel_first_gap_conv_bridges_accepts_keyword_tuple_dims() -> Non
     ]
 
 
+def test_fold_channel_first_gap_conv_bridges_accepts_helper_permute_input() -> None:
+    lines = [
+        "gap = torch.mean(input=features_cf, dim=(2, 3), keepdim=True)",
+        "y = self.conv_block_0(_torch_permute(input=gap, perm=(0, 3, 1, 2)))",
+    ]
+
+    repaired = _fold_channel_first_gap_conv_bridges(lines)
+
+    assert repaired == [
+        "gap = torch.mean(input=features_cf, dim=(2, 3), keepdim=True)",
+        "y = self.conv_block_0(gap)",
+    ]
+
+
 def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_handles_compact_assignments() -> None:
     lines = [
         "gap=torch.mean(features_cf, dim=[2, 3], keepdim=True)",
@@ -41252,6 +41459,20 @@ def test_fold_channel_last_prelu_bridges_rewrites_compact_assignments() -> None:
         "x_cf=_torch_permute(x, [0, 3, 1, 2])",
         "x_prelu=self.prelu_0(x_cf)",
         "y=_torch_permute(x_prelu, [0, 2, 3, 1])",
+    ]
+
+    rewritten = _fold_channel_last_prelu_bridges(lines)
+
+    assert rewritten == [
+        "y = self.prelu_0(x.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()",
+    ]
+
+
+def test_fold_channel_last_prelu_bridges_accepts_method_and_functional_permute() -> None:
+    lines = [
+        "x_cf = torch.permute(input=x, dims=(0, 3, 1, 2)).contiguous()",
+        "x_prelu = self.prelu_0(x_cf)",
+        "y = x_prelu.permute(0, 2, 3, 1).contiguous()",
     ]
 
     rewritten = _fold_channel_last_prelu_bridges(lines)
