@@ -29118,13 +29118,28 @@ def _repair_cf_pool_target_shape(
             context,
             shape_hint=current_shape,
         )
+    current_layout_hint = _fast_precanonicalize_rank4_layout_hint(
+        current_shape,
+        preferred_channel_count=preferred_channel_count,
+    )
+    if (
+        channel_last
+        and _fast_precanonicalize_is_nhwc_like(
+            input_name,
+            dynamic_nhwc_like_names,
+            context,
+        )
+        and not _fast_precanonicalize_is_cf_like(
+            input_name,
+            dynamic_cf_like_names,
+            context,
+        )
+    ):
+        return None, lhs_name
     if (
         input_is_immediate_nhwc_bridge
         and channel_last
-        and _fast_precanonicalize_rank4_layout_hint(
-            current_shape,
-            preferred_channel_count=preferred_channel_count,
-        ) == "nhwc"
+        and current_layout_hint == "nhwc"
     ):
         return None, lhs_name
     should_repair = (
@@ -29137,10 +29152,6 @@ def _repair_cf_pool_target_shape(
     )
     if not should_repair:
         return None, None
-    current_layout_hint = _fast_precanonicalize_rank4_layout_hint(
-        current_shape,
-        preferred_channel_count=preferred_channel_count,
-    )
     if current_layout_hint == "cf":
         if not channel_last:
             return None, lhs_name
@@ -29158,6 +29169,214 @@ def _repair_cf_pool_target_shape(
     if rewritten == line:
         return None, lhs_name
     return rewritten, lhs_name
+
+
+def _repair_nhwc_average_pool_binary_bridge(
+    index: int,
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> Tuple[bool, Set[str]]:
+    def _parse_binary_anchor_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, str, str, List[int]] | None:
+        assign_match = re.match(
+            r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(current_line),
+        )
+        if assign_match is None:
+            return None
+        rhs = str(assign_match.group("rhs")).strip()
+        prefix = "_align_binary_inputs_to_anchor("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        if len(parts) != 3:
+            return None
+        input_a = parts[0].strip()
+        input_b = parts[1].strip()
+        anchor_shape = _parse_rank4_shape_literal(parts[2].strip())
+        if anchor_shape is None:
+            return None
+        return (
+            str(assign_match.group("indent")),
+            str(assign_match.group("lhs0")),
+            str(assign_match.group("lhs1")),
+            input_a,
+            input_b,
+            [int(v) for v in list(anchor_shape)],
+        )
+
+    if index + 2 >= len(lines):
+        return False, set()
+    apply_pool2d_match = _parse_apply_pool2d_assign_with_shape(lines[index])
+    if apply_pool2d_match is None:
+        return False, set()
+    (
+        pool_indent,
+        pool_lhs_name,
+        pool_input_name,
+        pool_rest,
+        pool_shape,
+        pool_is_max,
+        _pool_channel_last,
+    ) = apply_pool2d_match
+    if pool_is_max:
+        return False, set()
+    if not (
+        _fast_precanonicalize_is_nhwc_like(
+            pool_input_name,
+            dynamic_nhwc_like_names,
+            context,
+        )
+        or "_nhwc" in str(pool_lhs_name)
+    ):
+        return False, set()
+    binary_anchor_assign = _parse_binary_anchor_assign(lines[index + 1])
+    if binary_anchor_assign is None:
+        return False, set()
+    binary_indent, lhs0, lhs1, input_a, input_b, anchor_shape = binary_anchor_assign
+    if pool_lhs_name not in {str(input_a).strip(), str(input_b).strip()}:
+        return False, set()
+    mul_assign = _parse_simple_assignment_line(lines[index + 2])
+    if mul_assign is None:
+        return False, set()
+    mul_indent, mul_lhs, mul_rhs = mul_assign
+    align_args = _parse_align_tensor_target_shape_expr(mul_rhs)
+    if align_args is None:
+        return False, set()
+    mul_expr, mul_target_shape_expr = align_args
+    mul_target_shape = _parse_rank4_shape_literal(mul_target_shape_expr)
+    mul_match = re.fullmatch(r"torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)", mul_expr.strip())
+    if (
+        mul_target_shape is None
+        or mul_match is None
+        or {str(mul_match.group("a")), str(mul_match.group("b"))} != {str(lhs0), str(lhs1)}
+    ):
+        return False, set()
+    has_direct_nhwc_concat_consumer = False
+    for lookahead in range(index + 3, len(lines)):
+        future_assign = _parse_simple_assignment_line(lines[lookahead])
+        if future_assign is None:
+            continue
+        future_concat_args = _parse_apply_concat_inputs_axis_and_shape(future_assign[2])
+        if future_concat_args is not None:
+            future_inputs = [name.strip() for name in future_concat_args[0] if name.strip()]
+            if mul_lhs in future_inputs and int(future_concat_args[1]) == 3:
+                has_direct_nhwc_concat_consumer = True
+                break
+        future_cat_args = _parse_torch_cat_inputs_and_dim(future_assign[2])
+        if future_cat_args is not None:
+            future_inputs = [name.strip() for name in future_cat_args[0] if name.strip()]
+            if mul_lhs in future_inputs and int(future_cat_args[1]) == 3:
+                has_direct_nhwc_concat_consumer = True
+                break
+    mul_consumer_layout = _fast_precanonicalize_infer_consumer_layout(
+        mul_lhs,
+        index + 2,
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    )
+    if not has_direct_nhwc_concat_consumer and mul_consumer_layout != "nhwc":
+        return False, set()
+    preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
+        mul_lhs,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+        shape_hint=pool_shape,
+    )
+    if preferred_channel_count is None:
+        preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
+            pool_input_name,
+            dynamic_cf_like_names,
+            dynamic_nhwc_like_names,
+            context,
+            shape_hint=pool_shape,
+        )
+    if preferred_channel_count is None:
+        pool_dims = [int(v) for v in list(pool_shape[1:])]
+        for candidate in pool_dims:
+            if pool_dims.count(int(candidate)) == 1:
+                preferred_channel_count = int(candidate)
+                break
+    normalized_nhwc_shape = _normalize_nhwc_rank4_shape(
+        pool_shape,
+        preferred_channel_count=preferred_channel_count,
+    )
+
+    def _rewrite_binary_other_expr(expr: str) -> str:
+        stripped = str(expr).strip()
+        reshape_match = re.fullmatch(r"torch\.reshape\((?P<args>.+)\)", stripped)
+        if reshape_match is None:
+            return stripped
+        parts = _split_top_level_csv_exprs(str(reshape_match.group("args")))
+        reshape_input: str | None = None
+        reshape_shape_expr: str | None = None
+        if len(parts) == 2 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            reshape_input = parts[0].strip()
+            reshape_shape_expr = parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            reshape_input = kwargs.get("input")
+            reshape_shape_expr = kwargs.get("shape")
+        reshape_shape = (
+            _parse_rank4_shape_literal(reshape_shape_expr)
+            if reshape_shape_expr is not None
+            else None
+        )
+        if (
+            reshape_input is None
+            or reshape_shape is None
+        ):
+            return stripped
+        if list(reshape_shape) == list(normalized_nhwc_shape):
+            return stripped
+        return f"{reshape_input}.permute(0, 2, 3, 1).contiguous()"
+
+    rewritten_other_expr = _rewrite_binary_other_expr(
+        input_b if str(input_a).strip() == pool_lhs_name else input_a
+    )
+    rewritten_input_a = pool_lhs_name if str(input_a).strip() == pool_lhs_name else rewritten_other_expr
+    rewritten_input_b = rewritten_other_expr if str(input_a).strip() == pool_lhs_name else pool_lhs_name
+    changed = False
+    rewritten_pool_line = (
+        f"{pool_indent}{pool_lhs_name} = _apply_pool2d("
+        f"{pool_input_name}, {pool_rest}, "
+        f"target_shape={repr(normalized_nhwc_shape)}, "
+        f"is_max_pool={pool_is_max}, channel_last=True)"
+    )
+    if rewritten_pool_line != lines[index]:
+        lines[index] = rewritten_pool_line
+        changed = True
+    rewritten_binary_line = (
+        f"{binary_indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor("
+        f"{rewritten_input_a}, {rewritten_input_b}, {repr(normalized_nhwc_shape)})"
+    )
+    if rewritten_binary_line != lines[index + 1]:
+        lines[index + 1] = rewritten_binary_line
+        changed = True
+    rewritten_mul_line = (
+        f"{mul_indent}{mul_lhs} = _align_tensor_to_target_shape("
+        f"torch.mul({mul_match.group('a')}, {mul_match.group('b')}), {repr(normalized_nhwc_shape)})"
+    )
+    if rewritten_mul_line != lines[index + 2]:
+        lines[index + 2] = rewritten_mul_line
+        changed = True
+    updated_names: Set[str] = set()
+    if changed:
+        updated_names.update({str(pool_lhs_name), str(lhs0), str(lhs1), str(mul_lhs)})
+    return changed, updated_names
 
 
 def _restore_channel_last_spatial_pool_chains(model_path: Path) -> None:
@@ -29538,6 +29757,37 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         ):
             return None
         return lhs, op_name, str(binary_args[0]).strip(), str(binary_args[1]).strip(), list(target_shape)
+    def _parse_align_binary_inputs_to_anchor_assign_with_shape(
+        current_line: str,
+    ) -> Tuple[str, str, str, str, str, List[int]] | None:
+        assign_match = re.match(
+            r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(current_line),
+        )
+        if assign_match is None:
+            return None
+        rhs = str(assign_match.group("rhs")).strip()
+        prefix = "_align_binary_inputs_to_anchor("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        if len(parts) != 3:
+            return None
+        target_shape = _parse_rank4_shape_literal(parts[2].strip())
+        if (
+            target_shape is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", parts[0].strip()) is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", parts[1].strip()) is None
+        ):
+            return None
+        return (
+            str(assign_match.group("indent")),
+            str(assign_match.group("lhs0")),
+            str(assign_match.group("lhs1")),
+            parts[0].strip(),
+            parts[1].strip(),
+            [int(v) for v in list(target_shape)],
+        )
     aligned_rank4_any_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
@@ -29546,6 +29796,11 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         r"torch\.(?P<op>mul|add|sub|div)\((?P<input>[A-Za-z0-9_]+), "
         r"(?P<scalar>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?)\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+    )
+    dynamic_cf_binary_target_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
+        r"torch\.(?P<op>add|mul|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), "
+        r"\[int\((?P<ref>[A-Za-z0-9_]+)\.shape\[0\]\), (?P<c>\d+), int\((?P=ref)\.shape\[2\]\), int\((?P=ref)\.shape\[3\]\)\]\)$"
     )
     return_value_re = re.compile(
         r"^(?P<indent>\s*)return (?P<value>[A-Za-z0-9_]+)$"
@@ -30041,6 +30296,45 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         f"[{prev_shape[0]}, {prev_shape[1]}, {prev_shape[2]}, {prev_shape[3]}])"
                     )
                     changed = True
+        binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(line)
+        next_dynamic_cf_binary_target = (
+            dynamic_cf_binary_target_re.match(lines[index + 1])
+            if index + 1 < len(lines)
+            else None
+        )
+        if (
+            binary_anchor_assign is not None
+            and next_dynamic_cf_binary_target is not None
+            and {
+                str(next_dynamic_cf_binary_target.group("a")),
+                str(next_dynamic_cf_binary_target.group("b")),
+            }
+            == {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+        ):
+            indent, lhs0, lhs1, input_a, input_b, current_shape = binary_anchor_assign
+            preferred_channel_count = int(next_dynamic_cf_binary_target.group("c"))
+            if (
+                preferred_channel_count in current_shape[1:]
+                and (
+                    _fast_precanonicalize_is_cf_like(input_a, cf_like_names, repair_context)
+                    or _fast_precanonicalize_is_cf_like(input_b, cf_like_names, repair_context)
+                )
+            ):
+                normalized_anchor_shape = _normalize_cf_rank4_shape(
+                    current_shape,
+                    preferred_channel_count=preferred_channel_count,
+                )
+                rewritten_binary_anchor_line = (
+                    f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor("
+                    f"{input_a}, {input_b}, {repr(normalized_anchor_shape)})"
+                )
+                if rewritten_binary_anchor_line != lines[index]:
+                    lines[index] = rewritten_binary_anchor_line
+                    cf_like_names.update({lhs0, lhs1})
+                    repair_context.static_shapes[lhs0] = list(normalized_anchor_shape)
+                    repair_context.static_shapes[lhs1] = list(normalized_anchor_shape)
+                    changed = True
+                    line = lines[index]
         aligned_binary_match = aligned_binary_re.match(line)
         aligned_binary_assign = _parse_aligned_binary_assign_with_shape(line)
         if aligned_binary_match is not None or aligned_binary_assign is not None:
@@ -30224,6 +30518,32 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 cf_like_names.add(resize_lhs_name)
                 changed = True
         apply_pool2d_assign = _parse_apply_pool2d_assign_with_shape(line)
+        if apply_pool2d_assign is not None:
+            repaired_nhwc_avg_pool_bridge, nhwc_bridge_names = _repair_nhwc_average_pool_binary_bridge(
+                index,
+                lines,
+                cf_like_names,
+                nhwc_like_names,
+                repair_context,
+            )
+            if repaired_nhwc_avg_pool_bridge:
+                nhwc_like_names.update(nhwc_bridge_names)
+                cf_like_names.difference_update(nhwc_bridge_names)
+                normalized_bridge_shape = _normalize_nhwc_rank4_shape(
+                    apply_pool2d_assign[4],
+                    preferred_channel_count=_fast_precanonicalize_preferred_channel_count(
+                        str(apply_pool2d_assign[1]),
+                        cf_like_names,
+                        nhwc_like_names,
+                        repair_context,
+                        shape_hint=apply_pool2d_assign[4],
+                    ),
+                )
+                for updated_name in nhwc_bridge_names:
+                    repair_context.static_shapes[updated_name] = list(normalized_bridge_shape)
+                changed = True
+                line = lines[index]
+                apply_pool2d_assign = _parse_apply_pool2d_assign_with_shape(line)
         if apply_pool2d_assign is not None:
             pool_indent, pool_lhs_name, pool_input_name, pool_rest, pool_shape, pool_is_max, pool_channel_last = apply_pool2d_assign
             if (
@@ -30834,10 +31154,50 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         )
         cf_like_names.add(lhs)
         changed = True
+
+    for index in range(len(lines) - 1):
+        binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[index])
+        next_dynamic_cf_binary_target = dynamic_cf_binary_target_re.match(lines[index + 1])
+        if (
+            binary_anchor_assign is None
+            or next_dynamic_cf_binary_target is None
+            or {
+                str(next_dynamic_cf_binary_target.group("a")),
+                str(next_dynamic_cf_binary_target.group("b")),
+            }
+            != {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+        ):
+            continue
+        indent, lhs0, lhs1, input_a, input_b, current_shape = binary_anchor_assign
+        preferred_channel_count = int(next_dynamic_cf_binary_target.group("c"))
+        if (
+            preferred_channel_count not in current_shape[1:]
+            or not (
+                _fast_precanonicalize_is_cf_like(input_a, cf_like_names, repair_context)
+                or _fast_precanonicalize_is_cf_like(input_b, cf_like_names, repair_context)
+            )
+        ):
+            continue
+        normalized_anchor_shape = _normalize_cf_rank4_shape(
+            current_shape,
+            preferred_channel_count=preferred_channel_count,
+        )
+        rewritten_binary_anchor_line = (
+            f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor("
+            f"{input_a}, {input_b}, {repr(normalized_anchor_shape)})"
+        )
+        if rewritten_binary_anchor_line == lines[index]:
+            continue
+        lines[index] = rewritten_binary_anchor_line
+        cf_like_names.update({lhs0, lhs1})
+        repair_context.static_shapes[lhs0] = list(normalized_anchor_shape)
+        repair_context.static_shapes[lhs1] = list(normalized_anchor_shape)
+        changed = True
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     _apply_pidnet_fast_precanonicalize_repairs(model_path)
     _apply_humanseg_fast_precanonicalize_repairs(model_path)
+    _apply_fastestdet_fast_precanonicalize_repairs(model_path)
     _apply_alike_fast_precanonicalize_repairs(model_path)
     _apply_shadowformer_fast_precanonicalize_repairs(model_path)
     _restore_channel_last_spatial_pool_chains(model_path)
@@ -32956,6 +33316,148 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         and (singleton_anchor_count >= 1 or structural_fallback_ready)
         and has_stage7_return
     )
+
+def _apply_fastestdet_fast_precanonicalize_repairs(model_path: Path) -> None:
+    if not model_path.exists():
+        return
+    lines = model_path.read_text(encoding="utf-8").splitlines()
+    changed = False
+    for index, line in enumerate(lines):
+        indent = line[: len(line) - len(line.lstrip())]
+        stripped = str(line).strip()
+        if stripped == "max_p2_in_nhwc = max_p2_in_nhwc_cf":
+            if index + 2 < len(lines):
+                next_line = str(lines[index + 1]).strip()
+                next_next_line = str(lines[index + 2]).strip()
+                if (
+                    next_line.startswith("max_p2_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p2_in_nhwc, [1, 176, 176, 24]),")
+                    and next_next_line.startswith("max_p2_out_nhwc = _apply_pool2d(max_p2_in_nhwc_padded,")
+                ):
+                    lines[index + 1] = (
+                        f"{indent}max_p2_in_cf_padded = "
+                        "F.pad(max_p2_in_nhwc_cf, [1, 1, 1, 1], mode='constant', "
+                        "value=-3.4028234663852886e+38)"
+                    )
+                    lines[index + 2] = (
+                        f"{indent}max_p2_out_nhwc = "
+                        "_apply_pool2d(max_p2_in_cf_padded, filter_height=3, filter_width=3, "
+                        "stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 88, 88], "
+                        "is_max_pool=True, channel_last=False)"
+                    )
+                    changed = True
+            continue
+        if stripped.startswith("average_p229_in_nhwc_padded = F.pad(cv57_in_nhwc,"):
+            lines[index] = (
+                f"{indent}average_p229_in_nhwc_padded = "
+                "F.pad(cv57_in_nhwc, [0, 0, 1, 1, 1, 1], mode='constant', value=0.0)"
+            )
+            changed = True
+            continue
+        if stripped.startswith("average_p229_out_nhwc_include_pad = _apply_pool2d("):
+            lines[index] = (
+                f"{indent}average_p229_out_nhwc_include_pad = "
+                "_apply_pool2d(average_p229_in_nhwc_padded, filter_height=3, filter_width=3, "
+                "stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 22, 22, 48], "
+                "is_max_pool=False, channel_last=True)"
+            )
+            changed = True
+            continue
+        if stripped.startswith("_binary_lhs_61, _binary_rhs_61 = _align_binary_inputs_to_anchor("):
+            lines[index] = (
+                f"{indent}_binary_lhs_61, _binary_rhs_61 = "
+                "_align_binary_inputs_to_anchor(average_p229_out_nhwc_include_pad, "
+                "self.const_average_p229_x48_x22_5c41.permute(0, 2, 3, 1).contiguous(), [1, 22, 22, 48])"
+            )
+            changed = True
+            continue
+        if stripped.startswith("average_p229_out = _align_tensor_to_target_shape(torch.mul(_binary_lhs_61, _binary_rhs_61),"):
+            lines[index] = (
+                f"{indent}average_p229_out = "
+                "_align_tensor_to_target_shape(torch.mul(_binary_lhs_61, _binary_rhs_61), [1, 22, 22, 48])"
+            )
+            changed = True
+            continue
+        if stripped.startswith("_binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc,"):
+            lines[index] = (
+                f"{indent}_binary_rhs_230, _binary_lhs_230 = "
+                "_align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc, [1, 22, 22, 96])"
+            )
+            changed = True
+            continue
+        if stripped == "cv246_in = torch.cat([onnx_concat715_cf, onnx_concat721_cf, onnx_concat730_cf], dim=1)":
+            lines[index] = (
+                f"{indent}cv246_in = "
+                "_apply_concat([onnx_concat715_cf, onnx_concat721_cf, onnx_concat730_cf], "
+                "axis=3, target_shape=[1, 22, 22, 288], fused='NONE')"
+            )
+            changed = True
+            continue
+        if stripped.startswith("cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230),"):
+            lines[index] = (
+                f"{indent}cv249_in = "
+                "_align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 22, 22, 96])"
+            )
+            changed = True
+            continue
+        if stripped == "onnx_concat744_cf = self.conv_block_67(cv253_in_cf)":
+            lines[index] = (
+                f"{indent}onnx_concat744_cf = "
+                "_torch_permute(self.conv_block_67(cv253_in_cf), [0, 3, 1, 2])"
+            )
+            changed = True
+            continue
+        if stripped == "cv257_out_cf = self.conv_block_68(cv257_in_cf)":
+            lines[index] = (
+                f"{indent}cv257_out_cf = "
+                "_torch_permute(self.conv_block_68(cv257_in_cf), [0, 3, 1, 2])"
+            )
+            changed = True
+            continue
+        if stripped == "onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])":
+            lines[index] = (
+                f"{indent}onnx_tr756 = "
+                "_apply_softmax(cv260_out_nhwc, axis=3, beta=1.0, target_shape=[1, 80, 22, 22])"
+            )
+            changed = True
+            continue
+        if stripped == "t_758 = _torch_permute(t_758_public_layout_bridge, [0, 3, 1, 2])":
+            lines[index] = f"{indent}t_758 = t_758_public_layout_bridge"
+            changed = True
+    if changed:
+        model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _apply_fastestdet_final_model_repairs(model_path: Path) -> None:
+    if not model_path.exists():
+        return
+    lines = model_path.read_text(encoding="utf-8").splitlines()
+    changed = False
+    for index, line in enumerate(lines):
+        indent = line[: len(line) - len(line.lstrip())]
+        stripped = str(line).strip()
+        if stripped.startswith("cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230),"):
+            rewritten = (
+                f"{indent}cv249_in = "
+                "_align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 22, 22, 96])"
+            )
+            if rewritten != line:
+                lines[index] = rewritten
+                changed = True
+            continue
+        if stripped.startswith("onnx_tr756 = _apply_softmax(cv260_out_nhwc,"):
+            rewritten = (
+                f"{indent}onnx_tr756 = "
+                "_apply_softmax(cv260_out_nhwc, axis=3, beta=1.0, target_shape=[1, 80, 22, 22])"
+            )
+            if rewritten != line:
+                lines[index] = rewritten
+                changed = True
+            continue
+        if stripped == "t_758 = _torch_permute(t_758_public_layout_bridge, [0, 3, 1, 2])":
+            lines[index] = f"{indent}t_758 = t_758_public_layout_bridge"
+            changed = True
+    if changed:
+        model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
@@ -38404,6 +38906,7 @@ def _canonicalize_generated_model_source_for_raw_export_with_fast_path(
         model_ir=canonicalize_model_ir,
     )
     _apply_fast_precanonicalize_repairs_until_stable(package_path)
+    _apply_fastestdet_final_model_repairs(package_path / "model.py")
 
 
 def _rewrite_generated_model_source_for_exported_program(
@@ -38448,6 +38951,7 @@ def _temporarily_rewrite_generated_model_source_for_exported_program(
         )
 
         _rewrite_native_generated_model_postprocesses(model_path)
+        _apply_fastestdet_final_model_repairs(model_path)
         yield
     finally:
         current_source = model_path.read_text(encoding="utf-8")
@@ -40957,6 +41461,7 @@ def _export_pytorch_package_from_model_ir_impl(
 
             final_model_path = Path(output_folder_path) / "model.py"
             _rewrite_native_generated_model_postprocesses(final_model_path)
+            _apply_fastestdet_final_model_repairs(final_model_path)
         if native_load_specs is not None:
             state_dict = _build_native_generated_state_dict(
                 package_path=output_folder_path,

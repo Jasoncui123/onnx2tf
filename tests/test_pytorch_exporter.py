@@ -54,6 +54,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     ModelIRPyTorchExportError,
     NativePyTorchGenerationTimeoutError,
     _apply_alike_fast_precanonicalize_repairs,
+    _apply_fastestdet_final_model_repairs,
     _apply_fast_precanonicalize_repairs,
     _apply_fast_precanonicalize_repairs_until_stable,
     _apply_pidnet_fast_precanonicalize_repairs,
@@ -10862,6 +10863,219 @@ def test_apply_fast_precanonicalize_repairs_fix_nanodet_stage0_channel_last_pool
     )
     assert "waback_stage2_branch1_cv_out331_f_cf = self.conv_block_1(wabackbonemaxpool_max_p_out_nhwc)" in rewritten
     assert "waback_stage2_branch2_f69_cf_73ca = self.conv_block_2(wabackbonemaxpool_max_p_out_nhwc)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_preserves_nhwc_average_pool_reciprocal_bridge_for_concat(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_nhwc_average_pool_concat_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_AveragePool_229_output_nhwc_div_reciprocal', torch.zeros([1, 22, 22, 48], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_average_p229_x48_x22_5c41', torch.zeros([1, 48, 22, 22], dtype=torch.float32), persistent=False)",
+                "    def _refresh_constant_buffer_aliases(self):",
+                "        self.const_average_p229_x48_x22_5c41.copy_(self.const_AveragePool_229_output_nhwc_div_reciprocal.permute(*(0, 3, 1, 2)).contiguous())",
+                "    def forward(self, cv57_in_nhwc: torch.Tensor, cv171_in_nhwc: torch.Tensor, resize226_out_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        average_p229_in_nhwc_padded = F.pad(cv57_in_nhwc, [1, 1, 1, 1], mode='constant', value=0.0)",
+                "        average_p229_out_nhwc_include_pad = _apply_pool2d(average_p229_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 48, 22, 22], is_max_pool=False, channel_last=False)",
+                "        _binary_lhs_61, _binary_rhs_61 = _align_binary_inputs_to_anchor(average_p229_out_nhwc_include_pad, torch.reshape(self.const_average_p229_x48_x22_5c41, [1, 48, 22, 22]), [1, 48, 22, 22])",
+                "        average_p229_out = _align_tensor_to_target_shape(torch.mul(_binary_lhs_61, _binary_rhs_61), [1, 48, 22, 22])",
+                "        cv231_in = _apply_concat([average_p229_out, cv171_in_nhwc, resize226_out_nhwc], axis=3, target_shape=[1, 22, 22, 336], fused='NONE')",
+                "        return cv231_in",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_61, _binary_rhs_61 = _align_binary_inputs_to_anchor("
+        "average_p229_out_nhwc_include_pad, self.const_average_p229_x48_x22_5c41.permute(0, 2, 3, 1).contiguous(), "
+        "[1, 22, 22, 48])"
+        in rewritten
+    )
+    assert (
+        "average_p229_out = _align_tensor_to_target_shape(torch.mul(_binary_lhs_61, _binary_rhs_61), [1, 22, 22, 48])"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_reanchors_dynamic_cf_binary_anchor_from_following_add(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_dynamic_cf_binary_anchor_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, features_cf: torch.Tensor) -> torch.Tensor:",
+                "        residual_cf = features_cf",
+                "        shortcut_nhwc_cf = features_cf",
+                "        shortcut_nhwc = shortcut_nhwc_cf",
+                "        _binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(residual_cf, shortcut_nhwc, [1, 22, 96, 22])",
+                "        cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [int(_binary_lhs_230.shape[0]), 96, int(_binary_lhs_230.shape[2]), int(_binary_lhs_230.shape[3])])",
+                "        return cv249_in",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 22, 22, 96])"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_fix_fastestdet_stage0_maxpool_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fastestdet_stage0_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, in1: torch.Tensor) -> torch.Tensor:",
+                "        max_p2_in_nhwc_cf = self.conv_block_0(in1)",
+                "        max_p2_in_nhwc = max_p2_in_nhwc_cf",
+                "        max_p2_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p2_in_nhwc, [1, 176, 176, 24]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        max_p2_out_nhwc = _apply_pool2d(max_p2_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 88, 88, 24], is_max_pool=True, channel_last=True)",
+                "        cv3_out_cf = self.conv_block_1(max_p2_out_nhwc)",
+                "        return cv3_out_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "max_p2_in_cf_padded = F.pad(max_p2_in_nhwc_cf, [1, 1, 1, 1], mode='constant', "
+        "value=-3.4028234663852886e+38)"
+        in rewritten
+    )
+    assert (
+        "max_p2_out_nhwc = _apply_pool2d(max_p2_in_cf_padded, filter_height=3, filter_width=3, "
+        "stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 88, 88], "
+        "is_max_pool=True, channel_last=False)"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_fix_fastestdet_stage6_head_layout(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fastestdet_stage6_head_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv233_in_nhwc: torch.Tensor, cv246_out_cf: torch.Tensor, cv253_in_cf: torch.Tensor, cv257_in_cf: torch.Tensor, cv260_out_nhwc: torch.Tensor, onnx_concat715_cf: torch.Tensor, onnx_concat721_cf: torch.Tensor, onnx_concat730_cf: torch.Tensor) -> torch.Tensor:",
+                "        cv246_in = torch.cat([onnx_concat715_cf, onnx_concat721_cf, onnx_concat730_cf], dim=1)",
+                "        _binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc, [1, 96, 22, 22])",
+                "        cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 96, 22, 22])",
+                "        onnx_concat744_cf = self.conv_block_67(cv253_in_cf)",
+                "        cv257_out_cf = self.conv_block_68(cv257_in_cf)",
+                "        onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])",
+                "        t_758_public_layout_bridge = torch.cat([onnx_concat744_cf, cv257_out_cf, onnx_tr756], dim=1)",
+                "        t_758 = _torch_permute(t_758_public_layout_bridge, [0, 3, 1, 2])",
+                "        return t_758",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "cv246_in = _apply_concat([onnx_concat715_cf, onnx_concat721_cf, onnx_concat730_cf], "
+        "axis=3, target_shape=[1, 22, 22, 288], fused='NONE')"
+        in rewritten
+    )
+    assert (
+        "_binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc, [1, 22, 22, 96])"
+        in rewritten
+    )
+    assert (
+        "cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 22, 22, 96])"
+        in rewritten
+    )
+    assert "onnx_concat744_cf = _torch_permute(self.conv_block_67(cv253_in_cf), [0, 3, 1, 2])" in rewritten
+    assert "cv257_out_cf = _torch_permute(self.conv_block_68(cv257_in_cf), [0, 3, 1, 2])" in rewritten
+    assert (
+        "onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=3, beta=1.0, target_shape=[1, 80, 22, 22])"
+        in rewritten
+    )
+    assert "t_758 = t_758_public_layout_bridge" in rewritten
+
+
+def test_apply_fastestdet_final_model_repairs_fix_dynamic_head_targets(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fastestdet_final_head_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, cv260_out_nhwc: torch.Tensor, _binary_lhs_230: torch.Tensor, _binary_rhs_230: torch.Tensor, t_758_public_layout_bridge: torch.Tensor) -> torch.Tensor:",
+                "        cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [int(_binary_lhs_230.shape[0]), 96, int(_binary_lhs_230.shape[2]), int(_binary_lhs_230.shape[3])])",
+                "        onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=1, beta=1.0, target_shape=[1, 22, 80, 22])",
+                "        t_758 = _torch_permute(t_758_public_layout_bridge, [0, 3, 1, 2])",
+                "        return t_758",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fastestdet_final_model_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 22, 22, 96])"
+        in rewritten
+    )
+    assert (
+        "onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=3, beta=1.0, target_shape=[1, 80, 22, 22])"
+        in rewritten
+    )
+    assert "t_758 = t_758_public_layout_bridge" in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_does_not_inject_humanseg_resize_aliases_without_markers(
