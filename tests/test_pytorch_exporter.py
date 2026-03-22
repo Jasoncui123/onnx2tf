@@ -53,7 +53,7 @@ from onnx2tf.tflite_builder.pytorch_accuracy_evaluator import (
 from onnx2tf.tflite_builder.pytorch_exporter import (
     ModelIRPyTorchExportError,
     NativePyTorchGenerationTimeoutError,
-    _apply_alike_fast_precanonicalize_repairs,
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs,
     _apply_fast_precanonicalize_repairs,
     _apply_fast_precanonicalize_repairs_until_stable,
     _apply_pidnet_fast_precanonicalize_repairs,
@@ -95,8 +95,11 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _onnx_repair_inferred_shapes_in_place,
     _patch_generated_runtime_pool2d_channel_last_recovery,
     _sanitize_dynamo_exported_onnx_metadata,
-    _has_alike_fast_repair_signature,
+    _has_dynamic_score_sampling_stage_signature,
     _has_humanseg_fast_repair_signature,
+    _has_mixed_layout_decoder_merge_public_output_signature,
+    _has_pooled_token_attention_signature,
+    _has_single_mixed_layout_decoder_merge_public_output_signature,
     _should_avoid_model_ir_in_raw_canonicalize_for_native_package,
     _should_skip_expensive_raw_canonicalize_for_native_package,
     _should_prefer_tflite_backed_package,
@@ -3627,7 +3630,7 @@ def test_apply_fast_precanonicalize_repairs_fix_stage1_and_gather_chain(
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "t_471 = torch.reshape(t_469, [1, 64, 1, 1])" in rewritten
@@ -3657,7 +3660,7 @@ def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis(
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert (
@@ -3689,7 +3692,7 @@ def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert (
@@ -3737,7 +3740,7 @@ def test_apply_fast_precanonicalize_repairs_rewrites_cf_hardsigmoid_gate_and_se_
     assert "gated_cf = torch.mul(features_cf, gate_sig)" in rewritten
 
 
-def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_stage(
+def test_apply_fast_precanonicalize_repairs_fix_dynamic_score_sampling_stage(
     tmp_path,
 ) -> None:
     package_dir = tmp_path / "fast_precanon_alike_pkg"
@@ -3848,7 +3851,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     stage7_prefix = "scores_stage7"
@@ -3881,7 +3884,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
     assert "_align_binary_inputs_to_anchor(wadkd_rs14_out0, wadkd_tr1_out0, [1, 1, 1, 1])" not in rewritten
 
 
-def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_stage_with_generic_names(
+def test_apply_fast_precanonicalize_repairs_fix_dynamic_score_sampling_stage_with_generic_names(
     tmp_path,
 ) -> None:
     package_dir = tmp_path / "fast_precanon_alike_generic_pkg"
@@ -3926,7 +3929,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "div_lhs_cast = gather0.to(dtype=torch.int64)" in rewritten
@@ -3937,6 +3940,58 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_dynamic_score_sampling_sta
     assert "expand23 = torch.mul(_lhs_191, _rhs_191)" in rewritten
     assert "_lhs_196, _rhs_196 = tr17, expand23" in rewritten
     assert "div3 = torch.div(_lhs_196, _rhs_196)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_dynamic_score_sampling_stage_with_generic_local_helper_name(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_dynamic_score_sampling_generic_helper_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def score_stage(self, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:",
+                "        desc_out = _torch_permute(score_div, [1, 0])",
+                "        shape_a = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)",
+                "        shape_b = _shape_tensor(add_b, dtype=torch.int32, device=add_b.device)",
+                "        gather_a = torch.gather(index=add_a, input=scores_map_buf, dim=0)",
+                "        gather_b = torch.gather(index=add_b, input=scores_map_buf, dim=0)",
+                "        rs_a = torch.reshape(gather_a, (-1, 1))",
+                "        rs_b = torch.reshape(gather_b, (-1, 1))",
+                "        pair0_lhs, pair0_rhs = _align_binary_inputs_to_anchor(rs_a, tr_b, [1, 1, 1, 1])",
+                "        pair1_lhs, pair1_rhs = _align_binary_inputs_to_anchor(rs_b, tr_a, [1, 1, 1, 1])",
+                "        score_add0 = torch.add(pair0_lhs, pair1_lhs)",
+                "        score_tr14 = _torch_permute(score_add0, [0, 1, 3, 2])",
+                "        final_pair_lhs, final_pair_rhs = _align_binary_inputs_to_anchor(score_tr14, score_cast, [1, 1, 1, 1])",
+                "        score_mul = torch.mul(final_pair_lhs, final_pair_rhs)",
+                "        out_scores = torch.reshape(torch.squeeze(score_mul), (([1]) + ([1])))",
+                "        return desc_out, out_scores",
+                "    def forward(self, scores_map_buf: torch.Tensor, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor):",
+                "        packed = self.score_stage(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast)",
+                "        desc_out = packed[0]",
+                "        out_scores = packed[1]",
+                "        return desc_out, out_scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _has_dynamic_score_sampling_stage_signature(model_path.read_text(encoding="utf-8").splitlines()) is True
+
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "def score_stage(self, x0: torch.Tensor, add_a: torch.Tensor, add_b: torch.Tensor, score_div: torch.Tensor, tr_a: torch.Tensor, tr_b: torch.Tensor, score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
+    assert "packed = self.score_stage(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map_buf)" in rewritten
+    assert "out_scores_stage7_mul0_out0 = torch.mul(out_scores_stage7_rs_fixed_0, tr_b)" in rewritten
+    assert "out_scores_stage7_mul1_out0 = torch.mul(out_scores_stage7_rs_fixed_1, tr_a)" in rewritten
+    assert "rs_a = torch.reshape(gather_a, (-1, 1))" not in rewritten
+    assert "rs_b = torch.reshape(gather_b, (-1, 1))" not in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_generic_names(
@@ -3976,7 +4031,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_generic_n
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     stage7_prefix = "scores_stage7"
@@ -4024,7 +4079,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_three_bra
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     stage7_prefix = "scores_stage7"
@@ -4066,7 +4121,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_generic_o
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     stage7_prefix = "out_scores_stage7"
@@ -4110,7 +4165,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_parenthes
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "(final_desc, final_scores) = self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map)" in rewritten
@@ -4149,7 +4204,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_f
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -4157,7 +4212,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_f
     assert "out_scores_stage7_flatten_out0 = torch.reshape(scores_map, _resolve_reshape_shape([-1, 1], scores_map, allow_zero=False))" in rewritten
 
 
-def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_packed_forward_outputs(
+def test_apply_fast_precanonicalize_repairs_fix_dynamic_score_sampling_stage_with_packed_forward_outputs(
     tmp_path,
 ) -> None:
     package_dir = tmp_path / "fast_precanon_alike_full_packed_outputs_pkg"
@@ -4190,7 +4245,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_packed_fo
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "stage7_outputs = self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map)" in rewritten
@@ -4201,7 +4256,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_packed_fo
     assert "_align_binary_inputs_to_anchor(score_rs0, tr_a, [1, 1, 1, 1])" not in rewritten
 
 
-def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_packed_forward_outputs(
+def test_apply_fast_precanonicalize_repairs_fix_dynamic_score_sampling_stage_with_keyword_packed_forward_outputs(
     tmp_path,
 ) -> None:
     package_dir = tmp_path / "fast_precanon_alike_full_keyword_packed_outputs_pkg"
@@ -4234,7 +4289,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_p
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -4276,7 +4331,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_typing_tu
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -4316,7 +4371,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_without_return
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -4356,7 +4411,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_optional_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -4397,7 +4452,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_s
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -4441,7 +4496,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_annotated
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "stage7_outputs: Tuple[torch.Tensor, torch.Tensor] = self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map)" in rewritten
@@ -4485,7 +4540,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_compact_a
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "stage7_outputs:tuple[torch.Tensor,torch.Tensor]=self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map)" in rewritten
@@ -4530,7 +4585,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_typing_mo
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "stage7_outputs:typing.Tuple[torch.Tensor,torch.Tensor]=self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map)" in rewritten
@@ -4574,7 +4629,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_shape_and
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -4615,7 +4670,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_reordered
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -4658,7 +4713,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_topology_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -4702,7 +4757,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_interleav
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -4748,7 +4803,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_topology_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -4794,7 +4849,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_topology_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -4840,7 +4895,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_topology_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -4886,7 +4941,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_topology_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -4928,7 +4983,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_ga
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -4973,7 +5028,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_gather_ou
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -5017,7 +5072,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_gather_ro
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -5062,7 +5117,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_passthrou
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "final_desc, final_scores = self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, score_map_buf)" in rewritten
@@ -5103,7 +5158,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_ga
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -5146,7 +5201,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_index_sel
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -5188,7 +5243,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_in
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -5231,7 +5286,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_take_alon
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5273,7 +5328,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_ta
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -5318,7 +5373,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_wr
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "final_desc, final_scores = self._forward_stage_7(x0, add_a, add_b, score_div, tr_a, tr_b, score_cast, scores_map)" in rewritten
@@ -5361,7 +5416,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_ga
         encoding='utf-8',
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5410,7 +5465,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_ga
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -5452,7 +5507,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_me
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -5497,7 +5552,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_me
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -5541,7 +5596,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_ga
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -5589,7 +5644,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5635,7 +5690,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5682,7 +5737,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -5751,7 +5806,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_split_sta
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5800,7 +5855,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_sc
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5846,7 +5901,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_passthrou
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5891,7 +5946,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_passthrou
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5935,7 +5990,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_pa
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -5979,7 +6034,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_pa
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -6023,7 +6078,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_passthrou
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map_buf: torch.Tensor)" in rewritten
@@ -6067,7 +6122,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -6114,7 +6169,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -6154,7 +6209,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -6192,7 +6247,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -6239,7 +6294,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_branch_an
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -6289,7 +6344,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_branch_an
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -6337,7 +6392,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_ignores_same_r
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -6392,7 +6447,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_ignores_same_r
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -6446,7 +6501,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_ignores_same_r
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -6494,7 +6549,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_ignores_stray_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -6538,7 +6593,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_generic_s
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -6583,7 +6638,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_prefers_domina
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, main_map_buf: torch.Tensor)" in rewritten
@@ -6625,7 +6680,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_does_not_prefe
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, main_map_buf: torch.Tensor)" in rewritten
@@ -6680,7 +6735,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_prefers_final_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, aux_map_buf: torch.Tensor)" in rewritten
@@ -6726,7 +6781,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_prefers_final_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, aux_map_buf: torch.Tensor)" in rewritten
@@ -6781,7 +6836,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_ignores_same_r
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -6835,7 +6890,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_ignores_same_r
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -6889,7 +6944,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_preserves_same
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "shape_c = _shape_tensor(add_c, dtype=torch.int32, device=add_c.device)" in rewritten
@@ -6934,7 +6989,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_topology_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -6976,7 +7031,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_without_shape_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7018,7 +7073,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_r
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7060,7 +7115,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_tuple_sha
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -7104,7 +7159,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_pair_alia
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -7149,7 +7204,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_pair_alia
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -7194,7 +7249,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_typed_par
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -7236,7 +7291,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_cross_nam
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -7278,7 +7333,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_ignores_prelud
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -7321,7 +7376,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_ignores_stray_
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -7365,7 +7420,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_nontermin
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7408,7 +7463,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_nontermin
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7451,7 +7506,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_s
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7493,7 +7548,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_reordered
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7535,7 +7590,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_s
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7576,7 +7631,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_reordered
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7618,7 +7673,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_aligned_s
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7662,7 +7717,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_aligned_f
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7706,7 +7761,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_aligned_s
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7750,7 +7805,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_aligned_s
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7792,7 +7847,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_a
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7835,7 +7890,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_reordered
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7881,7 +7936,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_anchor_ta
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7929,7 +7984,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_typed_par
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -7975,7 +8030,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_keyword_d
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8020,7 +8075,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_reordered
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8073,7 +8128,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_anchor_pa
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8122,7 +8177,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_anchor_pa
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "wadkd_score_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8170,7 +8225,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_an
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "wadkd_score_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8215,7 +8270,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_direct_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8263,7 +8318,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_di
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8313,7 +8368,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_direct_br
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8357,7 +8412,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_di
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8401,7 +8456,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_me
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8445,7 +8500,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_di
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8489,7 +8544,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_di
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8533,7 +8588,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_di
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8575,7 +8630,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_preserves_inli
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "mul2 = torch.mul(torch.reshape(torch.gather(score_map_buf, 0, add_c), (-1, 1)), tr_c)" in rewritten
@@ -8618,7 +8673,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_literal_b
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8664,7 +8719,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_branch_re
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8710,7 +8765,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_di
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "score_cast: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -8767,7 +8822,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_final_agg
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -8822,7 +8877,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_fi
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -8878,7 +8933,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_parenthes
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -8936,7 +8991,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_aligned_f
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -8992,7 +9047,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_aligned_i
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -9049,7 +9104,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_method_fi
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -9100,7 +9155,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_passthrou
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, score_map_buf: torch.Tensor)" in rewritten
@@ -9154,7 +9209,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_inline_me
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "out_scores_stage7_shape0_out0 = _shape_tensor(add_a, dtype=torch.int32, device=add_a.device)" in rewritten
@@ -9203,7 +9258,7 @@ def test_apply_fast_precanonicalize_repairs_fix_alike_full_stage7_with_return_al
         encoding="utf-8",
     )
 
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "extra_aux: torch.Tensor, scores_map: torch.Tensor)" in rewritten
@@ -9251,6 +9306,49 @@ def test_apply_fast_precanonicalize_repairs_fix_efficientformer_attention_scalar
         in rewritten
     )
     assert "[1, 49, 8, 49]" not in rewritten
+
+
+def test_detect_mixed_layout_decoder_merge_public_output_signature_with_generic_names() -> None:
+    lines = [
+        "import torch",
+        "class Model(torch.nn.Module):",
+        "    def forward(self, stem_cf, up_in, pred_map):",
+        "        decoder_up = _apply_resize(input=up_in, size=(180, 320), method='bilinear', target_shape=(1, 180, 320, 64), align_corners=False, half_pixel_centers=True, channel_last=True)",
+        "        decoder_merge = torch.cat(tensors=(stem_cf, decoder_up), dim=1)",
+        "        public_output = _torch_permute(input=pred_map, perm=(0, 3, 1, 2))",
+        "        return public_output",
+    ]
+
+    assert _has_mixed_layout_decoder_merge_public_output_signature(lines) is True
+    assert _has_single_mixed_layout_decoder_merge_public_output_signature(lines) is True
+
+
+def test_detect_mixed_layout_decoder_merge_public_output_signature_requires_resize_evidence() -> None:
+    lines = [
+        "import torch",
+        "class Model(torch.nn.Module):",
+        "    def forward(self, stem_cf, decoder_branch_nhwc, pred_map):",
+        "        decoder_merge = torch.cat([stem_cf, decoder_branch_nhwc], dim=1)",
+        "        return _torch_permute(pred_map, [0, 3, 1, 2])",
+    ]
+
+    assert _has_mixed_layout_decoder_merge_public_output_signature(lines) is False
+    assert _has_single_mixed_layout_decoder_merge_public_output_signature(lines) is False
+
+
+def test_detect_pooled_token_attention_signature_with_generic_shapes_and_const_alias() -> None:
+    lines = [
+        "import torch",
+        "class Model(torch.nn.Module):",
+        "    def forward(self, pooled_cf, stage_cf, residual_cf, attn_logits):",
+        "        attn_bias = self.const_attn_bias",
+        "        pooled_out = _apply_pool2d(input=pooled_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=(1, 64, 40, 40), channel_last=False, is_max_pool=False)",
+        "        token_map = _align_tensor_to_target_shape(torch.add(other=residual_cf, input=stage_cf), [1, 8, 8, 320])",
+        "        attn_scores = _align_tensor_to_target_shape(torch.add(other=attn_logits, input=attn_bias), [1, 5, 64, 64])",
+        "        return pooled_out, token_map, attn_scores",
+    ]
+
+    assert _has_pooled_token_attention_signature(lines) is True
 
 
 def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain(
@@ -13974,10 +14072,10 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_l1_packag
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
 
 
-def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_semantic_signature_with_generic_shapes(
+def test_should_avoid_model_ir_in_raw_canonicalize_for_pooled_token_attention_signature_with_generic_shapes(
     tmp_path,
 ) -> None:
-    package_dir = tmp_path / "efficientformer_semantic_generic_pkg"
+    package_dir = tmp_path / "pooled_token_attention_generic_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
     model_path.write_text(
@@ -14161,7 +14259,7 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_with_keyw
 def test_should_not_avoid_model_ir_in_raw_canonicalize_for_efficientformer_with_mismatched_token_grid(
     tmp_path,
 ) -> None:
-    package_dir = tmp_path / "efficientformer_semantic_mismatch_pkg"
+    package_dir = tmp_path / "pooled_token_attention_mismatch_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
     model_path.write_text(
@@ -14283,10 +14381,10 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_plain_partially_fas
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
-def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_semantic_signature_without_fixed_names(
+def test_should_avoid_model_ir_in_raw_canonicalize_for_mixed_layout_decoder_merge_signature_without_fixed_names(
     tmp_path,
 ) -> None:
-    package_dir = tmp_path / "bread_semantic_fast_canon_pkg"
+    package_dir = tmp_path / "mixed_layout_decoder_merge_fast_canon_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
     model_path.write_text(
@@ -14331,10 +14429,10 @@ def test_should_not_avoid_model_ir_in_raw_canonicalize_for_bread_without_resize_
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is False
 
 
-def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_semantic_signature_with_generic_resize_sources(
+def test_should_avoid_model_ir_in_raw_canonicalize_for_mixed_layout_decoder_merge_signature_with_generic_resize_sources(
     tmp_path,
 ) -> None:
-    package_dir = tmp_path / "bread_semantic_resize_source_pkg"
+    package_dir = tmp_path / "mixed_layout_decoder_merge_resize_source_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
     model_path.write_text(
@@ -18908,10 +19006,10 @@ def test_should_skip_expensive_raw_canonicalize_for_bread_after_fast_canonical_f
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
-def test_should_skip_expensive_raw_canonicalize_for_bread_semantic_signature(
+def test_should_skip_expensive_raw_canonicalize_for_single_mixed_layout_decoder_merge_public_output_signature(
     tmp_path,
 ) -> None:
-    package_dir = tmp_path / "bread_semantic_skip_pkg"
+    package_dir = tmp_path / "mixed_layout_decoder_merge_skip_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
     model_path.write_text(

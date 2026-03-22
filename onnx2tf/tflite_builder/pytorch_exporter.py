@@ -31289,7 +31289,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     _apply_pidnet_fast_precanonicalize_repairs(model_path)
     _apply_humanseg_fast_precanonicalize_repairs(model_path)
     _apply_structural_fast_precanonicalize_repairs(model_path)
-    _apply_alike_fast_precanonicalize_repairs(model_path)
+    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
     _apply_shadowformer_fast_precanonicalize_repairs(model_path)
     _restore_channel_last_spatial_pool_chains(model_path)
 
@@ -32851,16 +32851,16 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
+def _has_dynamic_score_sampling_stage_signature(lines: Sequence[str]) -> bool:
     stage7_reshape_shape_pattern = r"(?:\[\s*-1\s*,\s*1\s*\]|\(\s*-1\s*,\s*1\s*\))"
     stage7_def_re = re.compile(
-        r"^\s*def _forward_stage_7\(self, .+\)(?: -> (?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?:$"
+        r"^\s*def (?P<helper_name>[A-Za-z0-9_]+)\(self, .+\)(?: -> (?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?:$"
     )
     forward_unpack_re = re.compile(
-        r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
+        r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\.(?P<helper_name>[A-Za-z0-9_]+)\(.+\)$"
     )
     forward_packed_re = re.compile(
-        r"^\s*(?P<packed>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?\s*=\s*self\._forward_stage_7\(.+\)$"
+        r"^\s*(?P<packed>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?\s*=\s*self\.(?P<helper_name>[A-Za-z0-9_]+)\(.+\)$"
     )
     forward_index_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\s*=\s*(?P<packed>[A-Za-z0-9_]+)\[(?P<index>[01])\]$"
@@ -33276,9 +33276,13 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
 
     has_stage7_def = False
     stage7_param_names: list[str] = []
+    stage7_param_names_by_helper: Dict[str, list[str]] = {}
+    stage7_helper_defs: Set[str] = set()
     has_forward_call = False
+    stage7_called_helpers: Set[str] = set()
     packed_forward_names: Set[str] = set()
     packed_forward_indices: Dict[str, Set[str]] = {}
+    packed_forward_helpers: Dict[str, str] = {}
     gather_reshape_count = 0
     singleton_anchor_count = 0
     stage7_shape_tensor_count = 0
@@ -33291,15 +33295,24 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
             stage7_anchor_shape_alias_sources[parsed_shape_alias[0]] = parsed_shape_alias[1]
         stage7_def_match = stage7_def_re.match(current_line)
         if stage7_def_match is not None:
+            helper_name = str(stage7_def_match.group("helper_name"))
+            if helper_name == "forward":
+                continue
             has_stage7_def = True
             stage7_param_names = re.findall(r"([A-Za-z0-9_]+): torch\.Tensor", current_line)
+            stage7_param_names_by_helper[helper_name] = list(stage7_param_names)
+            stage7_helper_defs.add(helper_name)
             continue
-        if forward_unpack_re.match(current_line) is not None:
+        forward_unpack_match = forward_unpack_re.match(current_line)
+        if forward_unpack_match is not None:
             has_forward_call = True
+            stage7_called_helpers.add(str(forward_unpack_match.group("helper_name")))
             continue
         packed_match = forward_packed_re.match(current_line)
         if packed_match is not None:
-            packed_forward_names.add(str(packed_match.group("packed")))
+            packed_name = str(packed_match.group("packed"))
+            packed_forward_names.add(packed_name)
+            packed_forward_helpers[packed_name] = str(packed_match.group("helper_name"))
             continue
         forward_index_match = forward_index_re.match(current_line)
         if forward_index_match is not None:
@@ -33308,7 +33321,11 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
                 packed_forward_indices.setdefault(packed_name, set()).add(
                     str(forward_index_match.group("index"))
                 )
-                has_forward_call = has_forward_call or packed_forward_indices[packed_name] == {"0", "1"}
+                if packed_forward_indices[packed_name] == {"0", "1"}:
+                    has_forward_call = True
+                    helper_name = packed_forward_helpers.get(packed_name, None)
+                    if helper_name is not None:
+                        stage7_called_helpers.add(helper_name)
             continue
         if any(pattern.match(current_line) is not None for pattern in gather_reshape_res):
             gather_reshape_count += 1
@@ -33399,10 +33416,22 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         stage7_shape_tensor_count,
         max(0, len(stage7_param_names) - 2),
     )
+    candidate_stage7_helpers = stage7_helper_defs & stage7_called_helpers
+    if candidate_stage7_helpers:
+        stage7_param_names = max(
+            (stage7_param_names_by_helper.get(helper_name, []) for helper_name in candidate_stage7_helpers),
+            key=len,
+            default=stage7_param_names,
+        )
+        fallback_branch_count = min(
+            stage7_shape_tensor_count,
+            max(0, len(stage7_param_names) - 2),
+        )
     structural_fallback_ready = has_descriptor_permute and fallback_branch_count >= 1
     return (
         has_stage7_def
         and has_forward_call
+        and bool(candidate_stage7_helpers)
         and (gather_reshape_count >= 1 or structural_fallback_ready)
         and (singleton_anchor_count >= 1 or structural_fallback_ready)
         and has_stage7_return
@@ -33896,7 +33925,7 @@ def _reapply_post_export_final_model_repairs(package_path: Path) -> None:
         _apply_structural_final_model_repairs(model_path)
 
 
-def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
+def _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path: Path) -> None:
     if not model_path.exists():
         return
     model_source = model_path.read_text(encoding="utf-8")
@@ -33932,7 +33961,7 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 )
                 changed = True
         index += 1
-    if not _has_alike_fast_repair_signature(lines):
+    if not _has_dynamic_score_sampling_stage_signature(lines):
         if changed:
             model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return
@@ -33972,10 +34001,13 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\.to\(dtype=torch\.float32\)$"
     )
     forward_unpack_re = re.compile(
-        r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\._forward_stage_7\(.+\)$"
+        r"^\s*\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)? = self\.(?P<helper_name>[A-Za-z0-9_]+)\(.+\)$"
     )
     forward_packed_re = re.compile(
-        r"^\s*(?P<packed>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?\s*=\s*self\._forward_stage_7\(.+\)$"
+        r"^\s*(?P<packed>[A-Za-z0-9_]+)(?:\s*:\s*(?:tuple|Tuple|typing\.Tuple)\[torch\.Tensor,\s*torch\.Tensor\])?\s*=\s*self\.(?P<helper_name>[A-Za-z0-9_]+)\(.+\)$"
+    )
+    forward_index_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\s*=\s*(?P<packed>[A-Za-z0-9_]+)\[(?P<index>[01])\]$"
     )
     stage7_return_re = re.compile(
         r"^\s*return\s+\(?(?P<descriptors>[A-Za-z0-9_]+), (?P<score>[A-Za-z0-9_]+)\)?$"
@@ -34234,22 +34266,74 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
                 continue
         index += 1
 
-    stage7_def_index = next(
-        (index for index, line in enumerate(lines) if line.startswith("    def _forward_stage_7(")),
-        None,
-    )
-    forward_call_index = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if forward_unpack_re.match(line) or forward_packed_re.match(line)
-        ),
-        None,
-    )
+    stage7_helper_name: str | None = None
+    stage7_def_index: int | None = None
+    forward_call_index: int | None = None
+    packed_forward_calls: Dict[str, Tuple[int, str]] = {}
+    packed_forward_indices: Dict[str, Set[str]] = {}
+    for index, line in enumerate(lines):
+        forward_unpack_match = forward_unpack_re.match(line)
+        if forward_unpack_match is not None:
+            candidate_helper_name = str(forward_unpack_match.group("helper_name"))
+            if candidate_helper_name == "forward":
+                continue
+            candidate_def_index = next(
+                (
+                    def_index
+                    for def_index, candidate_line in enumerate(lines)
+                    if re.match(rf"^\s*def {re.escape(candidate_helper_name)}\(", str(candidate_line)) is not None
+                ),
+                None,
+            )
+            if candidate_def_index is None:
+                continue
+            stage7_helper_name = candidate_helper_name
+            stage7_def_index = candidate_def_index
+            forward_call_index = index
+            break
+        forward_packed_match = forward_packed_re.match(line)
+        if forward_packed_match is not None:
+            packed_forward_calls[str(forward_packed_match.group("packed"))] = (
+                index,
+                str(forward_packed_match.group("helper_name")),
+            )
+            continue
+        forward_index_match = forward_index_re.match(line)
+        if forward_index_match is None:
+            continue
+        packed_name = str(forward_index_match.group("packed"))
+        if packed_name not in packed_forward_calls:
+            continue
+        packed_forward_indices.setdefault(packed_name, set()).add(
+            str(forward_index_match.group("index"))
+        )
+        if packed_forward_indices[packed_name] != {"0", "1"}:
+            continue
+        packed_call_index, candidate_helper_name = packed_forward_calls[packed_name]
+        if candidate_helper_name == "forward":
+            continue
+        candidate_def_index = next(
+            (
+                def_index
+                for def_index, candidate_line in enumerate(lines)
+                if re.match(rf"^\s*def {re.escape(candidate_helper_name)}\(", str(candidate_line)) is not None
+            ),
+            None,
+        )
+        if candidate_def_index is None:
+            continue
+        stage7_helper_name = candidate_helper_name
+        stage7_def_index = candidate_def_index
+        forward_call_index = packed_call_index
+        break
+    if stage7_helper_name is None or stage7_def_index is None or forward_call_index is None:
+        if changed:
+            model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
     stage7_end_index = next(
         (index for index in range(stage7_def_index + 1, len(lines)) if lines[index].startswith("    def ")),
         len(lines),
-    ) if stage7_def_index is not None else len(lines)
+    )
     stage7_shape_matches: list[tuple[int, dict[str, str | None]]] = []
     stage7_singleton_anchor_matches: list[tuple[int, dict[str, str]]] = []
     stage7_descriptor_matches: list[tuple[int, dict[str, str]]] = []
@@ -35767,7 +35851,10 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         )
 
     def _parse_stage7_forward_call_arg_names(line: str) -> list[str]:
-        stage7_call_match = re.search(r"self\._forward_stage_7\((?P<args>.*)\)\s*$", line)
+        stage7_call_match = re.search(
+            rf"self\.{re.escape(stage7_helper_name)}\((?P<args>.*)\)\s*$",
+            line,
+        )
         if stage7_call_match is None:
             return []
         arg_names: list[str] = []
@@ -36499,7 +36586,10 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         f"{stage7_score_map_name})" not in forward_call_line
         and score_map_forward_arg not in forward_call_line
     ):
-        stage7_call_match = re.search(r"self\._forward_stage_7\((?P<args>.*)\)\s*$", forward_call_line)
+        stage7_call_match = re.search(
+            rf"self\.{re.escape(stage7_helper_name)}\((?P<args>.*)\)\s*$",
+            forward_call_line,
+        )
         stage7_call_args = str(stage7_call_match.group("args")) if stage7_call_match is not None else ""
         has_keyword_call_args = "=" in stage7_call_args
         appended_forward_arg = (
@@ -37001,7 +37091,7 @@ def _split_top_level_csv_exprs(expr: str) -> List[str]:
     return parts
 
 
-def _is_bread_resize_like_expr(expr: str, known_resize_outputs: Set[str]) -> bool:
+def _is_channel_last_resize_like_expr(expr: str, known_resize_outputs: Set[str]) -> bool:
     stripped = str(expr).strip()
     if stripped in known_resize_outputs:
         return True
@@ -37875,7 +37965,7 @@ def _resolve_nhwc_to_nchw_bridge_source(expr: str) -> str | None:
     return None
 
 
-def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
+def _has_mixed_layout_decoder_merge_signature(lines: Sequence[str]) -> bool:
     resize_assign_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?[A-Za-z0-9_]+, (?:size=)?[\[\(]\d+, \d+[\]\)], method='[^']+', "
         r"target_shape=[\[\(]1, \d+, \d+, \d+[\]\)], align_corners=(?:True|False), "
@@ -37931,14 +38021,14 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
         resize_inputs = [
             input_name
             for input_name in inputs
-            if _is_bread_resize_like_expr(input_name, resize_like_inputs)
+            if _is_channel_last_resize_like_expr(input_name, resize_like_inputs)
         ]
         if resize_inputs and len(resize_inputs) < len(inputs):
             return True
     return False
 
 
-def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
+def _has_public_nhwc_output_bridge_signature(lines: Sequence[str]) -> bool:
     return_single_re = re.compile(
         r"^\s*return (?P<value>[A-Za-z0-9_]+)$"
     )
@@ -37992,7 +38082,7 @@ def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
     return bool(returned_values)
 
 
-def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
+def _has_single_mixed_layout_decoder_merge_public_output_signature(lines: Sequence[str]) -> bool:
     resize_assign_re = re.compile(
         r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_resize\((?:input=)?[A-Za-z0-9_]+, (?:size=)?[\[\(]\d+, \d+[\]\)], method='[^']+', "
         r"target_shape=[\[\(]1, \d+, \d+, \d+[\]\)], align_corners=(?:True|False), "
@@ -38051,12 +38141,19 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
         resize_inputs = [
             input_name
             for input_name in inputs
-            if _is_bread_resize_like_expr(input_name, resize_like_outputs)
+            if _is_channel_last_resize_like_expr(input_name, resize_like_outputs)
         ]
         if len(resize_inputs) != 1:
             continue
         decoder_merge_count += 1
-    return decoder_merge_count == 1 and _has_bread_output_bridge_signature(lines)
+    return decoder_merge_count == 1 and _has_public_nhwc_output_bridge_signature(lines)
+
+
+def _has_mixed_layout_decoder_merge_public_output_signature(lines: Sequence[str]) -> bool:
+    return (
+        _has_mixed_layout_decoder_merge_signature(lines)
+        and _has_public_nhwc_output_bridge_signature(lines)
+    )
 
 
 def _has_nanodet_head_signature(lines: Sequence[str]) -> bool:
@@ -38244,7 +38341,7 @@ def _has_nhwc_stem_pool_bridge_signature(lines: Sequence[str]) -> bool:
     return False
 
 
-def _has_efficientformer_attention_signature(lines: Sequence[str]) -> bool:
+def _has_pooled_token_attention_signature(lines: Sequence[str]) -> bool:
     self_const_alias_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*self\.(?P<const_attr>[A-Za-z0-9_]+)\s*\)*$"
     )
@@ -39424,7 +39521,7 @@ def _should_skip_expensive_raw_canonicalize_for_native_package(package_path: Pat
         return True
     if _has_iat_llie_skip_signature(model_lines):
         return True
-    if _has_bread_fast_skip_signature(model_lines):
+    if _has_single_mixed_layout_decoder_merge_public_output_signature(model_lines):
         return True
     if _has_shadowformer_avoid_model_ir_signature(model_lines):
         return True
@@ -39443,13 +39540,13 @@ def _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_path: 
         return True
     if _has_iat_llie_skip_signature(model_lines):
         return True
-    if _has_bread_decoder_merge_signature(model_lines) and _has_bread_output_bridge_signature(model_lines):
+    if _has_mixed_layout_decoder_merge_public_output_signature(model_lines):
         return True
     if _has_nhwc_stem_pool_bridge_signature(model_lines):
         return True
     if _has_nanodet_backbone_pool_signature(model_lines) and _has_nanodet_resize_signature(model_lines) and _has_nanodet_head_signature(model_lines):
         return True
-    if _has_efficientformer_attention_signature(model_lines):
+    if _has_pooled_token_attention_signature(model_lines):
         return True
     if _has_shadowformer_avoid_model_ir_signature(model_lines):
         return True
