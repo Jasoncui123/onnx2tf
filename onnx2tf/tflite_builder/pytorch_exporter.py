@@ -24803,13 +24803,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         lines[index] = f"{indent}{rank3_input_lhs} = {rank3_input_src}"
         lines[index + 3] = (
             f"{indent}{rank3_matmul_lhs} = _align_tensor_to_target_shape("
-            f"torch.matmul({tmp_x0_match.group('lhs')}, {tmp_y0_match.group('lhs')}), "
+            f"torch.matmul({tmp_x0_match.group('lhs')}, {tmp_y0_assign[1]}), "
             f"[{rank3_input_n}, 1, {rank3_matmul_h}, {rank3_matmul_w}])"
         )
         lines[index + 4] = f"{indent}{rank4_reshape_lhs} = {rank3_matmul_lhs}"
         lines[index + 7] = (
             f"{indent}{rank4_matmul_lhs} = _align_tensor_to_target_shape("
-            f"torch.matmul({tmp_y1_match.group('lhs')}, {tmp_x1_name}.transpose(-1, -2)), "
+            f"torch.matmul({tmp_y1_assign[1]}, {tmp_x1_name}.transpose(-1, -2)), "
             f"[{rank3_input_n}, 1, {rank3_matmul_h}, {rank4_matmul_w}])"
         )
         singleton_cf_vars.add(rank4_matmul_lhs)

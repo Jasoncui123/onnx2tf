@@ -260,6 +260,101 @@ def test_rewrite_channel_last_binary_bridge_chains_handles_nchw_target_shape() -
     ]
 
 
+def test_rewrite_binary_aligned_target_shapes_propagates_clamp_shape_to_fix_permuted_target(
+    tmp_path,
+) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        "\n".join(
+            [
+                "_binary_lhs_69, _binary_rhs_69 = _align_binary_inputs_to_anchor(split_out0, clip1_out0, [1, 1, 180, 320])",
+                "div_out0 = torch.div(_binary_lhs_69, _binary_rhs_69)",
+                "clip2_out0 = torch.clamp(div_out0, min=0.0, max=1.0)",
+                "_binary_rhs_195, _binary_lhs_195 = _align_binary_inputs_to_anchor(nsnetoutcconvconv0_cv_out_cf, clip2_out0, [1, 320, 1, 180])",
+                "add4_out0 = _align_tensor_to_target_shape(torch.add(_binary_lhs_195, _binary_rhs_195), [1, 320, 1, 180])",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _rewrite_binary_aligned_target_shapes(model_file)
+
+    rewritten = model_file.read_text(encoding="utf-8")
+    assert (
+        "_align_binary_inputs_to_anchor(nsnetoutcconvconv0_cv_out_cf, clip2_out0, [1, 1, 180, 320])"
+        in rewritten
+    )
+    assert (
+        "add4_out0 = _align_tensor_to_target_shape(torch.add(_binary_lhs_195, _binary_rhs_195), [1, 1, 180, 320])"
+        in rewritten
+    )
+
+
+def test_rewrite_binary_aligned_target_shapes_fixes_slice_anchor_permuted_singleton_target(
+    tmp_path,
+) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        "\n".join(
+            [
+                "_binary_rhs_340, _binary_lhs_340 = _align_binary_inputs_to_anchor(mul13_out0_cf, slice3_out0, [1, 320, 1, 180])",
+                "add9_out0 = _align_tensor_to_target_shape(torch.add(_binary_lhs_340, _binary_rhs_340), [1, 320, 1, 180])",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _rewrite_binary_aligned_target_shapes(model_file)
+
+    rewritten = model_file.read_text(encoding="utf-8")
+    assert (
+        "_align_binary_inputs_to_anchor(mul13_out0_cf, slice3_out0, [1, 1, 180, 320])"
+        in rewritten
+    )
+    assert (
+        "add9_out0 = _align_tensor_to_target_shape(torch.add(_binary_lhs_340, _binary_rhs_340), [1, 1, 180, 320])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_for_raw_export_rewrites_rank3_rank4_resize_matmuls(
+    tmp_path,
+) -> None:
+    package_path = tmp_path / "rank3_rank4_resize_matmul_pkg"
+    package_path.mkdir()
+    model_path = package_path / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "resize_cubic_h_in = torch.reshape(split_out0, [1, 90, 160])",
+                "_tmp_x_18 = self.const_Resize_resize_cubic_w_matrix_transposed",
+                "_tmp_y_18 = resize_cubic_h_in",
+                "resize_cubic_w_out0 = _align_tensor_to_target_shape(torch.matmul(_tmp_x_18, _tmp_y_18), [1, 90, 160])",
+                "resize_cubic_w_out0_rank4 = torch.reshape(resize_cubic_w_out0, [1, 90, 160, 1])",
+                "_tmp_x_19 = self.const_Resize_resize_cubic_h_matrix_transposed",
+                "_tmp_y_19 = resize_cubic_w_out0_rank4",
+                "resize_cubic_out0 = _align_tensor_to_target_shape(torch.matmul(_tmp_x_19, _tmp_y_19), [1, 90, 320, 1])",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _canonicalize_generated_model_source_for_raw_export(package_path)
+    rewritten = model_path.read_text(encoding="utf-8")
+
+    assert (
+        "resize_cubic_w_out0 = _align_tensor_to_target_shape("
+        "torch.matmul(_tmp_x_18, _tmp_y_18), [1, 1, 90, 160])"
+    ) in rewritten
+    assert "resize_cubic_w_out0_rank4 = resize_cubic_w_out0" in rewritten
+    assert (
+        "resize_cubic_out0 = _align_tensor_to_target_shape("
+        "torch.matmul(_tmp_y_19, _tmp_x_19.transpose(-1, -2)), [1, 1, 90, 320])"
+    ) in rewritten
+
+
 def test_rewrite_channel_last_binary_bridge_chains_accepts_helper_permute_bridges() -> None:
     lines = [
         "in_public_layout_bridge = _torch_permute(input=in_t, perm=(0, 2, 3, 1))",

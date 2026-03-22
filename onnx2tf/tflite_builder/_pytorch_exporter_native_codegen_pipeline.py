@@ -173,6 +173,11 @@ def _rewrite_binary_aligned_target_shapes(model_file: Path) -> None:
     alias_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)\s*$"
     )
+    unary_shape_preserving_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = "
+        r"(?:(?:torch|F)\.(?:clamp|exp|neg|sigmoid|relu|tanh|abs)\((?P<input>[A-Za-z0-9_]+)(?:,.*)?\)"
+        r"|(?P<input_method>[A-Za-z0-9_]+)\.(?:contiguous|clone|detach)\(\))\s*$"
+    )
     static_shape_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?:_apply_resize\(.+target_shape=|_align_tensor_to_target_shape\(.+, )\[(?P<shape>[0-9,\s]+)\](?:, .+channel_last=False\)|\))\s*$"
     )
@@ -187,20 +192,49 @@ def _rewrite_binary_aligned_target_shapes(model_file: Path) -> None:
         r"(?P<expr>torch\.(?:add|sub|mul|div|maximum|minimum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)), "
         r"\[(?P<shape>[0-9,\s]+)\]\)\s*$"
     )
+    plain_binary_expr_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.(?:add|sub|mul|div|maximum|minimum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)\s*$"
+    )
     alias_source_by_var: dict[str, str] = {}
     static_shape_by_var: dict[str, list[int]] = {}
     for line in lines:
         alias_match = alias_re.match(line)
         if alias_match is not None:
             alias_source_by_var[str(alias_match.group("lhs"))] = str(alias_match.group("rhs"))
-        static_shape_match = static_shape_re.match(line)
-        if static_shape_match is None:
+        binary_align_match = binary_align_re.match(line)
+        if binary_align_match is not None:
+            aligned_shape = [
+                int(token.strip())
+                for token in str(binary_align_match.group("shape")).split(",")
+                if token.strip()
+            ]
+            static_shape_by_var[str(binary_align_match.group("lhs"))] = list(aligned_shape)
+            static_shape_by_var[str(binary_align_match.group("rhs"))] = list(aligned_shape)
             continue
-        static_shape_by_var[str(static_shape_match.group("lhs"))] = [
-            int(token.strip())
-            for token in str(static_shape_match.group("shape")).split(",")
-            if token.strip()
-        ]
+        static_shape_match = static_shape_re.match(line)
+        if static_shape_match is not None:
+            static_shape_by_var[str(static_shape_match.group("lhs"))] = [
+                int(token.strip())
+                for token in str(static_shape_match.group("shape")).split(",")
+                if token.strip()
+            ]
+            continue
+        plain_binary_match = plain_binary_expr_re.match(line)
+        if plain_binary_match is not None:
+            lhs_shape = static_shape_by_var.get(str(plain_binary_match.group("a")))
+            rhs_shape = static_shape_by_var.get(str(plain_binary_match.group("b")))
+            if lhs_shape is not None and rhs_shape is not None and lhs_shape == rhs_shape:
+                static_shape_by_var[str(plain_binary_match.group("lhs"))] = list(lhs_shape)
+                continue
+        unary_match = unary_shape_preserving_re.match(line)
+        if unary_match is not None:
+            input_name = str(
+                unary_match.group("input") or unary_match.group("input_method") or ""
+            )
+            if input_name in static_shape_by_var:
+                static_shape_by_var[str(unary_match.group("lhs"))] = list(
+                    static_shape_by_var[input_name]
+                )
 
     def _resolve_alias(name: str) -> str:
         current = str(name)
@@ -233,6 +267,42 @@ def _rewrite_binary_aligned_target_shapes(model_file: Path) -> None:
                 candidate_shape = list(left_shape)
             elif right_shape is not None and str(right_root).endswith("_cf"):
                 candidate_shape = list(right_shape)
+            elif (
+                left_shape is not None
+                and right_shape is None
+                and len(left_shape) == len(target_shape)
+                and sorted(int(v) for v in left_shape) == sorted(int(v) for v in target_shape)
+            ):
+                candidate_shape = list(left_shape)
+            elif (
+                right_shape is not None
+                and left_shape is None
+                and len(right_shape) == len(target_shape)
+                and sorted(int(v) for v in right_shape) == sorted(int(v) for v in target_shape)
+            ):
+                candidate_shape = list(right_shape)
+            elif (
+                len(target_shape) == 4
+                and int(target_shape[2]) == 1
+                and int(target_shape[1]) > 1
+                and int(target_shape[3]) > 1
+                and (
+                    str(left_root).endswith("_cf")
+                    or str(right_root).endswith("_cf")
+                )
+                and (
+                    ("slice" in str(left_root) and not str(left_root).endswith("_cf"))
+                    or ("slice" in str(right_root) and not str(right_root).endswith("_cf"))
+                    or ("clip" in str(left_root) and not str(left_root).endswith("_cf"))
+                    or ("clip" in str(right_root) and not str(right_root).endswith("_cf"))
+                )
+            ):
+                candidate_shape = [
+                    int(target_shape[0]),
+                    1,
+                    int(target_shape[3]),
+                    int(target_shape[1]),
+                ]
             if candidate_shape is None and ("self." in right_expr or "torch.reshape(" in right_expr):
                 for future_index in range(index + 1, min(len(lines), index + 5)):
                     future_expr_match = binary_expr_re.match(lines[future_index])
