@@ -31591,6 +31591,58 @@ def _parse_binary_add_args(expr: str) -> Tuple[str, str] | None:
     return input_expr, other_expr
 
 
+def _parse_align_tensor_target_shape_expr(expr: str) -> Tuple[str, str] | None:
+    stripped = str(expr).strip()
+    prefix = "_align_tensor_to_target_shape("
+    if not stripped.startswith(prefix) or not stripped.endswith(")"):
+        return None
+    parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+    if len(parts) == 2 and all(
+        re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+    ):
+        return parts[0].strip(), parts[1].strip()
+
+    kwargs: Dict[str, str] = {}
+    for part in parts:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+            continue
+        key, value = part.split("=", 1)
+        kwargs[key.strip()] = value.strip()
+    input_expr = kwargs.get("input", None)
+    target_shape_expr = kwargs.get("target_shape", None)
+    if input_expr is None or target_shape_expr is None:
+        return None
+    return input_expr, target_shape_expr
+
+
+def _parse_align_tensor_target_shape_assign(line: str) -> Tuple[str, str] | None:
+    current_line = str(line)
+    if "=" not in current_line:
+        return None
+    lhs, rhs = current_line.split("=", 1)
+    if re.fullmatch(r"\s*[A-Za-z0-9_]+\s*", lhs) is None:
+        return None
+    return _parse_align_tensor_target_shape_expr(rhs.strip())
+
+
+def _parse_apply_pool2d_input_expr(expr: str) -> str | None:
+    stripped = str(expr).strip()
+    prefix = "_apply_pool2d("
+    if not stripped.startswith(prefix) or not stripped.endswith(")"):
+        return None
+    parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+    if parts and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", parts[0]) is None:
+        return parts[0].strip()
+
+    kwargs: Dict[str, str] = {}
+    for part in parts:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+            continue
+        key, value = part.split("=", 1)
+        kwargs[key.strip()] = value.strip()
+    return kwargs.get("input")
+
+
 def _normalize_permute_dims_expr(expr: str) -> str:
     stripped = str(expr).strip()
     if (
@@ -31606,12 +31658,8 @@ def _resolve_nhwc_to_nchw_bridge_source(expr: str) -> str | None:
     if stripped.endswith(".contiguous()"):
         stripped = stripped[: -len(".contiguous()")].strip()
 
-    functional_match = re.match(
-        r"^torch\.permute\((?P<args>.+)\)$",
-        stripped,
-    )
-    if functional_match is not None:
-        parts = _split_top_level_csv_exprs(str(functional_match.group("args")))
+    def _parse_functional_permute_args(args: str) -> str | None:
+        parts = _split_top_level_csv_exprs(str(args))
         if len(parts) == 2 and "=" not in parts[0] and "=" not in parts[1]:
             source_expr = parts[0].strip()
             dims_expr = _normalize_permute_dims_expr(parts[1])
@@ -31629,6 +31677,8 @@ def _resolve_nhwc_to_nchw_bridge_source(expr: str) -> str | None:
         if source_expr is None:
             source_expr = kwargs.get("x", None)
         dims_expr = kwargs.get("dims", None)
+        if dims_expr is None:
+            dims_expr = kwargs.get("perm", None)
         if source_expr is None or dims_expr is None:
             return None
         if re.match(r"^[A-Za-z0-9_]+$", source_expr) is None:
@@ -31636,6 +31686,20 @@ def _resolve_nhwc_to_nchw_bridge_source(expr: str) -> str | None:
         if _normalize_permute_dims_expr(dims_expr) != "0,3,1,2":
             return None
         return source_expr
+
+    functional_match = re.match(
+        r"^torch\.permute\((?P<args>.+)\)$",
+        stripped,
+    )
+    if functional_match is not None:
+        return _parse_functional_permute_args(str(functional_match.group("args")))
+
+    helper_match = re.match(
+        r"^_torch_permute\((?P<args>.+)\)$",
+        stripped,
+    )
+    if helper_match is not None:
+        return _parse_functional_permute_args(str(helper_match.group("args")))
 
     method_match = re.match(
         r"^(?P<src>[A-Za-z0-9_]+)\.permute\((?P<dims>.+)\)$",
@@ -31699,14 +31763,8 @@ def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
     alias_assign_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)$"
     )
-    permute_assign_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
-    )
     return_single_re = re.compile(
         r"^\s*return (?P<value>[A-Za-z0-9_]+)$"
-    )
-    return_permute_re = re.compile(
-        r"^\s*return _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
     )
 
     returned_values: Set[str] = set()
@@ -31714,20 +31772,23 @@ def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
     permute_outputs: Set[str] = set()
     for line in lines:
         current_line = str(line)
+        stripped_line = current_line.lstrip()
         return_match = return_single_re.match(current_line)
         if return_match is not None:
             returned_values.add(str(return_match.group("value")))
             continue
-        if return_permute_re.match(current_line) is not None:
+        if stripped_line.startswith("return ") and _resolve_nhwc_to_nchw_bridge_source(stripped_line[len("return ") :]) is not None:
             return True
         alias_match = alias_assign_re.match(current_line)
         if alias_match is not None:
             alias_assignments[str(alias_match.group("lhs"))] = str(alias_match.group("src"))
             continue
-        permute_match = permute_assign_re.match(current_line)
-        if permute_match is not None:
-            permute_outputs.add(str(permute_match.group("lhs")))
-            continue
+        if "=" in current_line:
+            lhs, rhs = current_line.split("=", 1)
+            if re.fullmatch(r"\s*[A-Za-z0-9_]+\s*", lhs) is not None:
+                if _resolve_nhwc_to_nchw_bridge_source(rhs.strip()) is not None:
+                    permute_outputs.add(lhs.strip())
+                    continue
     if not returned_values:
         return False
     pending_values = set(returned_values)
@@ -31832,14 +31893,11 @@ def _has_nanodet_head_signature(lines: Sequence[str]) -> bool:
 def _has_nanodet_backbone_pool_signature(lines: Sequence[str]) -> bool:
     padded_assign_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?:_align_tensor_to_target_shape\()?[A-Za-z0-9_]+(?:, \[[0-9, ]+\])?\)?, "
-        r"\[(?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\], mode='constant', value=-3\.4028234663852886e\+38\)$"
-    )
-    pool_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\((?P<input>.+?),\s*filter_height=.*is_max_pool=True, channel_last=(?:True|False)\)$"
+        r"(?:\[(?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\]|\((?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\)), mode='constant', value=-3\.4028234663852886e\+38\)$"
     )
     inline_padded_re = re.compile(
         r"^F\.pad\((?:_align_tensor_to_target_shape\()?[A-Za-z0-9_]+(?:, \[[0-9, ]+\])?\)?, "
-        r"\[(?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\], mode='constant', value=-3\.4028234663852886e\+38\)$"
+        r"(?:\[(?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\]|\((?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\)), mode='constant', value=-3\.4028234663852886e\+38\)$"
     )
 
     padded_outputs: Set[str] = set()
@@ -31852,10 +31910,13 @@ def _has_nanodet_backbone_pool_signature(lines: Sequence[str]) -> bool:
         return True
 
     for line in lines:
-        pool_match = pool_re.match(str(line))
-        if pool_match is None:
+        current_line = str(line)
+        if "=" not in current_line:
             continue
-        pool_input = str(pool_match.group("input")).strip()
+        _, rhs = current_line.split("=", 1)
+        pool_input = _parse_apply_pool2d_input_expr(rhs.strip())
+        if pool_input is None or "is_max_pool=True" not in rhs:
+            continue
         if pool_input in padded_outputs:
             return True
         if inline_padded_re.match(pool_input) is not None:
@@ -31864,21 +31925,16 @@ def _has_nanodet_backbone_pool_signature(lines: Sequence[str]) -> bool:
 
 
 def _has_nanodet_resize_signature(lines: Sequence[str]) -> bool:
-    return _any_line_matches(
-        lines,
-        r"^\s*[A-Za-z0-9_]+ = _apply_resize\([A-Za-z0-9_]+, \[\d+, \d+\], method='bilinear', "
-        r"target_shape=\[1, \d+, \d+, \d+\], align_corners=False, half_pixel_centers=True, channel_last=True\)$",
+    resize_re = re.compile(
+        r"_apply_resize\([A-Za-z0-9_]+, \[\d+, \d+\], method='bilinear', "
+        r"target_shape=\[1, \d+, \d+, \d+\], align_corners=False, half_pixel_centers=True, channel_last=True\)"
     )
+    return any(resize_re.search(str(line)) is not None for line in lines)
 
 
 def _has_nhwc_stem_pool_bridge_signature(lines: Sequence[str]) -> bool:
     stem_conv_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = self\.conv_block_\d+\([A-Za-z0-9_]+(?:\.permute\([^)]*\)\.contiguous\(\))?\)$"
-    )
-    nhwc_align_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
-        r"(?P<input>[A-Za-z0-9_]+)(?:\.permute\(0, 2, 3, 1\)\.contiguous\(\))?, "
-        r"\[1, \d+, \d+, \d+\]\)$"
     )
     padded_aligned_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), "
@@ -31910,10 +31966,18 @@ def _has_nhwc_stem_pool_bridge_signature(lines: Sequence[str]) -> bool:
         if stem_match is not None:
             stem_outputs.add(str(stem_match.group("lhs")))
             continue
-        align_match = nhwc_align_re.match(current_line)
-        if align_match is not None and str(align_match.group("input")) in stem_outputs:
-            nhwc_bridge_outputs.add(str(align_match.group("lhs")))
-            continue
+        align_assign_match = re.match(r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<rhs>.+)$", current_line)
+        if align_assign_match is not None:
+            align_args = _parse_align_tensor_target_shape_expr(str(align_assign_match.group("rhs")))
+            if align_args is not None:
+                align_input, align_target_shape = align_args
+                align_input = re.sub(r"\.permute\([^)]*\)\.contiguous\(\)$", "", align_input).strip()
+                if (
+                    align_input in stem_outputs
+                    and re.fullmatch(r"[\[\(]\s*1\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*[\]\)]", align_target_shape) is not None
+                ):
+                    nhwc_bridge_outputs.add(str(align_assign_match.group("lhs")))
+                    continue
         padded_match = padded_aligned_re.match(current_line)
         if padded_match is None:
             padded_match = padded_direct_re.match(current_line)
@@ -31941,15 +32005,6 @@ def _has_nhwc_stem_pool_bridge_signature(lines: Sequence[str]) -> bool:
 def _has_efficientformer_attention_signature(lines: Sequence[str]) -> bool:
     cf_pool_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = _(?:align_tensor_to_target_shape\(torch\.mul|apply_pool2d)\("
-    )
-    nhwc_add_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[1, (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
-    )
-    attention_logits_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\((?P<input>[A-Za-z0-9_]+), (?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\), \[1, (?P<heads>\d+), (?P<t0>\d+), (?P<t1>\d+)\]\)$"
-    )
-    attention_logits_reversed_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\((?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+), (?P<input>[A-Za-z0-9_]+)\), \[1, (?P<heads>\d+), (?P<t0>\d+), (?P<t1>\d+)\]\)$"
     )
     self_const_alias_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*self\.(?P<const_attr>[A-Za-z0-9_]+)\s*\)*$"
@@ -31985,6 +32040,20 @@ def _has_efficientformer_attention_signature(lines: Sequence[str]) -> bool:
                 return None
             resolved = aliased
 
+    def _parse_rank4_shape(shape_expr: str) -> tuple[int, int, int, int] | None:
+        shape_match = re.fullmatch(
+            r"[\[\(]\s*(?P<n>\d+)\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)\s*[\]\)]",
+            str(shape_expr).strip(),
+        )
+        if shape_match is None:
+            return None
+        return (
+            int(shape_match.group("n")),
+            int(shape_match.group("d1")),
+            int(shape_match.group("d2")),
+            int(shape_match.group("d3")),
+        )
+
     for line in lines:
         current_line = str(line)
         if cf_pool_re.match(current_line) is not None:
@@ -32005,31 +32074,36 @@ def _has_efficientformer_attention_signature(lines: Sequence[str]) -> bool:
             if aliased_const is not None:
                 const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_const
             continue
-        attention_logits_match: re.Match[str] | None = None
-        for candidate_match in (
-            attention_logits_re.match(current_line),
-            attention_logits_reversed_re.match(current_line),
-        ):
-            if candidate_match is None:
+        align_assign = _parse_align_tensor_target_shape_assign(current_line)
+        if align_assign is None:
+            continue
+        aligned_expr, shape_expr = align_assign
+        shape = _parse_rank4_shape(shape_expr)
+        if shape is None:
+            continue
+        add_match = re.fullmatch(r"torch\.add\((?P<args>.+)\)", aligned_expr)
+        if add_match is None:
+            continue
+        add_args = _parse_binary_add_args(str(add_match.group("args")))
+        if add_args is None:
+            continue
+        lhs_expr, rhs_expr = add_args
+        resolved_lhs_const = _resolve_const_expr(lhs_expr)
+        resolved_rhs_const = _resolve_const_expr(rhs_expr)
+        _, dim1, dim2, dim3 = shape
+        if resolved_lhs_const is not None or resolved_rhs_const is not None:
+            if resolved_lhs_const is None and resolved_rhs_const is not None:
+                heads, token0, token1 = dim1, dim2, dim3
+            elif resolved_rhs_const is None and resolved_lhs_const is not None:
+                heads, token0, token1 = dim1, dim2, dim3
+            else:
                 continue
-            if _resolve_const_expr(str(candidate_match.group("const_expr"))) is None:
-                continue
-            attention_logits_match = candidate_match
-            break
-        if attention_logits_match is not None:
-            heads = int(attention_logits_match.group("heads"))
-            token0 = int(attention_logits_match.group("t0"))
-            token1 = int(attention_logits_match.group("t1"))
             if heads >= 2 and token0 == token1 and token0 >= 16:
                 attention_token_pairs.add(token0)
             continue
-        nhwc_add_match = nhwc_add_re.match(current_line)
-        if nhwc_add_match is not None:
-            height = int(nhwc_add_match.group("h"))
-            width = int(nhwc_add_match.group("w"))
-            channels = int(nhwc_add_match.group("c"))
-            if height == width and height >= 4 and channels > height:
-                nhwc_attention_tokens.add(height * width)
+        height, width, channels = dim1, dim2, dim3
+        if height == width and height >= 4 and channels > height:
+            nhwc_attention_tokens.add(height * width)
 
     return has_cf_pool and bool(nhwc_attention_tokens & attention_token_pairs)
 
