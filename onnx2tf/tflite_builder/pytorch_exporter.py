@@ -31622,6 +31622,10 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
         r"target_shape=\[1, \d+, \d+, \d+\], align_corners=(?:True|False), "
         r"half_pixel_centers=(?:True|False), channel_last=True\)$"
     )
+    apply_concat_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=(?:1|3), "
+        r"target_shape=\[[0-9, ]+\], fused='[^']+'\)$"
+    )
     torch_cat_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
     )
@@ -31644,6 +31648,8 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
         current_line = str(line)
         concat_match = torch_cat_re.match(current_line)
         if concat_match is None:
+            concat_match = apply_concat_re.match(current_line)
+        if concat_match is None:
             continue
         inputs = [input_name.strip() for input_name in str(concat_match.group("inputs")).split(",") if input_name.strip()]
         if len(inputs) != 2:
@@ -31661,11 +31667,18 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
 
 def _has_nanodet_head_signature(lines: Sequence[str]) -> bool:
     apply_concat_re = re.compile(
-        r"^\s*out = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=1, "
+        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=1, "
         r"target_shape=\[1, \d+, \d+\], fused='NONE'\)$"
     )
     torch_cat_re = re.compile(
-        r"^\s*out = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
+        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
+    )
+    return_apply_concat_re = re.compile(
+        r"^\s*return _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=1, "
+        r"target_shape=\[1, \d+, \d+\], fused='NONE'\)$"
+    )
+    return_torch_cat_re = re.compile(
+        r"^\s*return torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
     )
 
     for line in lines:
@@ -31673,6 +31686,10 @@ def _has_nanodet_head_signature(lines: Sequence[str]) -> bool:
         concat_match = apply_concat_re.match(current_line)
         if concat_match is None:
             concat_match = torch_cat_re.match(current_line)
+        if concat_match is None:
+            concat_match = return_apply_concat_re.match(current_line)
+        if concat_match is None:
+            concat_match = return_torch_cat_re.match(current_line)
         if concat_match is None:
             continue
         inputs = [input_name.strip() for input_name in str(concat_match.group("inputs")).split(",") if input_name.strip()]
@@ -31710,9 +31727,13 @@ def _has_nhwc_stem_pool_bridge_signature(lines: Sequence[str]) -> bool:
         r"(?P<input>[A-Za-z0-9_]+)(?:\.permute\(0, 2, 3, 1\)\.contiguous\(\))?, "
         r"\[1, \d+, \d+, \d+\]\)$"
     )
-    padded_re = re.compile(
+    padded_aligned_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), "
         r"\[1, \d+, \d+, \d+\]\), \[0, 0, 1, 1, 1, 1\], mode='constant', value=-3\.4028234663852886e\+38\)$"
+    )
+    padded_direct_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), "
+        r"\[0, 0, 1, 1, 1, 1\], mode='constant', value=-3\.4028234663852886e\+38\)$"
     )
     pool_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), .*is_max_pool=True, channel_last=True\)$"
@@ -31732,7 +31753,9 @@ def _has_nhwc_stem_pool_bridge_signature(lines: Sequence[str]) -> bool:
         if align_match is not None and str(align_match.group("input")) in stem_outputs:
             nhwc_bridge_outputs.add(str(align_match.group("lhs")))
             continue
-        padded_match = padded_re.match(current_line)
+        padded_match = padded_aligned_re.match(current_line)
+        if padded_match is None:
+            padded_match = padded_direct_re.match(current_line)
         if padded_match is not None:
             if str(padded_match.group("input")) not in nhwc_bridge_outputs:
                 continue
@@ -31752,17 +31775,82 @@ def _has_efficientformer_attention_signature(lines: Sequence[str]) -> bool:
         r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, [A-Za-z0-9_]+\), \[1, (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     attention_logits_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\([A-Za-z0-9_]+, self\.[A-Za-z0-9_]+\), \[1, (?P<heads>\d+), (?P<t0>\d+), (?P<t1>\d+)\]\)$"
+        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\((?P<input>[A-Za-z0-9_]+), (?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\), \[1, (?P<heads>\d+), (?P<t0>\d+), (?P<t1>\d+)\]\)$"
+    )
+    attention_logits_reversed_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.add\((?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+), (?P<input>[A-Za-z0-9_]+)\), \[1, (?P<heads>\d+), (?P<t0>\d+), (?P<t1>\d+)\]\)$"
+    )
+    self_const_alias_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*self\.(?P<const_attr>[A-Za-z0-9_]+)\s*\)*$"
+    )
+    generic_alias_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*$"
     )
 
     has_cf_pool = False
     nhwc_attention_tokens: Set[int] = set()
     attention_token_pairs: Set[int] = set()
+    local_alias_sources: Dict[str, str] = {}
+    const_alias_sources: Dict[str, str] = {}
+
+    def _resolve_local_alias(expr: str) -> str:
+        resolved = str(expr).strip()
+        seen: Set[str] = set()
+        while resolved not in seen:
+            seen.add(resolved)
+            aliased = local_alias_sources.get(resolved, None)
+            if aliased is None or aliased == resolved:
+                break
+            resolved = aliased
+        return resolved
+
+    def _resolve_const_expr(expr: str) -> str | None:
+        resolved = _resolve_local_alias(str(expr).strip())
+        while True:
+            if resolved.startswith("self."):
+                return resolved[len("self.") :]
+            aliased = const_alias_sources.get(resolved, None)
+            if aliased is None or aliased == resolved:
+                return None
+            resolved = aliased
 
     for line in lines:
         current_line = str(line)
         if cf_pool_re.match(current_line) is not None:
             has_cf_pool = True
+            continue
+        self_const_alias_match = self_const_alias_re.match(current_line)
+        if self_const_alias_match is not None:
+            const_alias_sources[str(self_const_alias_match.group("lhs"))] = (
+                f"self.{self_const_alias_match.group('const_attr')}"
+            )
+            continue
+        generic_alias_match = generic_alias_re.match(current_line)
+        if generic_alias_match is not None:
+            input_name = str(generic_alias_match.group("input"))
+            if not input_name.startswith("self."):
+                local_alias_sources[str(generic_alias_match.group("lhs"))] = _resolve_local_alias(input_name)
+            aliased_const = const_alias_sources.get(input_name, None)
+            if aliased_const is not None:
+                const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_const
+            continue
+        attention_logits_match: re.Match[str] | None = None
+        for candidate_match in (
+            attention_logits_re.match(current_line),
+            attention_logits_reversed_re.match(current_line),
+        ):
+            if candidate_match is None:
+                continue
+            if _resolve_const_expr(str(candidate_match.group("const_expr"))) is None:
+                continue
+            attention_logits_match = candidate_match
+            break
+        if attention_logits_match is not None:
+            heads = int(attention_logits_match.group("heads"))
+            token0 = int(attention_logits_match.group("t0"))
+            token1 = int(attention_logits_match.group("t1"))
+            if heads >= 2 and token0 == token1 and token0 >= 16:
+                attention_token_pairs.add(token0)
             continue
         nhwc_add_match = nhwc_add_re.match(current_line)
         if nhwc_add_match is not None:
@@ -31771,14 +31859,6 @@ def _has_efficientformer_attention_signature(lines: Sequence[str]) -> bool:
             channels = int(nhwc_add_match.group("c"))
             if height == width and height >= 4 and channels > height:
                 nhwc_attention_tokens.add(height * width)
-            continue
-        attention_logits_match = attention_logits_re.match(current_line)
-        if attention_logits_match is not None:
-            heads = int(attention_logits_match.group("heads"))
-            token0 = int(attention_logits_match.group("t0"))
-            token1 = int(attention_logits_match.group("t1"))
-            if heads >= 2 and token0 == token1 and token0 >= 16:
-                attention_token_pairs.add(token0)
 
     return has_cf_pool and bool(nhwc_attention_tokens & attention_token_pairs)
 
@@ -31843,6 +31923,9 @@ def _has_humanseg_skip_signature(lines: Sequence[str]) -> bool:
     torch_cat_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
     )
+    apply_concat_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=3, target_shape=\[[0-9, ]+\], fused='[^']+'\)$"
+    )
     conv_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = self\.conv_block_\d+\((?P<src>[A-Za-z0-9_]+)\)$"
     )
@@ -31865,6 +31948,8 @@ def _has_humanseg_skip_signature(lines: Sequence[str]) -> bool:
             )
             continue
         torch_cat_match = torch_cat_re.match(current_line)
+        if torch_cat_match is None:
+            torch_cat_match = apply_concat_re.match(current_line)
         if torch_cat_match is not None:
             torch_cat_inputs_by_lhs[str(torch_cat_match.group("lhs"))] = [
                 input_name.strip()
