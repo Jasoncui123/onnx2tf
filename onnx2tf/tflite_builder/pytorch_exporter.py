@@ -21697,6 +21697,303 @@ def _canonicalize_generated_model_source_for_raw_export(
     output_back_permute_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
     )
+    def _resolve_nchw_to_nhwc_bridge_source(expr: str) -> str | None:
+        stripped = str(expr).strip()
+        if stripped.endswith(".contiguous()"):
+            stripped = stripped[: -len(".contiguous()")].strip()
+
+        def _parse_permute_like_args(args_expr: str) -> str | None:
+            parts = _split_top_level_csv_exprs(args_expr)
+            input_expr: str | None = None
+            perm_expr: str | None = None
+            if len(parts) == 2 and all(
+                re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+            ):
+                input_expr, perm_expr = parts[0].strip(), parts[1].strip()
+            else:
+                kwargs: Dict[str, str] = {}
+                for part in parts:
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                        continue
+                    key, value = part.split("=", 1)
+                    kwargs[key.strip()] = value.strip()
+                input_expr = kwargs.get("input", kwargs.get("x"))
+                perm_expr = kwargs.get("perm", kwargs.get("dims"))
+            if input_expr is None or perm_expr is None:
+                return None
+            if re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None:
+                return None
+            if _normalize_permute_dims_expr(perm_expr) != "0,2,3,1":
+                return None
+            return input_expr
+
+        for prefix in ("_torch_permute(", "torch.permute("):
+            if stripped.startswith(prefix) and stripped.endswith(")"):
+                return _parse_permute_like_args(stripped[len(prefix) : -1])
+        method_match = re.fullmatch(r"(?P<input>[A-Za-z0-9_]+)\.permute\((?P<dims>.+)\)", stripped)
+        if method_match is not None and _normalize_permute_dims_expr(str(method_match.group("dims"))) == "0,2,3,1":
+            return str(method_match.group("input"))
+        return None
+
+    def _parse_transpose_conv_input_bridge_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        source_expr = _resolve_nchw_to_nhwc_bridge_source(rhs)
+        if source_expr is None:
+            return None
+        return indent, lhs, source_expr
+
+    def _parse_align_binary_inputs_to_anchor_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, str, str, List[int]] | None:
+        assign_match = re.match(
+            r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(current_line),
+        )
+        if assign_match is None:
+            return None
+        rhs = str(assign_match.group("rhs")).strip()
+        prefix = "_align_binary_inputs_to_anchor("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        input_a: str | None = None
+        input_b: str | None = None
+        shape_expr: str | None = None
+        if len(parts) == 3 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input_a = parts[0].strip()
+            input_b = parts[1].strip()
+            shape_expr = parts[2].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_a = kwargs.get("input", kwargs.get("a"))
+            input_b = kwargs.get("other", kwargs.get("b"))
+            shape_expr = kwargs.get("target_shape", kwargs.get("shape"))
+        if input_a is None or input_b is None or shape_expr is None:
+            return None
+        rank4_shape = _parse_rank4_shape_literal(shape_expr)
+        if rank4_shape is None:
+            return None
+        return (
+            str(assign_match.group("indent")),
+            str(assign_match.group("lhs0")),
+            str(assign_match.group("lhs1")),
+            input_a,
+            input_b,
+            [int(dim) for dim in rank4_shape],
+        )
+
+    def _parse_singleton_const_reshape_attr(expr: str) -> str | None:
+        stripped = str(expr).strip()
+        reshape_match = re.fullmatch(r"torch\.reshape\((?P<args>.+)\)", stripped)
+        if reshape_match is None:
+            return None
+        parts = _split_top_level_csv_exprs(str(reshape_match.group("args")))
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        if len(parts) == 2 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input_expr = parts[0].strip()
+            shape_expr = parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            shape_expr = kwargs.get("shape")
+        if input_expr is None or shape_expr is None:
+            return None
+        attr_match = re.fullmatch(r"\(*\s*self\.(?P<attr>[A-Za-z0-9_]+)\s*\)*", input_expr)
+        rank4_shape = _parse_rank4_shape_literal(shape_expr)
+        if attr_match is None or rank4_shape is None:
+            return None
+        if [int(dim) for dim in rank4_shape] != [1, 1, 1, 1]:
+            return None
+        return str(attr_match.group("attr"))
+
+    def _parse_singleton_const_anchor_fix_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, str, str] | None:
+        parsed = _parse_align_binary_inputs_to_anchor_assign(current_line)
+        if parsed is None:
+            return None
+        indent, lhs0, lhs1, input_a, input_b, rank4_shape = parsed
+        if rank4_shape != [1, 1, 1, 1]:
+            return None
+        const_attr_a = _parse_singleton_const_reshape_attr(input_a)
+        const_attr_b = _parse_singleton_const_reshape_attr(input_b)
+        if const_attr_a is not None and const_attr_b is None:
+            return indent, lhs0, lhs1, input_b, const_attr_a
+        if const_attr_b is not None and const_attr_a is None:
+            return indent, lhs0, lhs1, input_a, const_attr_b
+        return None
+
+    def _parse_permuted_cf_module_input_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        call_match = re.fullmatch(r"(?P<module>self\.[A-Za-z0-9_]+)\((?P<args>.+)\)", rhs.strip())
+        if call_match is None:
+            return None
+        args = _split_top_level_csv_exprs(str(call_match.group("args")))
+        if len(args) != 1:
+            return None
+        source_expr = _resolve_nhwc_to_nchw_bridge_source(args[0])
+        if source_expr is None:
+            return None
+        return indent, lhs, str(call_match.group("module")), source_expr
+
+    def _parse_transpose_conv_bias_fix_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        call_match = re.fullmatch(r"torch\.reshape\((?P<args>.+)\)", rhs.strip())
+        if call_match is None:
+            return None
+        parts = _split_top_level_csv_exprs(str(call_match.group("args")))
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        if len(parts) == 2 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+            input_expr, shape_expr = parts[0].strip(), parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            shape_expr = kwargs.get("shape")
+        if input_expr is None or shape_expr is None:
+            return None
+        shape = _parse_rank4_shape_literal(shape_expr)
+        if shape is None:
+            return None
+        stripped = input_expr.strip()
+        if stripped.endswith(".contiguous()"):
+            stripped = stripped[: -len(".contiguous()")].strip()
+
+        def _parse_permute_like_args(args_expr: str) -> str | None:
+            parts = _split_top_level_csv_exprs(args_expr)
+            source_expr: str | None = None
+            perm_expr: str | None = None
+            if len(parts) == 2 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+                source_expr, perm_expr = parts[0].strip(), parts[1].strip()
+            else:
+                kwargs: Dict[str, str] = {}
+                for part in parts:
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                        continue
+                    key, value = part.split("=", 1)
+                    kwargs[key.strip()] = value.strip()
+                source_expr = kwargs.get("input", kwargs.get("x"))
+                perm_expr = kwargs.get("perm", kwargs.get("dims"))
+            if source_expr is None or perm_expr is None:
+                return None
+            if re.fullmatch(r"[A-Za-z0-9_\.]+", source_expr) is None:
+                return None
+            if _normalize_permute_dims_expr(perm_expr) != "0,2,3,1":
+                return None
+            return source_expr
+
+        bridge_expr: str | None = None
+        for prefix in ("_torch_permute(", "torch.permute("):
+            if stripped.startswith(prefix) and stripped.endswith(")"):
+                bridge_expr = _parse_permute_like_args(stripped[len(prefix) : -1])
+                break
+        if bridge_expr is None:
+            method_match = re.fullmatch(r"(?P<input>[A-Za-z0-9_\.]+)\.permute\((?P<dims>.+)\)", stripped)
+            if method_match is not None and _normalize_permute_dims_expr(str(method_match.group("dims"))) == "0,2,3,1":
+                bridge_expr = str(method_match.group("input"))
+        if bridge_expr is None:
+            return None
+        return indent, lhs, bridge_expr, list(shape)
+
+    def _parse_transpose_conv_bias_add_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        expr, shape_expr = align_parts
+        shape = _parse_rank4_shape_literal(shape_expr)
+        if shape is None:
+            return None
+        add_parts = _parse_binary_add_args(expr)
+        if add_parts is None:
+            return None
+        return indent, lhs, add_parts[0], add_parts[1], list(shape)
+
+    def _parse_output_back_permute_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        if stripped.endswith(".contiguous()"):
+            stripped = stripped[: -len(".contiguous()")].strip()
+
+        def _parse_permute_like_args(args_expr: str) -> str | None:
+            parts = _split_top_level_csv_exprs(args_expr)
+            input_expr: str | None = None
+            perm_expr: str | None = None
+            if len(parts) == 2 and all(
+                re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+            ):
+                input_expr, perm_expr = parts[0].strip(), parts[1].strip()
+            else:
+                kwargs: Dict[str, str] = {}
+                for part in parts:
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                        continue
+                    key, value = part.split("=", 1)
+                    kwargs[key.strip()] = value.strip()
+                input_expr = kwargs.get("input", kwargs.get("x"))
+                perm_expr = kwargs.get("perm", kwargs.get("dims"))
+            if input_expr is None or perm_expr is None or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None:
+                return None
+            if _normalize_permute_dims_expr(perm_expr) != "0,3,1,2":
+                return None
+            return input_expr
+
+        for prefix in ("_torch_permute(", "torch.permute("):
+            if stripped.startswith(prefix) and stripped.endswith(")"):
+                source_name = _parse_permute_like_args(stripped[len(prefix) : -1])
+                if source_name is not None:
+                    return indent, lhs, source_name
+        method_match = re.fullmatch(r"(?P<input>[A-Za-z0-9_]+)\.permute\((?P<dims>.+)\)", stripped)
+        if method_match is None:
+            return None
+        if _normalize_permute_dims_expr(str(method_match.group("dims"))) != "0,3,1,2":
+            return None
+        return indent, lhs, str(method_match.group("input"))
     apply_softmax_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)]\)$"
     )
@@ -21706,6 +22003,56 @@ def _canonicalize_generated_model_source_for_raw_export(
     argmax_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.argmax\((?P<input>[A-Za-z0-9_]+), dim=_normalize_dim\((?P<axis>-?\d+), (?P=input)\.ndim\), keepdim=(?P<keepdim>True|False)\)\.to\(dtype=torch\.int64\)$"
     )
+    def _parse_argmax_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, int, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        suffix = ".to(dtype=torch.int64)"
+        prefix = "torch.argmax("
+        if not stripped.endswith(suffix):
+            return None
+        argmax_expr = stripped[: -len(suffix)].strip()
+        if not argmax_expr.startswith(prefix) or not argmax_expr.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(argmax_expr[len(prefix) : -1])
+        input_expr: str | None = None
+        axis_expr: str | None = None
+        keepdim_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "dim":
+                    axis_expr = value
+                elif key == "keepdim":
+                    keepdim_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            positional_index += 1
+        if (
+            input_expr is None
+            or axis_expr is None
+            or keepdim_expr is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None
+            or re.fullmatch(r"True|False", keepdim_expr) is None
+        ):
+            return None
+        axis_match = re.fullmatch(
+            r"_normalize_dim\(\s*(?P<axis>-?\d+)\s*,\s*[A-Za-z0-9_]+\.ndim\s*\)",
+            axis_expr,
+        )
+        if axis_match is None:
+            return None
+        return indent, lhs, input_expr, int(axis_match.group("axis")), keepdim_expr
     rank4_mean_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[(?P<dim0>-?\d+), (?P<dim1>-?\d+)\], keepdim=(?P<keepdim>True|False)\)$"
     )
@@ -21720,6 +22067,197 @@ def _canonicalize_generated_model_source_for_raw_export(
     reduce_sum_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_reduce_sum\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
     )
+    def _parse_rank4_reshape_consumer_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        call_match = re.fullmatch(r"torch\.reshape\((?P<args>.+)\)", rhs.strip())
+        if call_match is None:
+            return None
+        parts = _split_top_level_csv_exprs(str(call_match.group("args")))
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        if len(parts) == 2 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input_expr, shape_expr = parts[0].strip(), parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            shape_expr = kwargs.get("shape")
+        if input_expr is None or shape_expr is None:
+            return None
+        if re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None:
+            return None
+        if (
+            re.fullmatch(
+                rf"_resolve_reshape_shape\(\[[0-9,\- ]+\], {re.escape(input_expr)}, allow_zero=False\)",
+                shape_expr,
+            )
+            is None
+            and _parse_rank4_shape_literal(shape_expr) is None
+        ):
+            return None
+        return indent, lhs, input_expr
+
+    def _parse_rank3_reshape_from_rank4_source_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        call_match = re.fullmatch(r"torch\.reshape\((?P<args>.+)\)", rhs.strip())
+        if call_match is None:
+            return None
+        parts = _split_top_level_csv_exprs(str(call_match.group("args")))
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        if len(parts) == 2 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input_expr, shape_expr = parts[0].strip(), parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            shape_expr = kwargs.get("shape")
+        if input_expr is None or shape_expr is None:
+            return None
+        if re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None:
+            return None
+        resolved_shape_match = re.fullmatch(
+            rf"_resolve_reshape_shape\(\[(?P<shape>[0-9,\- ]+)\], {re.escape(input_expr)}, allow_zero=False\)",
+            shape_expr,
+        )
+        if resolved_shape_match is not None:
+            shape_values = [
+                int(value.strip())
+                for value in str(resolved_shape_match.group("shape")).split(",")
+                if value.strip()
+            ]
+        else:
+            shape_match = re.fullmatch(r"[\[\(](?P<shape>[0-9,\- ]+)[\]\)]", shape_expr.strip())
+            if shape_match is None:
+                return None
+            shape_values = [
+                int(value.strip())
+                for value in str(shape_match.group("shape")).split(",")
+                if value.strip()
+            ]
+        if len(shape_values) != 3:
+            return None
+        return indent, lhs, input_expr, shape_values
+
+    def _parse_rank4_mean_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, int, int, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        prefix = "torch.mean("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        dim_expr: str | None = None
+        keepdim_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if "=" in part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "dim":
+                    dim_expr = value
+                elif key == "keepdim":
+                    keepdim_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                dim_expr = part.strip()
+            elif positional_index == 2:
+                keepdim_expr = part.strip()
+            positional_index += 1
+        if (
+            input_expr is None
+            or dim_expr is None
+            or keepdim_expr is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None
+            or re.fullmatch(r"True|False", keepdim_expr) is None
+        ):
+            return None
+        dim_match = re.fullmatch(r"[\[\(]\s*(?P<dim0>-?\d+)\s*,\s*(?P<dim1>-?\d+)\s*[\]\)]", dim_expr)
+        if dim_match is None:
+            return None
+        return indent, lhs, input_expr, int(dim_match.group("dim0")), int(dim_match.group("dim1")), keepdim_expr
+    def _parse_reduce_sum_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, int, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        prefix = "_reduce_sum("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        axes_expr: str | None = None
+        keepdims_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if "=" in part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key in {"axes", "axis", "dim"}:
+                    axes_expr = value
+                elif key == "keepdims":
+                    keepdims_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                axes_expr = part.strip()
+            elif positional_index == 2:
+                keepdims_expr = part.strip()
+            positional_index += 1
+        if (
+            input_expr is None
+            or axes_expr is None
+            or keepdims_expr is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None
+            or re.fullmatch(r"True|False", keepdims_expr) is None
+        ):
+            return None
+        axis_match = re.fullmatch(
+            r"_normalize_axes\(\s*[\[\(]\s*(?P<axis>-?\d+)\s*,?\s*[\]\)]\s*,\s*[A-Za-z0-9_]+\.ndim\s*\)",
+            axes_expr,
+        )
+        if axis_match is None:
+            return None
+        return indent, lhs, input_expr, int(axis_match.group("axis")), keepdims_expr
     sub_from_one_align_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.sub\(1\.0, (?P<input>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
@@ -21768,6 +22306,63 @@ def _canonicalize_generated_model_source_for_raw_export(
     cf_permute_source_re = re.compile(
         r"(?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\)"
     )
+    def _parse_cf_nhwc_materialize_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, shape_expr = align_parts
+        shape = _parse_rank4_shape_literal(shape_expr)
+        if shape is None:
+            return None
+
+        def _parse_nchw_to_nhwc_bridge_source(expr: str) -> str | None:
+            stripped = str(expr).strip()
+            if stripped.endswith(".contiguous()"):
+                stripped = stripped[: -len(".contiguous()")].strip()
+
+            def _parse_permute_like_args(args_expr: str) -> str | None:
+                parts = _split_top_level_csv_exprs(args_expr)
+                input_name: str | None = None
+                perm_expr: str | None = None
+                if len(parts) == 2 and all(
+                    re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+                ):
+                    input_name, perm_expr = parts[0].strip(), parts[1].strip()
+                else:
+                    kwargs: Dict[str, str] = {}
+                    for part in parts:
+                        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                            continue
+                        key, value = part.split("=", 1)
+                        kwargs[key.strip()] = value.strip()
+                    input_name = kwargs.get("input", kwargs.get("x"))
+                    perm_expr = kwargs.get("perm", kwargs.get("dims"))
+                if input_name is None or perm_expr is None or re.fullmatch(r"[A-Za-z0-9_]+", input_name) is None:
+                    return None
+                if _normalize_permute_dims_expr(perm_expr) != "0,2,3,1":
+                    return None
+                return input_name
+
+            for prefix in ("_torch_permute(", "torch.permute("):
+                if stripped.startswith(prefix) and stripped.endswith(")"):
+                    return _parse_permute_like_args(stripped[len(prefix) : -1])
+            method_match = re.fullmatch(r"(?P<input>[A-Za-z0-9_]+)\.permute\((?P<dims>.+)\)", stripped)
+            if method_match is None:
+                return None
+            if _normalize_permute_dims_expr(str(method_match.group("dims"))) != "0,2,3,1":
+                return None
+            return str(method_match.group("input"))
+
+        source = _parse_nchw_to_nhwc_bridge_source(input_expr)
+        if source is None:
+            return None
+        return indent, lhs, source, list(shape)
     for index, line in enumerate(lines):
         conv_block_decl_match = conv_block_decl_re.match(line)
         if conv_block_decl_match is not None:
@@ -21897,9 +22492,14 @@ def _canonicalize_generated_model_source_for_raw_export(
         function_end = _function_end_index(line_index)
         for future_line in lines[line_index + 1 : function_end]:
             reshape_match = rank4_reshape_consumer_re.match(future_line)
+            reshape_assign = _parse_rank4_reshape_consumer_assign(future_line)
             if (
-                reshape_match is not None
-                and str(reshape_match.group("input")) == name
+                (reshape_match is not None or reshape_assign is not None)
+                and (
+                    str(reshape_match.group("input"))
+                    if reshape_match is not None
+                    else str(reshape_assign[2])
+                ) == name
             ):
                 return True
         return False
@@ -23125,11 +23725,24 @@ def _canonicalize_generated_model_source_for_raw_export(
                 future_cf_spatial_consumer = True
                 break
             lookahead_mean_match = rank4_mean_re.match(lines[lookahead])
+            lookahead_mean_assign = _parse_rank4_mean_assign(lines[lookahead])
             if (
-                lookahead_mean_match is not None
-                and str(lookahead_mean_match.group("input")) == lhs
-                and int(lookahead_mean_match.group("dim0")) == 1
-                and int(lookahead_mean_match.group("dim1")) == 2
+                (lookahead_mean_match is not None or lookahead_mean_assign is not None)
+                and (
+                    str(lookahead_mean_match.group("input"))
+                    if lookahead_mean_match is not None
+                    else str(lookahead_mean_assign[2])
+                ) == lhs
+                and (
+                    int(lookahead_mean_match.group("dim0"))
+                    if lookahead_mean_match is not None
+                    else int(lookahead_mean_assign[3])
+                ) == 1
+                and (
+                    int(lookahead_mean_match.group("dim1"))
+                    if lookahead_mean_match is not None
+                    else int(lookahead_mean_assign[4])
+                ) == 2
             ):
                 future_cf_spatial_consumer = True
                 break
@@ -23147,13 +23760,17 @@ def _canonicalize_generated_model_source_for_raw_export(
         changed = True
     for index in range(len(lines)):
         cf_nhwc_materialize_match = cf_nhwc_materialize_re.match(lines[index])
-        if cf_nhwc_materialize_match is not None:
-            alias = str(cf_nhwc_materialize_match.group("lhs"))
-            source = str(cf_nhwc_materialize_match.group("src"))
-            n = int(cf_nhwc_materialize_match.group("n"))
-            h = int(cf_nhwc_materialize_match.group("h"))
-            w = int(cf_nhwc_materialize_match.group("w"))
-            c = int(cf_nhwc_materialize_match.group("c"))
+        cf_nhwc_materialize_assign = _parse_cf_nhwc_materialize_assign(lines[index])
+        if cf_nhwc_materialize_match is not None or cf_nhwc_materialize_assign is not None:
+            alias = str(cf_nhwc_materialize_match.group("lhs")) if cf_nhwc_materialize_match is not None else str(cf_nhwc_materialize_assign[1])
+            source = str(cf_nhwc_materialize_match.group("src")) if cf_nhwc_materialize_match is not None else str(cf_nhwc_materialize_assign[2])
+            if cf_nhwc_materialize_match is not None:
+                n = int(cf_nhwc_materialize_match.group("n"))
+                h = int(cf_nhwc_materialize_match.group("h"))
+                w = int(cf_nhwc_materialize_match.group("w"))
+                c = int(cf_nhwc_materialize_match.group("c"))
+            else:
+                n, h, w, c = [int(v) for v in list(cf_nhwc_materialize_assign[3])]
             alias_tensor = (
                 model_ir.tensors.get(_resolve_model_ir_tensor_name(alias), None)
                 if model_ir is not None
@@ -23191,11 +23808,14 @@ def _canonicalize_generated_model_source_for_raw_export(
                 and is_channel_last_logical_layout(alias_layout)
                 and is_channel_last_logical_layout(source_layout)
                 and list(alias_tensor.shape) == [n, h, w, c]
-                and not source.endswith("_cf")
                 and not future_pool_consumer
                 and not future_reshape_consumer
             ):
-                indent = str(cf_nhwc_materialize_match.group("indent"))
+                indent = (
+                    str(cf_nhwc_materialize_match.group("indent"))
+                    if cf_nhwc_materialize_match is not None
+                    else str(cf_nhwc_materialize_assign[0])
+                )
                 lines[index] = f"{indent}{alias} = {source}"
                 changed = True
                 continue
@@ -23232,13 +23852,28 @@ def _canonicalize_generated_model_source_for_raw_export(
             next_rank3_reshape_match = None
             for lookahead_index in range(index + 1, min(index + 5, len(lines))):
                 candidate_reshape_match = rank4_reshape_consumer_re.match(lines[lookahead_index])
-                if candidate_reshape_match is not None and str(candidate_reshape_match.group("input")) == lhs:
+                candidate_reshape_assign = _parse_rank4_reshape_consumer_assign(lines[lookahead_index])
+                if (
+                    (candidate_reshape_match is not None or candidate_reshape_assign is not None)
+                    and (
+                        str(candidate_reshape_match.group("input"))
+                        if candidate_reshape_match is not None
+                        else str(candidate_reshape_assign[2])
+                    ) == lhs
+                ):
                     next_reshape_match = candidate_reshape_match
                     break
                 candidate_rank3_reshape_match = rank3_reshape_from_rank4_source_re.match(lines[lookahead_index])
+                candidate_rank3_reshape_assign = _parse_rank3_reshape_from_rank4_source_assign(
+                    lines[lookahead_index]
+                )
                 if (
-                    candidate_rank3_reshape_match is not None
-                    and str(candidate_rank3_reshape_match.group("src")) == lhs
+                    (candidate_rank3_reshape_match is not None or candidate_rank3_reshape_assign is not None)
+                    and (
+                        str(candidate_rank3_reshape_match.group("src"))
+                        if candidate_rank3_reshape_match is not None
+                        else str(candidate_rank3_reshape_assign[2])
+                    ) == lhs
                 ):
                     next_rank3_reshape_match = candidate_rank3_reshape_match
                     break
@@ -23538,16 +24173,17 @@ def _canonicalize_generated_model_source_for_raw_export(
                 cf_aliases.add(lhs)
                 changed = True
         mean_match = rank4_mean_re.match(lines[index])
-        if mean_match is not None:
-            input_name = str(mean_match.group("input"))
+        mean_assign = _parse_rank4_mean_assign(lines[index])
+        if mean_match is not None or mean_assign is not None:
+            input_name = str(mean_match.group("input")) if mean_match is not None else str(mean_assign[2])
             if (
                 _is_known_cf_name(input_name, singleton_cf_seeds)
-                and int(mean_match.group("dim0")) == 1
-                and int(mean_match.group("dim1")) == 2
+                and (int(mean_match.group("dim0")) if mean_match is not None else int(mean_assign[3])) == 1
+                and (int(mean_match.group("dim1")) if mean_match is not None else int(mean_assign[4])) == 2
             ):
-                indent = str(mean_match.group("indent"))
-                lhs = str(mean_match.group("lhs"))
-                keepdim = str(mean_match.group("keepdim"))
+                indent = str(mean_match.group("indent")) if mean_match is not None else str(mean_assign[0])
+                lhs = str(mean_match.group("lhs")) if mean_match is not None else str(mean_assign[1])
+                keepdim = str(mean_match.group("keepdim")) if mean_match is not None else str(mean_assign[5])
                 lines[index] = (
                     f"{indent}{lhs} = torch.mean({input_name}, dim=[2, 3], keepdim={keepdim})"
                 )
@@ -23868,11 +24504,15 @@ def _canonicalize_generated_model_source_for_raw_export(
                 singleton_cf_vars.add(lhs)
                 changed = True
         binary_anchor_nhwc_match = binary_anchor_align_nhwc_singleton_re.match(lines[index])
-        if binary_anchor_nhwc_match is not None:
-            lhs0 = str(binary_anchor_nhwc_match.group("lhs0"))
-            lhs1 = str(binary_anchor_nhwc_match.group("lhs1"))
-            input_a = str(binary_anchor_nhwc_match.group("a"))
-            input_b = str(binary_anchor_nhwc_match.group("b"))
+        parsed_binary_anchor_nhwc = _parse_align_binary_inputs_to_anchor_assign(lines[index])
+        if (
+            parsed_binary_anchor_nhwc is not None
+            and parsed_binary_anchor_nhwc[5][0] == 1
+            and parsed_binary_anchor_nhwc[5][3] == 1
+            and re.fullmatch(r"[A-Za-z0-9_]+", parsed_binary_anchor_nhwc[3]) is not None
+            and re.fullmatch(r"[A-Za-z0-9_]+", parsed_binary_anchor_nhwc[4]) is not None
+        ):
+            _, lhs0, lhs1, input_a, input_b, anchor_shape = parsed_binary_anchor_nhwc
             input_a_is_cf = _is_known_cf_name(input_a, singleton_cf_vars)
             input_b_is_cf = _is_known_cf_name(input_b, singleton_cf_vars)
             neither_input_is_explicit_nhwc = (
@@ -23888,10 +24528,8 @@ def _canonicalize_generated_model_source_for_raw_export(
                     and (input_a_is_cf or input_b_is_cf)
                 )
             ):
-                indent = str(binary_anchor_nhwc_match.group("indent"))
-                n = int(binary_anchor_nhwc_match.group("n"))
-                h = int(binary_anchor_nhwc_match.group("h"))
-                w = int(binary_anchor_nhwc_match.group("w"))
+                indent = parsed_binary_anchor_nhwc[0]
+                n, h, w = int(anchor_shape[0]), int(anchor_shape[1]), int(anchor_shape[2])
                 lines[index] = (
                     f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor("
                     f"{input_a}, {input_b}, [{n}, 1, {h}, {w}])"
@@ -23900,20 +24538,20 @@ def _canonicalize_generated_model_source_for_raw_export(
                 singleton_cf_vars.add(lhs1)
                 changed = True
         binary_anchor_rank4_match = binary_anchor_align_rank4_re.match(lines[index])
-        if binary_anchor_rank4_match is not None:
-            lhs0 = str(binary_anchor_rank4_match.group("lhs0"))
-            lhs1 = str(binary_anchor_rank4_match.group("lhs1"))
-            input_a = str(binary_anchor_rank4_match.group("a"))
-            input_b = str(binary_anchor_rank4_match.group("b"))
+        parsed_binary_anchor_rank4 = _parse_align_binary_inputs_to_anchor_assign(lines[index])
+        if (
+            parsed_binary_anchor_rank4 is not None
+            and re.fullmatch(r"[A-Za-z0-9_]+", parsed_binary_anchor_rank4[3]) is not None
+            and re.fullmatch(r"[A-Za-z0-9_]+", parsed_binary_anchor_rank4[4]) is not None
+        ):
+            lhs0 = parsed_binary_anchor_rank4[1]
+            lhs1 = parsed_binary_anchor_rank4[2]
+            input_a = parsed_binary_anchor_rank4[3]
+            input_b = parsed_binary_anchor_rank4[4]
             if (
                 _is_known_cf_name(input_a, singleton_cf_vars)
                 and _is_known_cf_name(input_b, singleton_cf_vars)
             ):
-                indent = str(binary_anchor_rank4_match.group("indent"))
-                n = int(binary_anchor_rank4_match.group("n"))
-                h = int(binary_anchor_rank4_match.group("h"))
-                w = int(binary_anchor_rank4_match.group("w"))
-                c = int(binary_anchor_rank4_match.group("c"))
                 cf_aliases.add(lhs0)
                 cf_aliases.add(lhs1)
                 changed = True
@@ -24123,18 +24761,24 @@ def _canonicalize_generated_model_source_for_raw_export(
         argmax_index = index + 1
         if alias_match is not None and str(alias_match.group("src")) == lhs:
             argmax_index = index + 2
+        argmax_assign = None
         if argmax_index < len(lines):
             argmax_match = argmax_re.match(lines[argmax_index])
+            argmax_assign = _parse_argmax_assign(lines[argmax_index])
         if (
             (_is_known_cf_name(input_name, singleton_cf_vars) or input_name.endswith("_nhwc_cf"))
-            and argmax_match is not None
-            and int(argmax_match.group("axis")) == 3
+            and (argmax_match is not None or argmax_assign is not None)
             and (
-                str(argmax_match.group("input")) == lhs
+                int(argmax_match.group("axis")) if argmax_match is not None else int(argmax_assign[3])
+            ) == 3
+            and (
+                (str(argmax_match.group("input")) if argmax_match is not None else str(argmax_assign[2])) == lhs
                 or (
                     alias_match is not None
                     and str(alias_match.group("src")) == lhs
-                    and str(argmax_match.group("input")) == str(alias_match.group("lhs"))
+                    and (
+                        str(argmax_match.group("input")) if argmax_match is not None else str(argmax_assign[2])
+                    ) == str(alias_match.group("lhs"))
                 )
             )
         ):
@@ -24152,11 +24796,15 @@ def _canonicalize_generated_model_source_for_raw_export(
                 alias_lhs = str(alias_match.group("lhs"))
                 lines[index + 1] = f"{alias_match.group('indent')}{alias_lhs} = {lhs}"
                 cf_aliases.add(alias_lhs)
+            argmax_indent = str(argmax_match.group("indent")) if argmax_match is not None else str(argmax_assign[0])
+            argmax_lhs = str(argmax_match.group("lhs")) if argmax_match is not None else str(argmax_assign[1])
+            argmax_input = str(argmax_match.group("input")) if argmax_match is not None else str(argmax_assign[2])
+            argmax_keepdim = str(argmax_match.group("keepdim")) if argmax_match is not None else str(argmax_assign[4])
             lines[argmax_index] = (
-                f"{argmax_match.group('indent')}{argmax_match.group('lhs')} = "
-                f"torch.argmax({argmax_match.group('input')}, "
-                f"dim=_normalize_dim(1, {argmax_match.group('input')}.ndim), "
-                f"keepdim={argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+                f"{argmax_indent}{argmax_lhs} = "
+                f"torch.argmax({argmax_input}, "
+                f"dim=_normalize_dim(1, {argmax_input}.ndim), "
+                f"keepdim={argmax_keepdim}).to(dtype=torch.int64)"
             )
             cf_aliases.add(lhs)
             changed = True
@@ -24356,6 +25004,11 @@ def _canonicalize_generated_model_source_for_raw_export(
             if "_align_binary_inputs_to_anchor(" in current_line
             else None
         )
+        parsed_binary_anchor_rank4 = (
+            _parse_align_binary_inputs_to_anchor_assign(current_line)
+            if "_align_binary_inputs_to_anchor(" in current_line
+            else None
+        )
         nhwc_mul_match = (
             _cached_regex_match("aligned_nhwc_rank4_re", aligned_nhwc_rank4_re, next_line)
             if "_align_tensor_to_target_shape(" in next_line
@@ -24381,6 +25034,33 @@ def _canonicalize_generated_model_source_for_raw_export(
                     reduce_sum_match = candidate_match
                     reduce_sum_index = candidate_index
                     break
+        if (
+            parsed_binary_anchor_rank4 is not None
+            and nhwc_mul_match is not None
+            and reduce_sum_match is not None
+            and str(nhwc_mul_match.group("expr"))
+            == f"torch.mul({parsed_binary_anchor_rank4[2]}, {parsed_binary_anchor_rank4[1]})"
+        ):
+            indent, lhs0, lhs1, a, b, anchor_shape = parsed_binary_anchor_rank4
+            n, h, w, c = anchor_shape
+            mul_lhs = str(nhwc_mul_match.group("lhs"))
+            reduce_lhs = str(reduce_sum_match.group("lhs"))
+            lines[index] = (
+                f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor({a}, {b}, [{n}, {c}, {h}, {w}])"
+            )
+            lines[index + 1] = (
+                f"{nhwc_mul_match.group('indent')}{mul_lhs} = _align_tensor_to_target_shape("
+                f"torch.mul({lhs1}, {lhs0}), [{n}, {c}, {h}, {w}])"
+            )
+            lines[reduce_sum_index] = (
+                f"{reduce_sum_match.group('indent')}{reduce_lhs} = _reduce_sum("
+                f"{mul_lhs}, _normalize_axes([1], {mul_lhs}.ndim), True)"
+            )
+            cf_aliases.add(mul_lhs)
+            singleton_cf_vars.add(reduce_lhs)
+            changed = True
+            index = reduce_sum_index + 1
+            continue
         if (
             binary_anchor_rank4_match is not None
             and nhwc_mul_match is not None
@@ -24881,9 +25561,17 @@ def _canonicalize_generated_model_source_for_raw_export(
                     gather_slice_supported = False
                     for future_index in range(gather_slice_index + 1, min(function_end, gather_slice_index + 10)):
                         permuted_use_match = permuted_cf_module_input_re.match(lines[future_index])
+                        permuted_use_assign = _parse_permuted_cf_module_input_assign(lines[future_index])
                         if (
-                            permuted_use_match is not None
-                            and str(permuted_use_match.group("src")) == gather_slice_lhs
+                            (
+                                permuted_use_match is not None
+                                or permuted_use_assign is not None
+                            )
+                            and (
+                                str(permuted_use_match.group("src"))
+                                if permuted_use_match is not None
+                                else str(permuted_use_assign[3])
+                            ) == gather_slice_lhs
                         ):
                             gather_slice_supported = True
                             break
@@ -25272,6 +25960,7 @@ def _canonicalize_generated_model_source_for_raw_export(
             w = int(aligned_nhwc_rank4_match.group("w"))
             c = int(aligned_nhwc_rank4_match.group("c"))
             next_argmax_match = argmax_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+            next_argmax_assign = _parse_argmax_assign(lines[index + 1]) if index + 1 < len(lines) else None
             cf_bn_const_expr_match = (
                 cf_bn_const_expr_re.fullmatch(expr)
                 if "self." in expr and ("torch.mul(" in expr or "torch.add(" in expr)
@@ -25284,17 +25973,24 @@ def _canonicalize_generated_model_source_for_raw_export(
             )
             if (
                 cf_permute_source_match is not None
-                and next_argmax_match is not None
-                and str(next_argmax_match.group("input")) == lhs
-                and int(next_argmax_match.group("axis")) == 3
+                and (next_argmax_match is not None or next_argmax_assign is not None)
+                and (
+                    str(next_argmax_match.group("input")) if next_argmax_match is not None else str(next_argmax_assign[2])
+                ) == lhs
+                and (
+                    int(next_argmax_match.group("axis")) if next_argmax_match is not None else int(next_argmax_assign[3])
+                ) == 3
             ):
                 src = str(cf_permute_source_match.group("src"))
                 indent = str(aligned_nhwc_rank4_match.group("indent"))
+                argmax_indent = str(next_argmax_match.group("indent")) if next_argmax_match is not None else str(next_argmax_assign[0])
+                argmax_lhs = str(next_argmax_match.group("lhs")) if next_argmax_match is not None else str(next_argmax_assign[1])
+                argmax_keepdim = str(next_argmax_match.group("keepdim")) if next_argmax_match is not None else str(next_argmax_assign[4])
                 lines[index] = f"{indent}{lhs} = {src}"
                 lines[index + 1] = (
-                    f"{next_argmax_match.group('indent')}{next_argmax_match.group('lhs')} = "
+                    f"{argmax_indent}{argmax_lhs} = "
                     f"torch.argmax({lhs}, dim=_normalize_dim(1, {lhs}.ndim), "
-                    f"keepdim={next_argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+                    f"keepdim={argmax_keepdim}).to(dtype=torch.int64)"
                 )
                 cf_aliases.add(lhs)
                 changed = True
@@ -25483,11 +26179,24 @@ def _canonicalize_generated_model_source_for_raw_export(
                         future_cf_spatial_consumer = True
                         break
                     lookahead_mean_match = rank4_mean_re.match(lines[lookahead])
+                    lookahead_mean_assign = _parse_rank4_mean_assign(lines[lookahead])
                     if (
-                        lookahead_mean_match is not None
-                        and str(lookahead_mean_match.group("input")) == lhs
-                        and int(lookahead_mean_match.group("dim0")) == 1
-                        and int(lookahead_mean_match.group("dim1")) == 2
+                        (lookahead_mean_match is not None or lookahead_mean_assign is not None)
+                        and (
+                            str(lookahead_mean_match.group("input"))
+                            if lookahead_mean_match is not None
+                            else str(lookahead_mean_assign[2])
+                        ) == lhs
+                        and (
+                            int(lookahead_mean_match.group("dim0"))
+                            if lookahead_mean_match is not None
+                            else int(lookahead_mean_assign[3])
+                        ) == 1
+                        and (
+                            int(lookahead_mean_match.group("dim1"))
+                            if lookahead_mean_match is not None
+                            else int(lookahead_mean_assign[4])
+                        ) == 2
                     ):
                         future_cf_spatial_consumer = True
                         break
@@ -25501,9 +26210,18 @@ def _canonicalize_generated_model_source_for_raw_export(
                     continue
                 next_line = lines[index + 1] if index + 1 < len(lines) else ""
                 next_permute_match = output_back_permute_re.match(next_line)
+                next_permute_assign = (
+                    _parse_output_back_permute_assign(next_line)
+                    if next_line
+                    else None
+                )
                 if (
-                    next_permute_match is not None
-                    and str(next_permute_match.group("src")) == lhs
+                    (next_permute_match is not None or next_permute_assign is not None)
+                    and (
+                        str(next_permute_match.group("src"))
+                        if next_permute_match is not None
+                        else str(next_permute_assign[2])
+                    ) == lhs
                 ):
                     indent = str(aligned_nhwc_rank4_match.group("indent"))
                     lines[index] = (
@@ -25520,9 +26238,17 @@ def _canonicalize_generated_model_source_for_raw_export(
                     lookahead_start = index + 2 if next_relu_same_lhs else index + 1
                     for lookahead in range(lookahead_start, min(index + 7, len(lines))):
                         permuted_use_match = permuted_cf_module_input_re.match(lines[lookahead])
+                        permuted_use_assign = _parse_permuted_cf_module_input_assign(lines[lookahead])
                         if (
-                            permuted_use_match is not None
-                            and str(permuted_use_match.group("src")) == lhs
+                            (
+                                permuted_use_match is not None
+                                or permuted_use_assign is not None
+                            )
+                            and (
+                                str(permuted_use_match.group("src"))
+                                if permuted_use_match is not None
+                                else str(permuted_use_assign[3])
+                            ) == lhs
                         ):
                             permuted_conv_use_count += 1
                     if next_relu_same_lhs and permuted_conv_use_count >= 1:
@@ -25535,39 +26261,79 @@ def _canonicalize_generated_model_source_for_raw_export(
                         if c == 1:
                             singleton_cf_vars.add(lhs)
             next_reduce_sum_match = reduce_sum_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+            next_reduce_sum_assign = _parse_reduce_sum_assign(lines[index + 1]) if index + 1 < len(lines) else None
             if (
-                next_reduce_sum_match is not None
-                and str(next_reduce_sum_match.group("input")) == lhs
-                and int(next_reduce_sum_match.group("axis")) == 3
-                and str(next_reduce_sum_match.group("keepdims")) == "True"
+                (next_reduce_sum_match is not None or next_reduce_sum_assign is not None)
+                and (
+                    str(next_reduce_sum_match.group("input"))
+                    if next_reduce_sum_match is not None
+                    else str(next_reduce_sum_assign[2])
+                ) == lhs
+                and (
+                    int(next_reduce_sum_match.group("axis"))
+                    if next_reduce_sum_match is not None
+                    else int(next_reduce_sum_assign[3])
+                ) == 3
+                and (
+                    str(next_reduce_sum_match.group("keepdims"))
+                    if next_reduce_sum_match is not None
+                    else str(next_reduce_sum_assign[4])
+                ) == "True"
                 and (
                     _expr_references_known_cf_identifier(expr, singleton_cf_vars)
                     or "_cf" in expr
                 )
             ):
                 indent = str(aligned_nhwc_rank4_match.group("indent"))
+                reduce_indent = (
+                    str(next_reduce_sum_match.group("indent"))
+                    if next_reduce_sum_match is not None
+                    else str(next_reduce_sum_assign[0])
+                )
+                reduce_lhs = (
+                    str(next_reduce_sum_match.group("lhs"))
+                    if next_reduce_sum_match is not None
+                    else str(next_reduce_sum_assign[1])
+                )
                 lines[index] = (
                     f"{indent}{lhs} = _align_tensor_to_target_shape({expr}, [{n}, {c}, {h}, {w}])"
                 )
                 lines[index + 1] = (
-                    f"{next_reduce_sum_match.group('indent')}{next_reduce_sum_match.group('lhs')} = _reduce_sum("
+                    f"{reduce_indent}{reduce_lhs} = _reduce_sum("
                     f"{lhs}, _normalize_axes([1], {lhs}.ndim), True)"
                 )
                 cf_aliases.add(lhs)
-                singleton_cf_vars.add(str(next_reduce_sum_match.group("lhs")))
+                singleton_cf_vars.add(reduce_lhs)
                 changed = True
         permuted_cf_module_input_match = permuted_cf_module_input_re.match(lines[index])
-        if permuted_cf_module_input_match is not None:
-            src = str(permuted_cf_module_input_match.group("src"))
+        permuted_cf_module_input_assign = _parse_permuted_cf_module_input_assign(lines[index])
+        if permuted_cf_module_input_match is not None or permuted_cf_module_input_assign is not None:
+            src = (
+                str(permuted_cf_module_input_match.group("src"))
+                if permuted_cf_module_input_match is not None
+                else str(permuted_cf_module_input_assign[3])
+            )
             recent_rank4_shape = _find_recent_rank4_shape(src, index)
             if _is_known_cf_name(src, singleton_cf_vars) or (
                 recent_rank4_shape is not None
                 and len(recent_rank4_shape) == 4
                 and int(recent_rank4_shape[1]) == 1
             ):
-                indent = str(permuted_cf_module_input_match.group("indent"))
-                lhs = str(permuted_cf_module_input_match.group("lhs"))
-                module = str(permuted_cf_module_input_match.group("module"))
+                indent = (
+                    str(permuted_cf_module_input_match.group("indent"))
+                    if permuted_cf_module_input_match is not None
+                    else str(permuted_cf_module_input_assign[0])
+                )
+                lhs = (
+                    str(permuted_cf_module_input_match.group("lhs"))
+                    if permuted_cf_module_input_match is not None
+                    else str(permuted_cf_module_input_assign[1])
+                )
+                module = (
+                    str(permuted_cf_module_input_match.group("module"))
+                    if permuted_cf_module_input_match is not None
+                    else str(permuted_cf_module_input_assign[2])
+                )
                 lines[index] = f"{indent}{lhs} = {module}({src})"
                 if (
                     recent_rank4_shape is not None
@@ -25577,11 +26343,12 @@ def _canonicalize_generated_model_source_for_raw_export(
                     singleton_cf_vars.add(src)
                 changed = True
         output_back_permute_match = output_back_permute_re.match(lines[index])
-        if output_back_permute_match is not None:
-            src = str(output_back_permute_match.group("src"))
+        output_back_permute_assign = _parse_output_back_permute_assign(lines[index])
+        if output_back_permute_match is not None or output_back_permute_assign is not None:
+            src = str(output_back_permute_match.group("src")) if output_back_permute_match is not None else str(output_back_permute_assign[2])
             if _is_known_cf_name(src, singleton_cf_vars):
-                indent = str(output_back_permute_match.group("indent"))
-                lhs = str(output_back_permute_match.group("lhs"))
+                indent = str(output_back_permute_match.group("indent")) if output_back_permute_match is not None else str(output_back_permute_assign[0])
+                lhs = str(output_back_permute_match.group("lhs")) if output_back_permute_match is not None else str(output_back_permute_assign[1])
                 lines[index] = f"{indent}{lhs} = {src}"
                 cf_aliases.add(lhs)
                 changed = True
@@ -25605,11 +26372,8 @@ def _canonicalize_generated_model_source_for_raw_export(
                 index += 1
                 continue
         softmax_match = apply_softmax_re.match(lines[index])
-        next_output_permute_match = (
-            output_back_permute_re.match(lines[index + 1])
-            if index + 1 < len(lines)
-            else None
-        )
+        next_output_permute_match = output_back_permute_re.match(lines[index + 1]) if index + 1 < len(lines) else None
+        next_output_permute_assign = _parse_output_back_permute_assign(lines[index + 1]) if index + 1 < len(lines) else None
         if softmax_match is not None:
             input_name = str(softmax_match.group("input"))
             resolved_input_shape = _find_recent_rank4_shape(input_name, index)
@@ -25776,9 +26540,10 @@ def _canonicalize_generated_model_source_for_raw_export(
                 lines[index + 1] = ""
                 changed = True
         cf_nhwc_materialize_match = cf_nhwc_materialize_re.match(lines[index])
-        if cf_nhwc_materialize_match is not None:
-            source = str(cf_nhwc_materialize_match.group("src"))
-            alias = str(cf_nhwc_materialize_match.group("lhs"))
+        cf_nhwc_materialize_assign = _parse_cf_nhwc_materialize_assign(lines[index])
+        if cf_nhwc_materialize_match is not None or cf_nhwc_materialize_assign is not None:
+            source = str(cf_nhwc_materialize_match.group("src")) if cf_nhwc_materialize_match is not None else str(cf_nhwc_materialize_assign[2])
+            alias = str(cf_nhwc_materialize_match.group("lhs")) if cf_nhwc_materialize_match is not None else str(cf_nhwc_materialize_assign[1])
             if _is_known_cf_name(source, singleton_cf_vars):
                 cf_materialized_alias_sources[alias] = source
                 function_end = _function_end_index(index)
@@ -25840,6 +26605,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         resize12_match = apply_resize_nhwc_re.match(lines[index + 2])
         concat_match = concat_re.match(lines[index + 3])
         conv_match = permuted_cf_module_input_re.match(lines[index + 4])
+        conv_assign = _parse_permuted_cf_module_input_assign(lines[index + 4])
         concat_assign = _parse_simple_assignment_line(lines[index + 3])
         parsed_concat_args = (
             _parse_apply_concat_inputs_axis_and_shape(concat_assign[2])
@@ -25856,13 +26622,17 @@ def _canonicalize_generated_model_source_for_raw_export(
             or resize11_match is None
             or resize12_match is None
             or (concat_match is None and parsed_concat_args is None)
-            or conv_match is None
-            or str(conv_match.group("module")) != "self.conv_block_71"
+            or (conv_match is None and conv_assign is None)
+            or (
+                str(conv_match.group("module")) if conv_match is not None else str(conv_assign[2])
+            ) != "self.conv_block_71"
             or len(concat_inputs) != 4
             or concat_inputs[1] != str(resize10_match.group("lhs"))
             or concat_inputs[2] != str(resize11_match.group("lhs"))
             or concat_inputs[3] != str(resize12_match.group("lhs"))
-            or str(conv_match.group("src")) != (concat_assign[1] if concat_assign is not None else str(concat_match.group("lhs")))
+            or (
+                str(conv_match.group("src")) if conv_match is not None else str(conv_assign[3])
+            ) != (concat_assign[1] if concat_assign is not None else str(concat_match.group("lhs")))
         ):
             index += 1
             continue
@@ -25908,7 +26678,9 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"torch.cat([{', '.join(concat_inputs)}], dim=1)"
         )
         lines[index + 4] = (
-            f"{conv_match.group('indent')}{conv_match.group('lhs')} = {conv_match.group('module')}("
+            f"{(conv_match.group('indent') if conv_match is not None else conv_assign[0])}"
+            f"{(conv_match.group('lhs') if conv_match is not None else conv_assign[1])} = "
+            f"{(conv_match.group('module') if conv_match is not None else conv_assign[2])}("
             f"{(concat_assign[1] if concat_assign is not None else concat_match.group('lhs'))})"
         )
         cf_aliases.update(
@@ -25986,17 +26758,27 @@ def _canonicalize_generated_model_source_for_raw_export(
     index = 0
     while index + 3 < len(lines):
         input_bridge_match = transpose_conv_input_bridge_re.match(lines[index])
+        input_bridge_assign = _parse_transpose_conv_input_bridge_assign(lines[index])
         apply_match = transpose_conv_apply_re.match(lines[index + 1])
         crop_match = transpose_conv_crop_re.match(lines[index + 2])
         output_permute_match = transpose_conv_output_permute_re.match(lines[index + 3])
+        output_permute_assign = _parse_output_back_permute_assign(lines[index + 3])
         if (
-            input_bridge_match is None
+            (input_bridge_match is None and input_bridge_assign is None)
             or apply_match is None
             or crop_match is None
-            or output_permute_match is None
-            or str(apply_match.group("input")) != str(input_bridge_match.group("alias"))
+            or (output_permute_match is None and output_permute_assign is None)
+            or str(apply_match.group("input")) != (
+                str(input_bridge_match.group("alias"))
+                if input_bridge_match is not None
+                else str(input_bridge_assign[1])
+            )
             or str(crop_match.group("src")) != str(apply_match.group("lhs"))
-            or str(output_permute_match.group("src")) != str(crop_match.group("lhs"))
+            or (
+                str(output_permute_match.group("src"))
+                if output_permute_match is not None
+                else str(output_permute_assign[2])
+            ) != str(crop_match.group("lhs"))
         ):
             index += 1
             continue
@@ -26018,11 +26800,23 @@ def _canonicalize_generated_model_source_for_raw_export(
             index += 1
             continue
         indent = str(apply_match.group("indent"))
-        input_alias = str(input_bridge_match.group("alias"))
-        input_source = str(input_bridge_match.group("src"))
+        input_alias = (
+            str(input_bridge_match.group("alias"))
+            if input_bridge_match is not None
+            else str(input_bridge_assign[1])
+        )
+        input_source = (
+            str(input_bridge_match.group("src"))
+            if input_bridge_match is not None
+            else str(input_bridge_assign[2])
+        )
         apply_lhs = str(apply_match.group("lhs"))
         cropped_lhs = str(crop_match.group("lhs"))
-        permuted_lhs = str(output_permute_match.group("lhs"))
+        permuted_lhs = (
+            str(output_permute_match.group("lhs"))
+            if output_permute_match is not None
+            else str(output_permute_assign[1])
+        )
         fallback_text = ", ".join(str(v) for v in fallback_values)
         lines[index] = f"{indent}{input_alias} = {input_source}"
         lines[index + 1] = (
@@ -26057,12 +26851,17 @@ def _canonicalize_generated_model_source_for_raw_export(
         alias_match = simple_alias_re.match(lines[index])
         self_permute_match = self_permute_assign_re.match(lines[index + 1])
         input_bridge_match = transpose_conv_input_bridge_re.match(lines[index + 2])
+        input_bridge_assign = _parse_transpose_conv_input_bridge_assign(lines[index + 2])
         if (
             alias_match is None
             or self_permute_match is None
-            or input_bridge_match is None
+            or (input_bridge_match is None and input_bridge_assign is None)
             or str(self_permute_match.group("lhs")) != str(alias_match.group("lhs"))
-            or str(input_bridge_match.group("src")) != str(alias_match.group("lhs"))
+            or (
+                str(input_bridge_match.group("src"))
+                if input_bridge_match is not None
+                else str(input_bridge_assign[2])
+            ) != str(alias_match.group("lhs"))
         ):
             index += 1
             continue
@@ -26096,19 +26895,30 @@ def _canonicalize_generated_model_source_for_raw_export(
     while index + 5 < len(lines):
         self_permute_match = self_permute_assign_re.match(lines[index])
         input_bridge_match = transpose_conv_input_bridge_re.match(lines[index + 1])
+        input_bridge_assign = _parse_transpose_conv_input_bridge_assign(lines[index + 1])
         apply_match = transpose_conv_apply_re.match(lines[index + 2])
         crop_match = transpose_conv_crop_re.match(lines[index + 3])
         bias_fix_match = transpose_conv_bias_fix_re.match(lines[index + 4])
+        bias_fix_assign = _parse_transpose_conv_bias_fix_assign(lines[index + 4])
         bias_add_match = transpose_conv_bias_add_re.match(lines[index + 5])
+        bias_add_assign = _parse_transpose_conv_bias_add_assign(lines[index + 5])
         if (
             self_permute_match is None
-            or input_bridge_match is None
+            or (input_bridge_match is None and input_bridge_assign is None)
             or apply_match is None
             or crop_match is None
-            or bias_fix_match is None
-            or bias_add_match is None
-            or str(input_bridge_match.group("src")) != str(self_permute_match.group("lhs"))
-            or str(apply_match.group("input")) != str(input_bridge_match.group("alias"))
+            or (bias_fix_match is None and bias_fix_assign is None)
+            or (bias_add_match is None and bias_add_assign is None)
+            or (
+                str(input_bridge_match.group("src"))
+                if input_bridge_match is not None
+                else str(input_bridge_assign[2])
+            ) != str(self_permute_match.group("lhs"))
+            or str(apply_match.group("input")) != (
+                str(input_bridge_match.group("alias"))
+                if input_bridge_match is not None
+                else str(input_bridge_assign[1])
+            )
             or str(crop_match.group("src")) != str(apply_match.group("lhs"))
         ):
             index += 1
@@ -26127,18 +26937,46 @@ def _canonicalize_generated_model_source_for_raw_export(
             or fallback_values[1] != 1
             or target_values[1] != fallback_values[2]
             or target_values[2] != fallback_values[3]
-            or str(bias_add_match.group("a")) != str(crop_match.group("lhs"))
-            or str(bias_add_match.group("b")) != str(bias_fix_match.group("lhs"))
+            or (
+                str(bias_add_match.group("a"))
+                if bias_add_match is not None
+                else str(bias_add_assign[2])
+            ) != str(crop_match.group("lhs"))
+            or (
+                str(bias_add_match.group("b"))
+                if bias_add_match is not None
+                else str(bias_add_assign[3])
+            ) != (
+                str(bias_fix_match.group("lhs"))
+                if bias_fix_match is not None
+                else str(bias_fix_assign[1])
+            )
         ):
             index += 1
             continue
         indent = str(apply_match.group("indent"))
         input_source = str(self_permute_match.group("lhs"))
-        input_alias = str(input_bridge_match.group("alias"))
+        input_alias = (
+            str(input_bridge_match.group("alias"))
+            if input_bridge_match is not None
+            else str(input_bridge_assign[1])
+        )
         apply_lhs = str(apply_match.group("lhs"))
-        bias_expr = str(bias_fix_match.group("expr"))
-        bias_lhs = str(bias_fix_match.group("lhs"))
-        bias_add_lhs = str(bias_add_match.group("lhs"))
+        bias_expr = (
+            str(bias_fix_match.group("expr"))
+            if bias_fix_match is not None
+            else str(bias_fix_assign[2])
+        )
+        bias_lhs = (
+            str(bias_fix_match.group("lhs"))
+            if bias_fix_match is not None
+            else str(bias_fix_assign[1])
+        )
+        bias_add_lhs = (
+            str(bias_add_match.group("lhs"))
+            if bias_add_match is not None
+            else str(bias_add_assign[1])
+        )
         fallback_text = ", ".join(str(v) for v in fallback_values)
         cropped_h = int(crop_match.group("end")) - int(crop_match.group("start"))
         cropped_w = int(crop_match.group("width"))
@@ -26153,7 +26991,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         lines[index + 4] = f"{indent}{bias_lhs} = {bias_expr}"
         lines[index + 5] = (
             f"{indent}{bias_add_lhs} = _align_tensor_to_target_shape("
-            f"torch.add({bias_add_match.group('a')}, {bias_lhs}), "
+            f"torch.add({(bias_add_match.group('a') if bias_add_match is not None else bias_add_assign[2])}, {bias_lhs}), "
             f"[{fallback_values[0]}, 1, {cropped_h}, {cropped_w}])"
         )
         changed = True
@@ -26162,15 +27000,18 @@ def _canonicalize_generated_model_source_for_raw_export(
     while index + 1 < len(lines):
         aligned_tensor_match = generic_aligned_tensor_re.match(lines[index])
         output_back_permute_match = output_back_permute_re.match(lines[index + 1])
+        output_back_permute_assign = _parse_output_back_permute_assign(lines[index + 1])
         if (
             aligned_tensor_match is None
-            or output_back_permute_match is None
-            or str(output_back_permute_match.group("src")) != str(aligned_tensor_match.group("lhs"))
+            or (output_back_permute_match is None and output_back_permute_assign is None)
+            or (
+                str(output_back_permute_match.group("src")) if output_back_permute_match is not None else str(output_back_permute_assign[2])
+            ) != str(aligned_tensor_match.group("lhs"))
         ):
             index += 1
             continue
         lhs = str(aligned_tensor_match.group("lhs"))
-        dst = str(output_back_permute_match.group("lhs"))
+        dst = str(output_back_permute_match.group("lhs")) if output_back_permute_match is not None else str(output_back_permute_assign[1])
         expr = str(aligned_tensor_match.group("expr"))
         dst_exact_shape = _model_ir_exact_shape(dst)
         if (
@@ -26306,7 +27147,15 @@ def _canonicalize_generated_model_source_for_raw_export(
         reshape_consumer_found = False
         for lookahead_index in range(index + 1, min(index + 6, len(lines))):
             candidate_reshape_match = generic_reshape_consumer_re.match(lines[lookahead_index])
-            if candidate_reshape_match is not None and str(candidate_reshape_match.group("input")) == lhs:
+            candidate_reshape_assign = _parse_rank4_reshape_consumer_assign(lines[lookahead_index])
+            if (
+                (candidate_reshape_match is not None or candidate_reshape_assign is not None)
+                and (
+                    str(candidate_reshape_match.group("input"))
+                    if candidate_reshape_match is not None
+                    else str(candidate_reshape_assign[2])
+                ) == lhs
+            ):
                 reshape_consumer_found = True
                 break
         if not reshape_consumer_found:
@@ -26640,13 +27489,16 @@ def _canonicalize_generated_model_source_for_raw_export(
         if argmax_index >= len(lines):
             continue
         argmax_match = argmax_re.match(lines[argmax_index])
+        argmax_assign = _parse_argmax_assign(lines[argmax_index])
         if (
-            argmax_match is None
+            argmax_match is None and argmax_assign is None
             or (
-                str(argmax_match.group("input")) != str(resize_argmax_match[1])
+                (str(argmax_match.group("input")) if argmax_match is not None else str(argmax_assign[2])) != str(resize_argmax_match[1])
                 and (
                     alias_match is None
-                    or str(argmax_match.group("input")) != str(alias_match.group("lhs"))
+                    or (
+                        str(argmax_match.group("input")) if argmax_match is not None else str(argmax_assign[2])
+                    ) != str(alias_match.group("lhs"))
                 )
             )
         ):
@@ -26669,10 +27521,11 @@ def _canonicalize_generated_model_source_for_raw_export(
             f"half_pixel_centers={resize_argmax_match[8]}, channel_last=False)"
         )
         lines[argmax_index] = (
-            f"{argmax_match.group('indent')}{argmax_match.group('lhs')} = "
-            f"torch.argmax({argmax_match.group('input')}, "
-            f"dim=_normalize_dim(1, {argmax_match.group('input')}.ndim), "
-            f"keepdim={argmax_match.group('keepdim')}).to(dtype=torch.int64)"
+            f"{(argmax_match.group('indent') if argmax_match is not None else argmax_assign[0])}"
+            f"{(argmax_match.group('lhs') if argmax_match is not None else argmax_assign[1])} = "
+            f"torch.argmax({(argmax_match.group('input') if argmax_match is not None else argmax_assign[2])}, "
+            f"dim=_normalize_dim(1, {(argmax_match.group('input') if argmax_match is not None else argmax_assign[2])}.ndim), "
+            f"keepdim={(argmax_match.group('keepdim') if argmax_match is not None else argmax_assign[4])}).to(dtype=torch.int64)"
         )
         changed = True
     for index, line in enumerate(lines):
@@ -26835,17 +27688,18 @@ def _canonicalize_generated_model_source_for_raw_export(
             continue
         continue
     for index, line in enumerate(lines):
-        singleton_const_anchor_fix_match = singleton_const_anchor_fix_re.match(line)
-        if singleton_const_anchor_fix_match is None:
+        parsed_singleton_const_anchor_fix = _parse_singleton_const_anchor_fix_assign(line)
+        if parsed_singleton_const_anchor_fix is None:
             continue
         channel_count = _find_recent_singleton_cf_channel_count(index)
         if channel_count is None:
             continue
+        singleton_indent, singleton_lhs0, singleton_lhs1, singleton_input, singleton_const_attr = parsed_singleton_const_anchor_fix
         lines[index] = (
-            f"{singleton_const_anchor_fix_match.group('indent')}{singleton_const_anchor_fix_match.group('lhs0')}, "
-            f"{singleton_const_anchor_fix_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-            f"{singleton_const_anchor_fix_match.group('input')}, "
-            f"torch.reshape(self.{singleton_const_anchor_fix_match.group('const_attr')}, [1, {channel_count}, 1, 1]), "
+            f"{singleton_indent}{singleton_lhs0}, "
+            f"{singleton_lhs1} = _align_binary_inputs_to_anchor("
+            f"{singleton_input}, "
+            f"torch.reshape(self.{singleton_const_attr}, [1, {channel_count}, 1, 1]), "
             f"[1, {channel_count}, 1, 1])"
         )
         changed = True
@@ -26875,10 +27729,15 @@ def _canonicalize_generated_model_source_for_raw_export(
     for index in range(len(lines) - 1):
         generic_alias_match = generic_alias_re.match(lines[index])
         rank3_reshape_match = rank3_reshape_from_rank4_source_re.match(lines[index + 1])
+        rank3_reshape_assign = _parse_rank3_reshape_from_rank4_source_assign(lines[index + 1])
         if (
             generic_alias_match is None
-            or rank3_reshape_match is None
-            or str(rank3_reshape_match.group("src")) != str(generic_alias_match.group("lhs"))
+            or (rank3_reshape_match is None and rank3_reshape_assign is None)
+            or (
+                str(rank3_reshape_match.group("src"))
+                if rank3_reshape_match is not None
+                else str(rank3_reshape_assign[2])
+            ) != str(generic_alias_match.group("lhs"))
         ):
             continue
         lhs = str(generic_alias_match.group("lhs"))
@@ -26897,17 +27756,18 @@ def _canonicalize_generated_model_source_for_raw_export(
             ]
         if nhwc_target_shape is None or len(nhwc_target_shape) != 4:
             continue
-        rank3_target_shape_text = (
-            rank3_reshape_match.group("resolved_shape")
-            or rank3_reshape_match.group("shape")
+        rank3_target_shape = (
+            [
+                int(value.strip())
+                for value in str(
+                    rank3_reshape_match.group("resolved_shape")
+                    or rank3_reshape_match.group("shape")
+                ).split(",")
+                if value.strip()
+            ]
+            if rank3_reshape_match is not None
+            else [int(value) for value in rank3_reshape_assign[3]]
         )
-        if rank3_target_shape_text is None:
-            continue
-        rank3_target_shape = [
-            int(value.strip())
-            for value in str(rank3_target_shape_text).split(",")
-            if value.strip()
-        ]
         if (
             len(rank3_target_shape) != 3
             or int(rank3_target_shape[0]) != int(nhwc_target_shape[0])
@@ -27782,15 +28642,37 @@ def _repair_binary_alignment_layout(
     dynamic_nhwc_like_names: Set[str],
     context: _FastPrecanonicalizeRepairContext,
 ) -> Tuple[str | None, str | None]:
-    aligned_binary_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
-    )
-    aligned_binary_match = aligned_binary_re.match(line)
-    if aligned_binary_match is None:
+    assign = _parse_simple_assignment_line(line)
+    if assign is None:
         return None, None
-    lhs_name = str(aligned_binary_match.group("lhs"))
-    arg_a = str(aligned_binary_match.group("a"))
-    arg_b = str(aligned_binary_match.group("b"))
+    indent, lhs_name, rhs_expr = assign
+    align_parts = _parse_align_tensor_target_shape_expr(rhs_expr)
+    if align_parts is None:
+        return None, None
+    input_expr, target_shape_expr = align_parts
+    target_shape = _parse_rank4_shape_literal(target_shape_expr)
+    if target_shape is None:
+        return None, None
+    binary_match = re.fullmatch(
+        r"torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<args>.+)\)",
+        input_expr.strip(),
+    )
+    if binary_match is None:
+        return None, None
+    op_name = str(binary_match.group("op"))
+    if op_name == "mul":
+        binary_args = _parse_binary_mul_args(str(binary_match.group("args")))
+    else:
+        binary_args = _parse_binary_add_args(str(binary_match.group("args")))
+    if binary_args is None:
+        return None, None
+    arg_a = str(binary_args[0]).strip()
+    arg_b = str(binary_args[1]).strip()
+    if (
+        re.fullmatch(r"[A-Za-z0-9_]+", arg_a) is None
+        or re.fullmatch(r"[A-Za-z0-9_]+", arg_b) is None
+    ):
+        return None, None
     operands_are_cf_like = (
         _fast_precanonicalize_is_cf_like(arg_a, dynamic_cf_like_names, context)
         and _fast_precanonicalize_is_cf_like(arg_b, dynamic_cf_like_names, context)
@@ -27825,12 +28707,7 @@ def _repair_binary_alignment_layout(
             dynamic_nhwc_like_names,
             context,
         )
-    current_shape = [
-        int(aligned_binary_match.group("n")),
-        int(aligned_binary_match.group("h")),
-        int(aligned_binary_match.group("w")),
-        int(aligned_binary_match.group("c")),
-    ]
+    current_shape = [int(v) for v in list(target_shape)]
     if _fast_precanonicalize_rank4_layout_hint(
         current_shape,
         preferred_channel_count=preferred_channel_count,
@@ -27841,8 +28718,8 @@ def _repair_binary_alignment_layout(
         preferred_channel_count=preferred_channel_count,
     )
     rewritten = (
-        f"{aligned_binary_match.group('indent')}{lhs_name} = _align_tensor_to_target_shape("
-        f"torch.{aligned_binary_match.group('op')}({arg_a}, {arg_b}), {repr(normalized_shape)})"
+        f"{indent}{lhs_name} = _align_tensor_to_target_shape("
+        f"torch.{op_name}({arg_a}, {arg_b}), {repr(normalized_shape)})"
     )
     if rewritten == line:
         return None, lhs_name
@@ -28068,6 +28945,38 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     aligned_binary_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
+    def _parse_aligned_binary_assign_with_shape(
+        current_line: str,
+    ) -> Tuple[str, str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, target_shape_expr = align_parts
+        target_shape = _parse_rank4_shape_literal(target_shape_expr)
+        if target_shape is None:
+            return None
+        binary_match = re.fullmatch(
+            r"torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<args>.+)\)",
+            input_expr.strip(),
+        )
+        if binary_match is None:
+            return None
+        op_name = str(binary_match.group("op"))
+        if op_name == "mul":
+            binary_args = _parse_binary_mul_args(str(binary_match.group("args")))
+        else:
+            binary_args = _parse_binary_add_args(str(binary_match.group("args")))
+        if (
+            binary_args is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", str(binary_args[0]).strip()) is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", str(binary_args[1]).strip()) is None
+        ):
+            return None
+        return lhs, op_name, str(binary_args[0]).strip(), str(binary_args[1]).strip(), list(target_shape)
     aligned_rank4_any_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
@@ -28111,6 +29020,147 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs\("
         r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 2, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
+    def _parse_local_response_norm_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, str, str, str, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "F.local_response_norm("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        size_expr: str | None = None
+        alpha_expr: str | None = None
+        beta_expr: str | None = None
+        k_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "size":
+                    size_expr = value
+                elif key == "alpha":
+                    alpha_expr = value
+                elif key == "beta":
+                    beta_expr = value
+                elif key == "k":
+                    k_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            positional_index += 1
+        if (
+            input_expr is None
+            or size_expr is None
+            or alpha_expr is None
+            or beta_expr is None
+            or k_expr is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None
+            or re.fullmatch(r"\d+", size_expr) is None
+            or re.fullmatch(r"[-+0-9.eE]+", alpha_expr) is None
+            or re.fullmatch(r"[-+0-9.eE]+", beta_expr) is None
+            or re.fullmatch(r"[-+0-9.eE]+", k_expr) is None
+        ):
+            return None
+        return indent, lhs, input_expr, size_expr, alpha_expr, beta_expr, k_expr
+    def _parse_apply_softmax_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, int, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "_apply_softmax("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        softmax_args = _parse_apply_softmax_input_axis_and_shape(rhs)
+        if softmax_args is None:
+            return None
+        input_expr, axis_value, rank4_shape = softmax_args
+        beta_expr: str | None = None
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                continue
+            key, value = part.split("=", 1)
+            if key.strip() == "beta":
+                beta_expr = value.strip()
+                break
+        if (
+            rank4_shape is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input_expr.strip()) is None
+            or beta_expr is None
+            or re.fullmatch(r"[-+0-9.eE]+", beta_expr) is None
+            or re.fullmatch(r"\d+", str(rank4_shape[0]).strip()) is None
+        ):
+            return None
+        return (
+            indent,
+            lhs,
+            input_expr.strip(),
+            axis_value,
+            beta_expr,
+            [int(v) for v in list(rank4_shape)],
+        )
+    def _parse_reduce_max_assign(
+        current_line: str,
+    ) -> Tuple[str, str, str, int, str] | None:
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "_reduce_max("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        axis_expr: str | None = None
+        keepdims_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "axes":
+                    axis_expr = value
+                elif key == "keepdims":
+                    keepdims_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                axis_expr = part.strip()
+            elif positional_index == 2:
+                keepdims_expr = part.strip()
+            positional_index += 1
+        if (
+            input_expr is None
+            or axis_expr is None
+            or keepdims_expr is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None
+            or re.fullmatch(r"True|False", keepdims_expr) is None
+        ):
+            return None
+        axis_match = re.fullmatch(
+            r"_normalize_axes\(\s*[\[\(]\s*(?P<axis>-?\d+)\s*,?\s*[\]\)]\s*,\s*[A-Za-z0-9_]+\.ndim\s*\)",
+            axis_expr,
+        )
+        if axis_match is None:
+            return None
+        return indent, lhs, input_expr, int(axis_match.group("axis")), keepdims_expr
     for line in lines:
         register_buffer_match = register_buffer_re.match(line)
         if register_buffer_match is None:
@@ -28321,7 +29371,8 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                     )
                     changed = True
         aligned_binary_match = aligned_binary_re.match(line)
-        if aligned_binary_match is not None:
+        aligned_binary_assign = _parse_aligned_binary_assign_with_shape(line)
+        if aligned_binary_match is not None or aligned_binary_assign is not None:
             rewritten_binary_line, binary_lhs = _repair_binary_alignment_layout(
                 line,
                 index,
@@ -28342,6 +29393,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 changed = True
                 line = rewritten_binary_line
                 aligned_binary_match = None
+                aligned_binary_assign = None
         if aligned_binary_match is not None:
             arg_a = str(aligned_binary_match.group("a"))
             arg_b = str(aligned_binary_match.group("b"))
@@ -28573,6 +29625,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 next_nonempty_line = str(lines[lookahead])
                 break
             next_lrn_match = local_response_norm_re.match(next_nonempty_line)
+            next_lrn_assign = _parse_local_response_norm_assign(next_nonempty_line)
             if (
                 _fast_precanonicalize_rank4_layout_hint(
                     [
@@ -28652,8 +29705,10 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                     or input_name.endswith("_cf")
                     or input_name.endswith("_out_cf")
                 )
-                and next_lrn_match is not None
-                and str(next_lrn_match.group("input")) == str(apply_pool2d_match.group("lhs"))
+                and (
+                    (next_lrn_match is not None and str(next_lrn_match.group("input")) == str(apply_pool2d_match.group("lhs")))
+                    or (next_lrn_assign is not None and str(next_lrn_assign[2]) == str(apply_pool2d_match.group("lhs")))
+                )
             ):
                 input_channel_count = conv_block_out_channels.get(
                     module_output_producers.get(input_name, ""),
@@ -28842,42 +29897,94 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 cf_like_names.add(str(aligned_bn_const_reshaped_match.group("lhs")))
                 changed = True
         local_response_norm_match = local_response_norm_re.match(line)
-        if local_response_norm_match is not None:
-            input_name = str(local_response_norm_match.group("input"))
+        local_response_norm_assign = _parse_local_response_norm_assign(line)
+        if local_response_norm_match is not None or local_response_norm_assign is not None:
+            input_name = (
+                str(local_response_norm_match.group("input"))
+                if local_response_norm_match is not None
+                else str(local_response_norm_assign[2])
+            )
             if (
                 input_name in cf_like_names
                 or input_name.endswith("_cf")
                 or input_name.endswith("_out_cf")
             ):
-                cf_like_names.add(str(local_response_norm_match.group("lhs")))
+                cf_like_names.add(
+                    str(local_response_norm_match.group("lhs"))
+                    if local_response_norm_match is not None
+                    else str(local_response_norm_assign[1])
+                )
         softmax_match = apply_softmax_re.match(line)
-        if softmax_match is not None:
-            input_name = str(softmax_match.group("input"))
+        softmax_assign = _parse_apply_softmax_assign(line)
+        if softmax_match is not None or softmax_assign is not None:
+            input_name = (
+                str(softmax_match.group("input"))
+                if softmax_match is not None
+                else str(softmax_assign[2])
+            )
+            axis_value = (
+                int(softmax_match.group("axis"))
+                if softmax_match is not None
+                else int(softmax_assign[3])
+            )
             if (
                 (
                     input_name in cf_like_names
                     or input_name.endswith("_cf")
                     or input_name.endswith("_out_cf")
                 )
-                and int(softmax_match.group("axis")) == 3
+                and axis_value in {3, -1}
             ):
+                if softmax_match is not None:
+                    lhs_name = str(softmax_match.group("lhs"))
+                    beta_expr = str(softmax_match.group("beta"))
+                    target_shape = [
+                        int(softmax_match.group("n")),
+                        int(softmax_match.group("h")),
+                        int(softmax_match.group("w")),
+                        int(softmax_match.group("c")),
+                    ]
+                    indent = str(softmax_match.group("indent"))
+                else:
+                    lhs_name = str(softmax_assign[1])
+                    beta_expr = str(softmax_assign[4])
+                    target_shape = list(softmax_assign[5])
+                    indent = str(softmax_assign[0])
                 lines[index] = (
-                    f"{softmax_match.group('indent')}{softmax_match.group('lhs')} = _apply_softmax("
-                    f"{input_name}, axis=1, beta={softmax_match.group('beta')}, "
-                    f"target_shape=[{softmax_match.group('n')}, {softmax_match.group('c')}, "
-                    f"{softmax_match.group('h')}, {softmax_match.group('w')}])"
+                    f"{indent}{lhs_name} = _apply_softmax("
+                    f"{input_name}, axis=1, beta={beta_expr}, "
+                    f"target_shape=[{target_shape[0]}, {target_shape[3]}, "
+                    f"{target_shape[1]}, {target_shape[2]}])"
                 )
-                cf_like_names.add(str(softmax_match.group("lhs")))
+                cf_like_names.add(lhs_name)
                 changed = True
         reduce_max_match = reduce_max_re.match(line)
-        if reduce_max_match is not None:
-            input_name = str(reduce_max_match.group("input"))
-            if input_name in cf_like_names and int(reduce_max_match.group("axis")) == 3:
+        reduce_max_assign = _parse_reduce_max_assign(line)
+        if reduce_max_match is not None or reduce_max_assign is not None:
+            input_name = (
+                str(reduce_max_match.group("input"))
+                if reduce_max_match is not None
+                else str(reduce_max_assign[2])
+            )
+            axis_value = (
+                int(reduce_max_match.group("axis"))
+                if reduce_max_match is not None
+                else int(reduce_max_assign[3])
+            )
+            if input_name in cf_like_names and axis_value == 3:
+                if reduce_max_match is not None:
+                    indent = str(reduce_max_match.group("indent"))
+                    lhs_name = str(reduce_max_match.group("lhs"))
+                    keepdims_expr = str(reduce_max_match.group("keepdims"))
+                else:
+                    indent = str(reduce_max_assign[0])
+                    lhs_name = str(reduce_max_assign[1])
+                    keepdims_expr = str(reduce_max_assign[4])
                 lines[index] = (
-                    f"{reduce_max_match.group('indent')}{reduce_max_match.group('lhs')} = _reduce_max("
-                    f"{input_name}, _normalize_axes([1], {input_name}.ndim), {reduce_max_match.group('keepdims')})"
+                    f"{indent}{lhs_name} = _reduce_max("
+                    f"{input_name}, _normalize_axes([1], {input_name}.ndim), {keepdims_expr})"
                 )
-                cf_like_names.add(str(reduce_max_match.group("lhs")))
+                cf_like_names.add(lhs_name)
                 changed = True
         sub_from_one_match = sub_from_one_re.match(line)
         rewritten_terminal_line, terminal_lhs = _repair_terminal_classifier_tail_layout(
