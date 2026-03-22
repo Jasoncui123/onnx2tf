@@ -20231,13 +20231,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"\s*=\s*\(*\s*(?P<rhs>[A-Za-z0-9_]+)\s*\)*$"
     )
     transposed_const_use_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>.*torch\.matmul\(.+, (?P<temp>[A-Za-z0-9_]+)\.transpose\(-1, -2\)\).*)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<expr>.*torch\.matmul\(.+, (?P<temp>[A-Za-z0-9_]+)\.transpose\(-1, -2\)\).*)$"
     )
     scalar_as_tensor_re = re.compile(
         r"torch\.as_tensor\((?P<value>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), dtype=torch\.[A-Za-z0-9_]+, device=_module_device\(self\)\)"
     )
     scalar_first_binary_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.(?P<op>add|mul)\("
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.(?P<op>add|mul)\("
         r"(?P<scalar>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), "
         r"(?P<rhs>.+)\)$"
     )
@@ -20250,11 +20250,11 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"torch\.as_tensor\((?P<literal>\[.+?\]), dtype=torch\.(?P<dtype>[A-Za-z0-9_]+), device=_module_device\(self\)\)"
     )
     minimum_scalar_tensor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<prefix>.*)torch\.minimum\((?P<tensor>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<prefix>.*)torch\.minimum\((?P<tensor>[A-Za-z0-9_]+), "
         r"torch\.as_tensor\((?P<value>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), dtype=torch\.[A-Za-z0-9_]+, device=_module_device\(self\)\)\)(?P<suffix>.*)$"
     )
     maximum_scalar_tensor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<prefix>.*)torch\.maximum\((?P<tensor>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<prefix>.*)torch\.maximum\((?P<tensor>[A-Za-z0-9_]+), "
         r"torch\.as_tensor\((?P<value>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), dtype=torch\.[A-Za-z0-9_]+, device=_module_device\(self\)\)\)(?P<suffix>.*)$"
     )
     assign_re = re.compile(
@@ -20270,10 +20270,10 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)return (?P<value>[A-Za-z0-9_]+)$"
     )
     rank4_reshape_consumer_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), _resolve_reshape_shape\(\[(?P<shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), _resolve_reshape_shape\(\[(?P<shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)\)$"
     )
     rank3_reshape_from_rank4_source_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<src>[A-Za-z0-9_]+), "
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=src), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
     generic_expr_assign_re = re.compile(
@@ -20316,19 +20316,19 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<shape>[0-9, ]+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     local_response_norm_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.local_response_norm\((?P<input>[A-Za-z0-9_]+), size=(?P<size>\d+), alpha=(?P<alpha>[-+0-9.eE]+), beta=(?P<beta>[-+0-9.eE]+), k=(?P<k>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.local_response_norm\((?P<input>[A-Za-z0-9_]+), size=(?P<size>\d+), alpha=(?P<alpha>[-+0-9.eE]+), beta=(?P<beta>[-+0-9.eE]+), k=(?P<k>[-+0-9.eE]+)\)$"
     )
     cf_nhwc_materialize_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     binary_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     binary_cf_consumer_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs(?:_to_anchor)?\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs(?:_to_anchor)?\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     singleton_cf_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     cf_concat_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
@@ -20337,7 +20337,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=(?P<axis>-?\d+)\)$"
     )
     binary_same_permute_cf_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.(?P<op>add|sub)\("
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.(?P<op>add|sub)\("
         r"(?P<a>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\), "
         r"(?P<b>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\)\)$"
     )
@@ -20345,13 +20345,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<shape>[0-9, ]+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
     )
     binary_anchor_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     same_shape_singleton_reshape_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     unary_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>torch\.(?:clamp|relu|neg|sigmoid|exp)\(.+\))$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<expr>torch\.(?:clamp|relu|neg|sigmoid|exp)\(.+\))$"
     )
     binary_assign_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<expr>torch\.(?:mul|add|sub|div|minimum|maximum)\(.+\))$"
@@ -20363,22 +20363,22 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<alias>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
     )
     transpose_conv_apply_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_module_transpose_conv2d\((?P<input>[A-Za-z0-9_]+), (?P<prefix>.+), target_shape=\[(?P<target>[0-9, ]+)\], fallback_shape=\[(?P<fallback>[0-9, ]+)\], target_logical_layout='NHWC', fused='(?P<fused>[^']+)'\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_module_transpose_conv2d\((?P<input>[A-Za-z0-9_]+), (?P<prefix>.+), target_shape=\[(?P<target>[0-9, ]+)\], fallback_shape=\[(?P<fallback>[0-9, ]+)\], target_logical_layout='NHWC', fused='(?P<fused>[^']+)'\)$"
     )
     transpose_conv_crop_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)\[0:1, 0:1, (?P<start>\d+):(?P<end>\d+), 0:(?P<width>\d+)\]$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<src>[A-Za-z0-9_]+)\[0:1, 0:1, (?P<start>\d+):(?P<end>\d+), 0:(?P<width>\d+)\]$"
     )
     transpose_conv_output_permute_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
     )
     self_permute_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P=lhs)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P=lhs)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
     )
     transpose_conv_bias_fix_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<expr>self\.[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<n>\d+), 1, (?P<w>\d+), 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<expr>self\.[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<n>\d+), 1, (?P<w>\d+), 1\]\)$"
     )
     transpose_conv_bias_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     simple_alias_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<src>[A-Za-z0-9_]+)$"
@@ -20390,20 +20390,20 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
     )
     singleton_const_anchor_fix_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\("
         r"(?P<input>[A-Za-z0-9_]+), torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 1, 1, 1\]\), \[1, 1, 1, 1\]\)$"
     )
     recent_cf_singleton_shape_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = .*\[(?P<n>\d+), (?P<c>\d+), 1, 1\]\)?$"
+        r"^\s*[A-Za-z0-9_]+\s*=\s*.*\[(?P<n>\d+), (?P<c>\d+), 1, 1\]\)?$"
     )
     reshape_from_inverse_permute_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<shape>[0-9, ]+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), \[(?P<shape>[0-9, ]+)\]\)$"
     )
     binary_anchor_align_nhwc_singleton_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     binary_anchor_align_rank4_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     aligned_nhwc_singleton_binary_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>torch\.(?:add|sub|mul|div|minimum|maximum)\(.+\)), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
@@ -20412,29 +20412,29 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     permuted_cf_module_input_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<module>self\.[A-Za-z0-9_]+)\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<module>self\.[A-Za-z0-9_]+)\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
     output_back_permute_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
     )
     apply_softmax_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)]\)$"
     )
     reduce_max_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _reduce_max\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_reduce_max\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
     )
     argmax_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.argmax\((?P<input>[A-Za-z0-9_]+), dim=_normalize_dim\((?P<axis>-?\d+), (?P=input)\.ndim\), keepdim=(?P<keepdim>True|False)\)\.to\(dtype=torch\.int64\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.argmax\((?P<input>[A-Za-z0-9_]+), dim=_normalize_dim\((?P<axis>-?\d+), (?P=input)\.ndim\), keepdim=(?P<keepdim>True|False)\)\.to\(dtype=torch\.int64\)$"
     )
     rank4_mean_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[(?P<dim0>-?\d+), (?P<dim1>-?\d+)\], keepdim=(?P<keepdim>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[(?P<dim0>-?\d+), (?P<dim1>-?\d+)\], keepdim=(?P<keepdim>True|False)\)$"
     )
     rank4_reshape_consumer_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"^\s*[A-Za-z0-9_]+\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
     generic_reshape_consumer_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"^\s*[A-Za-z0-9_]+\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
     pidnet_spp_scale3_mul_re = re.compile(
@@ -20495,25 +20495,25 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), 1, (?P=c)\]\)$"
     )
     pidnet_spp_scale4_add_out_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 1, 1, (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 1, 1, (?P<c>\d+)\]\)$"
     )
     reduce_sum_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _reduce_sum\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_reduce_sum\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
     )
     sub_from_one_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.sub\(1\.0, (?P<input>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.sub\(1\.0, (?P<input>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     rank3_resize_input_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<src>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     rank3_matmul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.matmul\((?P<x>[A-Za-z0-9_]+), (?P<y>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.matmul\((?P<x>[A-Za-z0-9_]+), (?P<y>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     rank4_singleton_reshape_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<src>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<src>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     rank4_singleton_matmul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.matmul\((?P<x>[A-Za-z0-9_]+), (?P<y>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.matmul\((?P<x>[A-Za-z0-9_]+), (?P<y>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     apply_resize_nhwc_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=True\)$"
@@ -20538,7 +20538,7 @@ def _canonicalize_generated_model_source_for_raw_export(
     in_channels_re = re.compile(r"^\s*in_channels=(?P<channels>\d+),$")
     out_channels_re = re.compile(r"^\s*out_channels=(?P<channels>\d+),$")
     module_output_assign_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\("
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\("
     )
     cf_name_token_re = re.compile(r"(?:^|_)cf(?:_|$)")
     cf_out_token_re = re.compile(r"(?:^|_)out_cf(?:_|$)")
@@ -23995,7 +23995,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 )
                 next_reshape_match = (
                     re.match(
-                        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+                        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
                         r"\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$",
                         lines[index + 3],
                     )
@@ -24671,7 +24671,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                 lines.insert(runtime_import_block_end, runtime_import_line)
                 changed = True
     orphan_rank3_permute_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 2, 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 2, 1\]\)$"
     )
     square_permuted_const_alias_re = re.compile(
         r"^\s*self\.(?P<alias>[A-Za-z0-9_]+)\.copy_\("
@@ -26294,7 +26294,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     tensor786_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs\("
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs\("
         r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 2, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     for line in lines:

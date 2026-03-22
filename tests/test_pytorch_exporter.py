@@ -338,8 +338,37 @@ def test_canonicalize_generated_model_source_preserves_rank3_permute_function_ar
     _canonicalize_generated_model_source_for_raw_export(package_dir)
 
     rewritten = model_path.read_text(encoding="utf-8")
-    assert "t_7863 = _torch_permute(t_7859, [0, 2, 1])" in rewritten
-    assert "t_7863 = _torch_permute(t_653, [0, 2, 1])" not in rewritten
+    assert "_torch_permute(t_7859, [0, 2, 1])" in rewritten
+    assert "_torch_permute(t_653, [0, 2, 1])" not in rewritten
+
+
+def test_canonicalize_generated_model_source_keeps_compact_rank3_permute_input_when_unrelated_unary_precedes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_rank3_orphan_permute_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, t_7859: torch.Tensor) -> torch.Tensor:",
+                "        t_653=torch.neg(t_7859)",
+                "        t_7863=_torch_permute(t_7859, [0, 2, 1])",
+                "        return t_7863",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_torch_permute(t_7859, [0, 2, 1])" in rewritten
+    assert "_torch_permute(t_653, [0, 2, 1])" not in rewritten
 
 
 def test_canonicalize_generated_model_source_rewrites_tensor_split_for_compact_public_layout_bridge(
@@ -401,6 +430,169 @@ def test_canonicalize_generated_model_source_rewrites_tensor_split_for_compact_p
     assert "in_public_layout_bridge = image_public_layout_bridge" in rewritten
     assert "torch.tensor_split(in_public_layout_bridge, 3, dim=_normalize_dim(1, in_public_layout_bridge.ndim))" in rewritten
     assert "_normalize_dim(3, in_public_layout_bridge.ndim)" not in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_compact_scalar_clamp_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_scalar_clamp_chain_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        mid=torch.maximum(x, torch.as_tensor(-1.0, dtype=torch.float32, device=_module_device(self)))",
+                "        y=torch.minimum(mid, torch.as_tensor(1.0, dtype=torch.float32, device=_module_device(self)))",
+                "        return y",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "mid = torch.clamp(x, min=-1.0)" in rewritten
+    assert "y = torch.clamp(mid, max=1.0)" in rewritten
+    assert "torch.maximum(" not in rewritten
+    assert "torch.minimum(" not in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_compact_scalar_first_binary(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_scalar_first_binary_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        y=torch.add(1.0, x)",
+                "        return y",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "y = torch.add(x, 1.0)" in rewritten
+    assert "torch.add(1.0, x)" not in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_compact_singleton_const_anchor(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_singleton_const_anchor_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_inline_literal_0', torch.zeros([1, 1, 1, 1], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        score_cf = _align_tensor_to_target_shape(torch.mul(x, x), [1, 16, 1, 1])",
+                "        _binary_lhs_0,_binary_rhs_0=_align_binary_inputs_to_anchor(score_cf, torch.reshape(self.const_inline_literal_0, [1, 1, 1, 1]), [1, 1, 1, 1])",
+                "        return _binary_rhs_0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor("
+        "score_cf, torch.reshape(self.const_inline_literal_0, [1, 16, 1, 1]), [1, 16, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_compact_singleton_const_anchor_with_compact_cf_source(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_singleton_const_anchor_compact_cf_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_inline_literal_0', torch.zeros([1, 1, 1, 1], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        score_cf=_align_tensor_to_target_shape(torch.mul(x, x), [1, 16, 1, 1])",
+                "        _binary_lhs_0,_binary_rhs_0=_align_binary_inputs_to_anchor(score_cf, torch.reshape(self.const_inline_literal_0, [1, 1, 1, 1]), [1, 1, 1, 1])",
+                "        return _binary_rhs_0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor("
+        "score_cf, torch.reshape(self.const_inline_literal_0, [1, 16, 1, 1]), [1, 16, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_compact_nhwc_singleton_binary_anchor(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_nhwc_singleton_binary_anchor_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:",
+                "        score_cf = _align_tensor_to_target_shape(torch.mul(x, x), [1, 1, 8, 8])",
+                "        mask_cf = _align_tensor_to_target_shape(torch.mul(y, y), [1, 1, 8, 8])",
+                "        _binary_lhs_0,_binary_rhs_0=_align_binary_inputs_to_anchor(score_cf, mask_cf, [1, 8, 8, 1])",
+                "        return _binary_rhs_0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(score_cf, mask_cf, [1, 1, 8, 8])"
+        in rewritten
+    )
 
 
 def test_export_pytorch_package_materializes_rank3_channel_last_binary_before_transpose(tmp_path) -> None:
@@ -1135,6 +1327,36 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_with_parenth
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_compact_scale4_add_out(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_add_out_compact_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_add_out=torch.reshape(torch.add(branch_a_cf, branch_b_cf), [1, 1, 1, 192])",
+                "        return spp_add_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_add_out = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_through_local_const_pair_alias(
     tmp_path,
 ) -> None:
@@ -1835,6 +2057,35 @@ def test_canonicalize_generated_model_source_removes_permute_for_singleton_rank4
     assert "resize_out_nhwc.permute(0, 3, 1, 2).contiguous()" not in rewritten
 
 
+def test_canonicalize_generated_model_source_removes_permute_for_compact_singleton_rank4_matmul_conv_input(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_singleton_rank4_matmul_conv_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, split_out0: torch.Tensor, _tmp_x_18: torch.Tensor, _tmp_y_18: torch.Tensor) -> torch.Tensor:",
+                "        resize_out_nhwc=torch.reshape(torch.matmul(_tmp_y_18, _tmp_x_18), [1, 1, 90, 160])",
+                "        ianetincconvconv3_cv_in_cf=self.conv_block_0(resize_out_nhwc.permute(0, 3, 1, 2).contiguous())",
+                "        return ianetincconvconv3_cv_in_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "ianetincconvconv3_cv_in_cf = self.conv_block_0(resize_out_nhwc)" in rewritten
+    assert "resize_out_nhwc.permute(0, 3, 1, 2).contiguous()" not in rewritten
+
+
 def test_canonicalize_generated_model_source_rewrites_pidnet_cf_resize_argmax_path_to_channel_first(
     tmp_path,
 ) -> None:
@@ -2385,6 +2636,46 @@ def test_canonicalize_generated_model_source_rewrites_cf_softmax_mask_chain(
         "torch.add(batch_normalization268_mul_out, torch.reshape(self.const_BatchNormalization_268_bn_add, [1, 2, 1, 1])), [1, 2, 80, 80])"
         in rewritten
     )
+    assert "t_756 = _apply_softmax(t_753, axis=1, beta=1.0, target_shape=[1, 2, 80, 80])" in rewritten
+    assert "t_757 = _reduce_max(t_756, _normalize_axes([1], t_756.ndim), False)" in rewritten
+    assert "t_771 = _align_tensor_to_target_shape(torch.sub(1.0, t_757), [1, 1, 80, 80])" in rewritten
+    assert "t_772 = t_771" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_cf_softmax_mask_chain_with_compact_assignments(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_softmax_mask_compact_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_268_bn_mul', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_BatchNormalization_268_bn_add', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, resize267_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        batch_normalization268_mul_out=_align_tensor_to_target_shape(torch.mul(resize267_out_cf, self.const_BatchNormalization_268_bn_mul), [1, 80, 80, 2])",
+                "        t_753=_align_tensor_to_target_shape(torch.add(batch_normalization268_mul_out, self.const_BatchNormalization_268_bn_add), [1, 80, 80, 2])",
+                "        t_756=_apply_softmax(t_753, axis=3, beta=1.0, target_shape=[1, 80, 80, 2])",
+                "        t_757=_reduce_max(t_756, _normalize_axes([3], t_756.ndim), False)",
+                "        t_771=_align_tensor_to_target_shape(torch.sub(1.0, t_757), [1, 80, 80])",
+                "        t_772=torch.reshape(t_771, [1, 80, 80, 1])",
+                "        return t_772",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
     assert "t_756 = _apply_softmax(t_753, axis=1, beta=1.0, target_shape=[1, 2, 80, 80])" in rewritten
     assert "t_757 = _reduce_max(t_756, _normalize_axes([1], t_756.ndim), False)" in rewritten
     assert "t_771 = _align_tensor_to_target_shape(torch.sub(1.0, t_757), [1, 1, 80, 80])" in rewritten
@@ -8214,6 +8505,47 @@ def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_with_compact_r
         in rewritten
     )
     assert "t_772 = t_771" in rewritten
+    assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_fix_stage5_mask_chain_with_compact_tuple_lhs_binary_align(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_mask_compact_tuple_lhs_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.register_buffer('const_BatchNormalization_268_bn_mul', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_BatchNormalization_268_bn_add', torch.zeros([1, 1, 1, 2], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_tensor786_expand_x80_x2_af49', torch.zeros([1, 80, 80, 2], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, cv265_out_cf: torch.Tensor, t_791: torch.Tensor) -> torch.Tensor:",
+                "        resize267_out = _apply_resize(cv265_out_cf, [80, 80], method='bilinear', target_shape=[1, 80, 80, 2], align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        batch_normalization268_mul_out = _align_tensor_to_target_shape(torch.mul(resize267_out, self.const_BatchNormalization_268_bn_mul), [1, 80, 80, 2])",
+                "        t_753 = _align_tensor_to_target_shape(torch.add(batch_normalization268_mul_out, self.const_BatchNormalization_268_bn_add), [1, 80, 80, 2])",
+                "        t_756 = _apply_softmax(t_753, axis=3, beta=1.0, target_shape=[1, 80, 80, 2])",
+                "        t_757 = _reduce_max(t_756, _normalize_axes([3], t_756.ndim), False)",
+                "        t_771 = _align_tensor_to_target_shape(torch.sub(torch.as_tensor(1.0, dtype=torch.float32, device=_module_device(self)), t_757), [1, 80, 80])",
+                "        t_772 = torch.reshape(t_771, [1, 80, 80, 1])",
+                "        _binary_lhs_196,_binary_rhs_196 = _align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49, [1, 2, 80, 80])",
+                "        t_786 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_196, _binary_rhs_196), [1, 2, 80, 80])",
+                "        return t_786",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
     assert "_align_binary_inputs(t_772, self.const_tensor786_expand_x80_x2_af49.permute(0, 3, 1, 2).contiguous(), [1, 2, 80, 80])" in rewritten
 
 
@@ -17177,6 +17509,54 @@ def test_canonicalize_generated_model_source_restores_rank4_transpose_conv_bridg
     )
 
 
+def test_canonicalize_generated_model_source_restores_compact_rank4_transpose_conv_bridge_from_model_ir(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_transpose_conv_rank4_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, onnx_cv_tr59: torch.Tensor) -> torch.Tensor:",
+                "        cv_tr18_convtranspose1_d_in_nchw2_d=onnx_cv_tr59",
+                "        cv_tr18_convtranspose1_d_in_nchw2_d=cv_tr18_convtranspose1_d_in_nchw2_d.permute(0, 3, 1, 2).contiguous()",
+                "        cv_tr18_in_nhwc=_torch_permute(cv_tr18_convtranspose1_d_in_nchw2_d, [0, 2, 3, 1])",
+                "        return cv_tr18_in_nhwc",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="compact_transpose_conv_rank4_bridge_fix")
+    model_ir.tensors["onnx_cv_tr59"] = TensorIR(
+        name="onnx_cv_tr59",
+        dtype="FLOAT32",
+        shape=[1, 64, 64],
+        shape_signature=[1, 64, 64],
+        logical_layout="NCW",
+    )
+    model_ir.tensors["cv_tr18_convtranspose1_d_in_nchw2_d"] = TensorIR(
+        name="cv_tr18_convtranspose1_d_in_nchw2_d",
+        dtype="FLOAT32",
+        shape=[1, 64, 1, 64],
+        shape_signature=[1, 64, 1, 64],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "cv_tr18_convtranspose1_d_in_nchw2_d = torch.reshape(onnx_cv_tr59, [1, 64, 1, 64])"
+        in rewritten
+    )
+    assert "cv_tr18_convtranspose1_d_in_nchw2_d.permute(0, 3, 1, 2).contiguous()" not in rewritten
+
+
 def test_canonicalize_generated_model_source_rewrites_final_output_permute_from_cf_expr(
     tmp_path,
 ) -> None:
@@ -17199,6 +17579,51 @@ def test_canonicalize_generated_model_source_rewrites_final_output_permute_from_
         encoding="utf-8",
     )
     model_ir = ModelIR(name="final_output_cf_fix")
+    model_ir.tensors["clip7_clip_min_out"] = TensorIR(
+        name="clip7_clip_min_out",
+        dtype="FLOAT32",
+        shape=[1, 3, 180, 320],
+        shape_signature=[1, 3, 180, 320],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["output"] = TensorIR(
+        name="output",
+        dtype="FLOAT32",
+        shape=[1, 3, 180, 320],
+        shape_signature=[1, 3, 180, 320],
+        logical_layout="NCHW",
+    )
+    model_ir.outputs = ["output"]
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "out = out_nhwc" in rewritten
+    assert "out = _torch_permute(out_nhwc, [0, 3, 1, 2])" not in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_compact_final_output_permute_from_cf_expr(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "compact_final_output_cf_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, clip7_clip_min_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        out_nhwc=_align_tensor_to_target_shape(torch.clamp(clip7_clip_min_out_cf, max=255.0), [1, 320, 3, 180])",
+                "        out=_torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="compact_final_output_cf_fix")
     model_ir.tensors["clip7_clip_min_out"] = TensorIR(
         name="clip7_clip_min_out",
         dtype="FLOAT32",
@@ -17308,6 +17733,50 @@ def test_canonicalize_generated_model_source_restores_public_output_resize_targe
     assert "target_shape=[1, 256, 21, 128]" not in rewritten
 
 
+def test_canonicalize_generated_model_source_restores_compact_public_output_resize_target_shape(tmp_path) -> None:
+    package_dir = tmp_path / "compact_public_output_resize_target_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        t607_public_layout_bridge_cf=_apply_resize(x, [128, 256], method='bilinear', target_shape=[1, 256, 21, 128], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        t_607=t607_public_layout_bridge_cf",
+                "        return t_607",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="compact_public_output_resize_target_fix")
+    model_ir.outputs = ["607"]
+    model_ir.tensors["607"] = TensorIR(
+        name="607",
+        dtype="FLOAT32",
+        shape=[1, 21, 128, 256],
+        shape_signature=[1, 21, 128, 256],
+        logical_layout="NCHW",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(
+        package_dir,
+        model_ir=model_ir,
+    )
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "t607_public_layout_bridge_cf = _apply_resize(x, [128, 256], method='bilinear', "
+        "target_shape=[1, 21, 128, 256], align_corners=False, "
+        "half_pixel_centers=True, channel_last=False)"
+        in rewritten
+    )
+    assert "target_shape=[1, 256, 21, 128]" not in rewritten
+
+
 def test_canonicalize_generated_model_source_preserves_pidnet_pag4_mul2_alignment(tmp_path) -> None:
     package_dir = tmp_path / "pidnet_pag4_mul2_pkg"
     package_dir.mkdir()
@@ -17339,6 +17808,64 @@ def test_canonicalize_generated_model_source_preserves_pidnet_pag4_mul2_alignmen
         "pag4_mul2_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_99, _binary_rhs_99), [1, 64, 24, 40])"
         in rewritten
     )
+
+
+def test_canonicalize_generated_model_source_rewrites_compact_cf_gap_mean_dims(tmp_path) -> None:
+    package_dir = tmp_path / "compact_cf_gap_mean_dims_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_out_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_average_in=_align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_out_cf), [1, 3, 5, 512])",
+                "        spp_global_cf=torch.mean(spp_average_in, dim=[1, 2], keepdim=True)",
+                "        return spp_global_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_average_in = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_out_cf), [1, 512, 3, 5])"
+        in rewritten
+    )
+    assert "spp_global_cf = torch.mean(spp_average_in, dim=[2, 3], keepdim=True)" in rewritten
+
+
+def test_canonicalize_generated_model_source_rewrites_compact_cf_reduce_sum_axis(tmp_path) -> None:
+    package_dir = tmp_path / "compact_cf_reduce_sum_axis_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pag_sig_out0: torch.Tensor, pag_resize1_out_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_99,_binary_rhs_99=_align_binary_inputs(pag_sig_out0, pag_resize1_out_nhwc, [1, 64, 24, 40])",
+                "        pag_mul_out=_align_tensor_to_target_shape(torch.mul(_binary_lhs_99, _binary_rhs_99), [1, 64, 24, 40])",
+                "        pag_reduce_sum_out=_reduce_sum(pag_mul_out, _normalize_axes([3], pag_mul_out.ndim), True)",
+                "        return pag_reduce_sum_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "_align_binary_inputs(pag_sig_out0, pag_resize1_out_nhwc, [1, 64, 24, 40])" in rewritten
+    assert "pag_reduce_sum_out = _reduce_sum(pag_mul_out, _normalize_axes([1], pag_mul_out.ndim), True)" in rewritten
 
 
 def test_canonicalize_generated_model_source_keeps_nhwc_cf_alias_without_extra_permute(tmp_path) -> None:
@@ -21243,6 +21770,44 @@ def test_canonicalize_generated_model_source_rewrites_cf_resize_argmax_path_to_c
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_cf_resize_argmax_path_to_channel_first_with_compact_argmax_assignment(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_resize_argmax_compact_argmax_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, final_layerconv2_cv_out_nhwc_cf: torch.Tensor) -> torch.Tensor:",
+                "        wa_resize3_out_nhwc_cf = _apply_resize(final_layerconv2_cv_out_nhwc_cf, [192, 320], method='bilinear', target_shape=[1, 192, 320, 19], align_corners=True, half_pixel_centers=False, channel_last=True)",
+                "        wa_resize3_out_nhwc = wa_resize3_out_nhwc_cf",
+                "        out_argmax=torch.argmax(wa_resize3_out_nhwc, dim=_normalize_dim(3, wa_resize3_out_nhwc.ndim), keepdim=False).to(dtype=torch.int64)",
+                "        return out_argmax",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "wa_resize3_out_nhwc_cf = _apply_resize(final_layerconv2_cv_out_nhwc_cf, [192, 320], method='bilinear', "
+        "target_shape=[1, 19, 192, 320], align_corners=True, half_pixel_centers=False, channel_last=False)"
+        in rewritten
+    )
+    assert "wa_resize3_out_nhwc = wa_resize3_out_nhwc_cf" in rewritten
+    assert (
+        "out_argmax = torch.argmax(wa_resize3_out_nhwc, dim=_normalize_dim(1, wa_resize3_out_nhwc.ndim), keepdim=False).to(dtype=torch.int64)"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_preserves_nhwc_materialize_before_rank4_reshape(tmp_path) -> None:
     package_dir = tmp_path / "nhwc_materialize_pkg"
     package_dir.mkdir()
@@ -21324,6 +21889,33 @@ def test_canonicalize_generated_model_source_preserves_compact_aligned_nhwc_alia
     assert "x_nhwc = x_cf" not in rewritten
 
 
+def test_canonicalize_generated_model_source_preserves_compact_aligned_nhwc_alias_before_compact_rank4_reshape(tmp_path) -> None:
+    package_dir = tmp_path / "aligned_nhwc_alias_compact_reshape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x_cf: torch.Tensor) -> torch.Tensor:",
+                "        x_nhwc=_align_tensor_to_target_shape(x_cf, [1, 45, 80, 64])",
+                "        y=torch.reshape(x_nhwc, _resolve_reshape_shape([1, -1, 64], x_nhwc, allow_zero=False))",
+                "        return y",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "x_nhwc=_align_tensor_to_target_shape(x_cf, [1, 45, 80, 64])" in rewritten
+    assert "x_nhwc = x_cf" not in rewritten
+
+
 def test_canonicalize_generated_model_source_rewrites_compact_aligned_pad_to_channel_first(
     tmp_path,
 ) -> None:
@@ -21377,6 +21969,57 @@ def test_canonicalize_generated_model_source_restores_nhwc_materialize_for_chann
         encoding="utf-8",
     )
     model_ir = ModelIR(name="channel_last_alias_before_rank4_reshape")
+    model_ir.tensors["x_cf"] = TensorIR(
+        name="x_cf",
+        dtype="FLOAT32",
+        shape=[1, 64, 45, 80],
+        shape_signature=[1, 64, 45, 80],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["x"] = TensorIR(
+        name="x",
+        dtype="FLOAT32",
+        shape=[1, 45, 80, 64],
+        shape_signature=[1, 45, 80, 64],
+        logical_layout="NHWC",
+    )
+    model_ir.tensors["y"] = TensorIR(
+        name="y",
+        dtype="FLOAT32",
+        shape=[1, 3600, 64],
+        shape_signature=[1, 3600, 64],
+        logical_layout="NWC",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir, model_ir=model_ir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "x = _align_tensor_to_target_shape(x_cf.permute(0, 2, 3, 1).contiguous(), [1, 45, 80, 64])" in rewritten
+    assert "x = x_cf" not in rewritten
+
+
+def test_canonicalize_generated_model_source_restores_nhwc_materialize_for_channel_last_alias_before_compact_rank4_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "channel_last_alias_compact_reshape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x_cf: torch.Tensor) -> torch.Tensor:",
+                "        x = x_cf",
+                "        y=torch.reshape(x, _resolve_reshape_shape([1, -1, 64], x, allow_zero=False))",
+                "        return y",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_ir = ModelIR(name="channel_last_alias_before_compact_rank4_reshape")
     model_ir.tensors["x_cf"] = TensorIR(
         name="x_cf",
         dtype="FLOAT32",
