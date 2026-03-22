@@ -71,6 +71,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _fold_channel_first_hardsigmoid_gate_conv_bridges,
     _fold_boundary_transpose_pad_conv_bridges,
     _fold_channel_last_prelu_bridges,
+    _fold_rank4_reshape_permute_conv_bridges,
     _infer_shadowformer_shape_from_dims,
     _inline_trivial_public_layout_bridge_aliases,
     _make_tensor_storage_name_map,
@@ -287,6 +288,35 @@ def test_fold_channel_last_affine_conv_bridges_handles_compact_assignments() -> 
     ]
 
 
+def test_fold_channel_last_affine_conv_bridges_accepts_keyword_tuple_shapes() -> None:
+    lines = [
+        "x_nhwc = _align_tensor_to_target_shape(input=x_cf.permute(0, 2, 3, 1).contiguous(), target_shape=(1, 8, 8, 4))",
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs(input=x_nhwc, other=self.const_mul_any, target_shape=(1, 8, 8, 4))",
+        "mul0 = _align_tensor_to_target_shape(input=torch.mul(input=_binary_lhs_0, other=_binary_rhs_0), target_shape=(1, 8, 8, 4))",
+        "_binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(input=mul0, other=self.const_add_any, target_shape=(1, 8, 8, 4))",
+        "add0 = _align_tensor_to_target_shape(input=torch.add(input=_binary_lhs_1, other=_binary_rhs_1), target_shape=(1, 8, 8, 4))",
+        "y = self.conv_block_0(add0.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+    rewritten = _fold_channel_last_affine_conv_bridges(
+        lines,
+        derive_local_var_name=lambda base_name: f"{base_name}_tmp",
+        channel_first_constant_expr_for_buffer_attr=lambda buffer_expr, target_shape: (
+            "self.const_mul_cf"
+            if buffer_expr == "self.const_mul_any" and list(target_shape) == [1, 4, 1, 1]
+            else "self.const_add_cf"
+            if buffer_expr == "self.const_add_any" and list(target_shape) == [1, 4, 1, 1]
+            else None
+        ),
+    )
+
+    assert rewritten == [
+        "mul0_cf_tmp = torch.mul(x_cf, self.const_mul_cf)",
+        "add0_cf_tmp = torch.add(mul0_cf_tmp, self.const_add_cf)",
+        "y = self.conv_block_0(add0_cf_tmp)",
+    ]
+
+
 def test_rewrite_channel_last_gap_means_to_reduce_mean_keeps_rank3_cf_mean_consistent() -> None:
     lines = [
         "t_1780 = _align_tensor_to_target_shape(t1780_cf.permute(0, 2, 1).contiguous(), [1, 4096, 180])",
@@ -312,6 +342,47 @@ def test_rewrite_channel_last_gap_means_to_reduce_mean_keeps_rank3_cf_mean_consi
     assert rewritten == [
         "t_1780=_align_tensor_to_target_shape(t1780_cf.permute(0, 2, 1).contiguous(), [1, 4096, 180])",
         "t1781_cf = torch.mean(t1780_cf, dim=1, keepdim=True)",
+    ]
+
+
+def test_rewrite_channel_last_gap_means_to_reduce_mean_accepts_keyword_tuple_rank3_forms() -> None:
+    lines = [
+        "t_1780 = _align_tensor_to_target_shape(input=t1780_cf.permute(0, 2, 1).contiguous(), target_shape=(1, 4096, 180))",
+        "t1781_cf = torch.mean(input=t_1780, dim=(2,), keepdim=True)",
+    ]
+
+    rewritten = _rewrite_channel_last_gap_means_to_reduce_mean(lines)
+
+    assert rewritten == [
+        "t_1780 = _align_tensor_to_target_shape(input=t1780_cf.permute(0, 2, 1).contiguous(), target_shape=(1, 4096, 180))",
+        "t1781_cf = torch.mean(t1780_cf, dim=1, keepdim=True)",
+    ]
+
+
+def test_rewrite_channel_last_gap_means_to_reduce_mean_accepts_keyword_tuple_inline_gap_mean() -> None:
+    lines = [
+        "gap_nhwc = torch.mean(input=features_cf.permute(0, 2, 3, 1).contiguous(), dim=(1, 2), keepdim=True)",
+    ]
+
+    rewritten = _rewrite_channel_last_gap_means_to_reduce_mean(lines)
+
+    assert rewritten == [
+        "gap_nhwc = _reduce_mean(features_cf.permute(0, 2, 3, 1).contiguous(), _normalize_axes([1, 2], features_cf.permute(0, 2, 3, 1).contiguous().ndim), keepdims=True)",
+    ]
+
+
+def test_fold_rank4_reshape_permute_conv_bridges_accepts_keyword_tuple_shapes() -> None:
+    lines = [
+        "x_reshaped = torch.reshape(input=x_cf, shape=(1, 16, 4, 4))",
+        "x_nhwc = torch.reshape(input=x_reshaped.permute(0, 2, 3, 1).contiguous(), shape=(1, 4, 4, 16))",
+        "y = _align_tensor_to_target_shape(self.conv_block_0(x_nhwc.permute(0, 3, 1, 2).contiguous()), (1, 32, 4, 4))",
+    ]
+
+    rewritten = _fold_rank4_reshape_permute_conv_bridges(lines)
+
+    assert rewritten == [
+        "x_reshaped = torch.reshape(input=x_cf, shape=(1, 16, 4, 4))",
+        "y = _align_tensor_to_target_shape(self.conv_block_0(x_reshaped), [1, 32, 4, 4])",
     ]
 
 
@@ -837,6 +908,131 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_direct_mul_f
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_direct_mul_with_keyword_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_direct_mul_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 256, 1, 1])",
+                "        spp_bn_mul_out = torch.mul(other=self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, input=spp_global_cf)",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 256, 1, 1]))"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale3_mul_with_keyword_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale3_mul_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, scale3_recip: torch.Tensor, spp_mul_in: torch.Tensor) -> torch.Tensor:",
+                "        spp_mul_out = _align_tensor_to_target_shape(input=torch.mul(other=spp_mul_in, input=scale3_recip), target_shape=(1, 192, 1, 29))",
+                "        return spp_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_mul_out = _align_tensor_to_target_shape(torch.mul(scale3_recip, spp_mul_in), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale3_add_anchor_with_keyword_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale3_add_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, bn_add_in: torch.Tensor) -> torch.Tensor:",
+                "        scale3_add = self.const_demo_add_any",
+                "        _binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor(a=scale3_add, b=bn_add_in, target_shape=(1, 192, 1, 31))",
+                "        return _binary_lhs_22",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_22, _binary_rhs_22 = _align_binary_inputs_to_anchor("
+        "bn_add_in, torch.reshape(scale3_add, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale3_const_anchor_with_keyword_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale3_const_anchor_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_pool_out: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor(a=spp_pool_out, b=self.const_demo_scale3_any, target_shape=(1, 256, 1, 13))",
+                "        return _binary_lhs_21",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_21, _binary_rhs_21 = _align_binary_inputs_to_anchor("
+        "spp_pool_out, torch.reshape(self.const_demo_scale3_any, [1, 256, 1, 1]), [1, 256, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_leaves_pidnet_scale4_direct_mul_without_channel_evidence(
     tmp_path,
 ) -> None:
@@ -1357,6 +1553,36 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_compact_scale4_add_
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_keyword_scale4_add_out(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_add_out_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_add_out = torch.reshape(input=torch.add(other=branch_b_cf, input=branch_a_cf), shape=(1, 1, 1, 192))",
+                "        return spp_add_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_add_out = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_pidnet_compact_scale4_bn_add_anchor(
     tmp_path,
 ) -> None:
@@ -1420,6 +1646,37 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_compact_forced_scal
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_keyword_forced_scale4_mul(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_forced_mul_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        spp_bn_mul_out = torch.reshape(input=torch.mul(other=self.const_demo_mul_any, input=spp_global_cf), shape=(1, 1, 192, 1))",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_mul_any, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_pidnet_compact_forced_scale4_add_anchor(
     tmp_path,
 ) -> None:
@@ -1435,6 +1692,37 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_compact_forced_scal
                 "    def forward(self, branch_a_cf: torch.Tensor, branch_b_cf: torch.Tensor) -> torch.Tensor:",
                 "        spp_global_cf = _align_tensor_to_target_shape(torch.add(branch_a_cf, branch_b_cf), [1, 192, 1, 1])",
                 "        _binary_lhs_0,_binary_rhs_0=_align_binary_inputs_to_anchor(spp_global_cf, self.const_demo_add_any, [1, 1, 1, 192])",
+                "        return _binary_lhs_0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "_binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(spp_global_cf, "
+        "torch.reshape(self.const_demo_add_any, [1, 192, 1, 1]), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_keyword_forced_scale4_add_anchor(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_forced_add_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_0, _binary_rhs_0 = _align_binary_inputs_to_anchor(a=self.const_demo_add_any, b=spp_global_cf, target_shape=(1, 1, 1, 192))",
                 "        return _binary_lhs_0",
                 "",
             ]
@@ -1992,6 +2280,38 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_vari
     )
 
 
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_keyword_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_keyword_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(input=torch.mul(input=spp_global_cf, other=torch.reshape(input=scale4_bn_mul, shape=(1, 1, 192, 1))), shape=(1, 1, 1, 192))",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
 def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_reversed_tuple_shapes(
     tmp_path,
 ) -> None:
@@ -2007,6 +2327,38 @@ def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_vari
                 "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
                 "        scale4_bn_mul = self.const_demo_mul_any",
                 "        spp_bn_mul_out = torch.reshape(torch.mul(torch.reshape(scale4_bn_mul, (1, 1, 192, 1)), spp_global_cf), (1, 1, 1, 192))",
+                "        return spp_bn_mul_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(scale4_bn_mul, [1, 192, 1, 1])), [1, 192, 1, 1])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_rewrites_pidnet_scale4_reshape_variant_with_reversed_keyword_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_scale4_reshape_variant_reversed_keyword_raw_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_global_cf: torch.Tensor) -> torch.Tensor:",
+                "        scale4_bn_mul = self.const_demo_mul_any",
+                "        spp_bn_mul_out = torch.reshape(input=torch.mul(other=spp_global_cf, input=torch.reshape(input=scale4_bn_mul, shape=(1, 1, 192, 1))), shape=(1, 1, 1, 192))",
                 "        return spp_bn_mul_out",
                 "",
             ]
@@ -11837,6 +12189,151 @@ def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature_wi
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature_with_keyword_pag_mul_outer_align(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_semantic_skip_keyword_pag_mul_outer_align_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_input, pag_lhs, pag_rhs, scale4_input):",
+                "        scale4_bn_mul = self.const_scale4_bn_mul",
+                "        scale4_bn_add = self.const_scale4_bn_add",
+                "        spp_average_padded = F.pad(spp_input, [2, 2, 2, 2], mode='constant', value=0.0)",
+                "        spp_global = torch.mean(spp_input, dim=[2, 3], keepdim=True)",
+                "        scale4_mul = torch.mul(scale4_input, torch.reshape(scale4_bn_mul, [1, 192, 1, 1]))",
+                "        scale4_add_lhs, scale4_add_rhs = _align_binary_inputs_to_anchor(scale4_input, torch.reshape(scale4_bn_add, [1, 192, 1, 1]), [1, 192, 1, 1])",
+                "        pag_out = _align_tensor_to_target_shape(input=torch.mul(other=pag_rhs, input=pag_lhs), target_shape=(1, 48, 18, 30))",
+                "        return spp_average_padded, spp_global, scale4_mul, scale4_add_lhs, scale4_add_rhs, pag_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature_with_keyword_pad_and_mean_args(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_semantic_skip_keyword_pad_mean_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_input, pag_lhs, pag_rhs, scale4_input):",
+                "        scale4_bn_mul = self.const_scale4_bn_mul",
+                "        scale4_bn_add = self.const_scale4_bn_add",
+                "        spp_average_padded = F.pad(mode='constant', value=0.0, pad=(2, 2, 2, 2), input=spp_input)",
+                "        spp_global = torch.mean(keepdim=True, dim=(2, 3), input=spp_input)",
+                "        scale4_mul = torch.mul(scale4_input, torch.reshape(scale4_bn_mul, [1, 192, 1, 1]))",
+                "        scale4_add_lhs, scale4_add_rhs = _align_binary_inputs_to_anchor(scale4_input, torch.reshape(scale4_bn_add, [1, 192, 1, 1]), [1, 192, 1, 1])",
+                "        pag_out = _align_tensor_to_target_shape(torch.mul(pag_lhs, pag_rhs), [1, 48, 18, 30])",
+                "        return spp_average_padded, spp_global, scale4_mul, scale4_add_lhs, scale4_add_rhs, pag_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature_with_keyword_scale4_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_semantic_skip_keyword_scale4_reshape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_input, pag_lhs, pag_rhs, scale4_input):",
+                "        scale4_bn_mul = self.const_scale4_bn_mul",
+                "        scale4_bn_add = self.const_scale4_bn_add",
+                "        spp_average_padded = F.pad(spp_input, [2, 2, 2, 2], mode='constant', value=0.0)",
+                "        spp_global = torch.mean(spp_input, dim=[2, 3], keepdim=True)",
+                "        scale4_mul = torch.mul(scale4_input, torch.reshape(input=scale4_bn_mul, shape=(1, 192, 1, 1)))",
+                "        scale4_add_lhs, scale4_add_rhs = _align_binary_inputs_to_anchor(scale4_input, torch.reshape(input=scale4_bn_add, shape=(1, 192, 1, 1)), [1, 192, 1, 1])",
+                "        pag_out = _align_tensor_to_target_shape(torch.mul(pag_lhs, pag_rhs), [1, 48, 18, 30])",
+                "        return spp_average_padded, spp_global, scale4_mul, scale4_add_lhs, scale4_add_rhs, pag_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature_with_method_scale4_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_semantic_skip_method_scale4_reshape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_input, pag_lhs, pag_rhs, scale4_input):",
+                "        scale4_bn_mul = self.const_scale4_bn_mul",
+                "        scale4_bn_add = self.const_scale4_bn_add",
+                "        spp_average_padded = F.pad(spp_input, [2, 2, 2, 2], mode='constant', value=0.0)",
+                "        spp_global = torch.mean(spp_input, dim=[2, 3], keepdim=True)",
+                "        scale4_mul = torch.mul(scale4_input, scale4_bn_mul.view((1, 192, 1, 1)))",
+                "        scale4_add_lhs, scale4_add_rhs = _align_binary_inputs_to_anchor(scale4_input, scale4_bn_add.reshape((1, 192, 1, 1)), [1, 192, 1, 1])",
+                "        pag_out = _align_tensor_to_target_shape(torch.mul(pag_lhs, pag_rhs), [1, 48, 18, 30])",
+                "        return spp_average_padded, spp_global, scale4_mul, scale4_add_lhs, scale4_add_rhs, pag_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature_with_non_cf_singleton_scale4_reshape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_semantic_skip_non_cf_singleton_scale4_reshape_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_input, pag_lhs, pag_rhs, scale4_input):",
+                "        scale4_bn_mul = self.const_scale4_bn_mul",
+                "        scale4_bn_add = self.const_scale4_bn_add",
+                "        spp_average_padded = F.pad(spp_input, [2, 2, 2, 2], mode='constant', value=0.0)",
+                "        spp_global = torch.mean(spp_input, dim=[2, 3], keepdim=True)",
+                "        scale4_mul = torch.mul(scale4_input, torch.reshape(scale4_bn_mul, [1, 1, 192, 1]))",
+                "        scale4_add_lhs, scale4_add_rhs = _align_binary_inputs_to_anchor(scale4_input, scale4_bn_add.reshape((1, 1, 192, 1)), [1, 192, 1, 1])",
+                "        pag_out = _align_tensor_to_target_shape(torch.mul(pag_lhs, pag_rhs), [1, 48, 18, 30])",
+                "        return spp_average_padded, spp_global, scale4_mul, scale4_add_lhs, scale4_add_rhs, pag_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_skip_expensive_raw_canonicalize_for_pidnet_semantic_signature_with_tuple_pag_shape(
     tmp_path,
 ) -> None:
@@ -17928,6 +18425,37 @@ def test_canonicalize_generated_model_source_preserves_pidnet_pag4_mul2_alignmen
         "_binary_lhs_99, _binary_rhs_99 = _align_binary_inputs(pag4_sig_out0, pag4_resize1_out_nhwc, [1, 64, 24, 40])"
         in rewritten
     )
+    assert (
+        "pag4_mul2_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_99, _binary_rhs_99), [1, 64, 24, 40])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_preserves_pidnet_pag4_mul2_alignment_with_keyword_mul_and_target_shape(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_pag4_mul2_keyword_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pag4_sig_out0: torch.Tensor, pag4_resize1_out_nhwc: torch.Tensor) -> torch.Tensor:",
+                "        _binary_lhs_99, _binary_rhs_99 = _align_binary_inputs(pag4_sig_out0, pag4_resize1_out_nhwc, [1, 64, 24, 40])",
+                "        pag4_mul2_out0 = _align_tensor_to_target_shape(input=torch.mul(other=_binary_rhs_99, input=_binary_lhs_99), target_shape=(1, 64, 24, 40))",
+                "        return pag4_mul2_out0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
     assert (
         "pag4_mul2_out0 = _align_tensor_to_target_shape(torch.mul(_binary_lhs_99, _binary_rhs_99), [1, 64, 24, 40])"
         in rewritten
@@ -40483,6 +41011,18 @@ def test_repair_channel_last_gap_conv_inputs_repairs_compact_assignment_chain() 
     ]
 
 
+def test_repair_channel_last_gap_conv_inputs_accepts_keyword_tuple_dims() -> None:
+    lines = [
+        "        gap = torch.mean(input=features, dim=(1, 2), keepdim=True)",
+        "        y = self.conv_block_66(gap)",
+    ]
+    repaired = _repair_channel_last_gap_conv_inputs(lines)
+    assert repaired == [
+        "        gap = torch.mean(input=features, dim=(1, 2), keepdim=True)",
+        "        y = self.conv_block_66(gap.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+
 def test_fold_channel_first_gap_conv_bridges_repairs_compact_assignment_chain() -> None:
     lines = [
         "gap=torch.mean(features_cf, dim=[2, 3], keepdim=True)",
@@ -40497,10 +41037,37 @@ def test_fold_channel_first_gap_conv_bridges_repairs_compact_assignment_chain() 
     ]
 
 
+def test_fold_channel_first_gap_conv_bridges_accepts_keyword_tuple_dims() -> None:
+    lines = [
+        "gap = torch.mean(input=features_cf, dim=(2, 3), keepdim=True)",
+        "y = self.conv_block_0(gap.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+    repaired = _fold_channel_first_gap_conv_bridges(lines)
+
+    assert repaired == [
+        "gap = torch.mean(input=features_cf, dim=(2, 3), keepdim=True)",
+        "y = self.conv_block_0(gap)",
+    ]
+
+
 def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_handles_compact_assignments() -> None:
     lines = [
         "gap=torch.mean(features_cf, dim=[2, 3], keepdim=True)",
         "gap_nhwc=_torch_permute(gap, [0, 2, 3, 1])",
+    ]
+
+    repaired = _rewrite_channel_first_gap_outputs_to_explicit_channel_last(lines)
+
+    assert repaired == [
+        "gap_nhwc = torch.mean(features_cf.permute(0, 2, 3, 1).contiguous(), dim=[1, 2], keepdim=True)",
+    ]
+
+
+def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_accepts_keyword_tuple_dims() -> None:
+    lines = [
+        "gap = torch.mean(input=features_cf, dim=(2, 3), keepdim=True)",
+        "gap_nhwc = _torch_permute(gap, [0, 2, 3, 1])",
     ]
 
     repaired = _rewrite_channel_first_gap_outputs_to_explicit_channel_last(lines)
@@ -40579,6 +41146,50 @@ def test_fold_channel_first_hardsigmoid_gate_conv_bridges_rewrites_compact_class
     ]
 
 
+def test_fold_channel_first_hardsigmoid_gate_conv_bridges_accepts_keyword_tuple_gap_mean() -> None:
+    lines = [
+        "        gate_mul = torch.mul(features_cf, 0.1666666716337204)",
+        "        gate_add = _align_tensor_to_target_shape(torch.add(gate_mul, 0.5), [1, 8, 16, 960])",
+        "        gate_sig = torch.clamp(gate_add, min=0.0, max=1.0)",
+        "        _binary_rhs_0, _binary_lhs_0 = _align_binary_inputs_to_anchor(gate_sig, features_cf, [1, 8, 16, 960])",
+        "        gated_nhwc = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [1, 8, 16, 960])",
+        "        gap = torch.mean(input=gated_nhwc, dim=(1, 2), keepdim=True)",
+        "        ygap = self.conv_block_66(gap.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+    rewritten = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+
+    assert rewritten == [
+        "        gate_sig = torch.nn.functional.hardsigmoid(features_cf)",
+        "        gated_nhwc = torch.mul(features_cf, gate_sig)",
+        "        gap = torch.mean(gated_nhwc, dim=[2, 3], keepdim=True)",
+        "        ygap = self.conv_block_66(gap)",
+    ]
+
+
+def test_fold_channel_first_hardsigmoid_gate_conv_bridges_accepts_helper_permute_conv_inputs() -> None:
+    lines = [
+        "        gate_mul = torch.mul(features_cf, 0.1666666716337204)",
+        "        gate_add = _align_tensor_to_target_shape(torch.add(gate_mul, 0.5), [1, 8, 16, 960])",
+        "        gate_sig = torch.clamp(gate_add, min=0.0, max=1.0)",
+        "        _binary_rhs_0, _binary_lhs_0 = _align_binary_inputs_to_anchor(gate_sig, features_cf, [1, 8, 16, 960])",
+        "        gated_nhwc = _align_tensor_to_target_shape(torch.mul(_binary_lhs_0, _binary_rhs_0), [1, 8, 16, 960])",
+        "        y0 = self.conv_block_62(_torch_permute(input=gated_nhwc, perm=(0, 3, 1, 2)))",
+        "        gap = torch.mean(gated_nhwc, dim=[1, 2], keepdim=True)",
+        "        ygap = self.conv_block_66(_torch_permute(input=gap, perm=(0, 3, 1, 2)))",
+    ]
+
+    rewritten = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+
+    assert rewritten == [
+        "        gate_sig = torch.nn.functional.hardsigmoid(features_cf)",
+        "        gated_nhwc = torch.mul(features_cf, gate_sig)",
+        "        y0 = self.conv_block_62(gated_nhwc)",
+        "        gap = torch.mean(gated_nhwc, dim=[2, 3], keepdim=True)",
+        "        ygap = self.conv_block_66(gap)",
+    ]
+
+
 def test_inline_trivial_public_layout_bridge_aliases_rewrites_compact_alias_assignment() -> None:
     lines = [
         "foo_public_layout_bridge=foo_cf",
@@ -40605,6 +41216,34 @@ def test_fold_boundary_transpose_pad_conv_bridges_rewrites_compact_assignments()
     assert rewritten == [
         "conv0 = self.conv_block_0(x_nhwc)",
         "y=_torch_permute(conv0, [0, 2, 3, 1])",
+    ]
+
+
+def test_fold_boundary_transpose_pad_conv_bridges_accepts_keyword_tuple_permute() -> None:
+    lines = [
+        "conv0 = self.conv_block_0(x_nhwc.permute(0, 2, 3, 1).contiguous())",
+        "y = _torch_permute(input=conv0, perm=(0, 2, 3, 1))",
+    ]
+
+    rewritten = _fold_boundary_transpose_pad_conv_bridges(lines)
+
+    assert rewritten == [
+        "conv0 = self.conv_block_0(x_nhwc)",
+        "y = _torch_permute(input=conv0, perm=(0, 2, 3, 1))",
+    ]
+
+
+def test_fold_boundary_transpose_pad_conv_bridges_accepts_helper_permute_input() -> None:
+    lines = [
+        "conv0 = self.conv_block_0(_torch_permute(input=x_nhwc, perm=(0, 2, 3, 1)))",
+        "y = _torch_permute(input=conv0, perm=(0, 2, 3, 1))",
+    ]
+
+    rewritten = _fold_boundary_transpose_pad_conv_bridges(lines)
+
+    assert rewritten == [
+        "conv0 = self.conv_block_0(x_nhwc)",
+        "y = _torch_permute(input=conv0, perm=(0, 2, 3, 1))",
     ]
 
 
@@ -40714,9 +41353,64 @@ def test_bridge_boundary_metadata_gather_nd_inputs_collapses_compact_double_perm
     ]
 
 
+def test_bridge_boundary_metadata_gather_nd_inputs_collapses_keyword_tuple_double_permute() -> None:
+    model_ir = ModelIR(name="boundary_metadata_gather_nd_keyword_tuple_double_permute_helper")
+    model_ir.inputs = ["data", "indices"]
+    model_ir.outputs = ["output"]
+    model_ir.tensors["data"] = TensorIR(
+        name="data",
+        dtype="FLOAT32",
+        shape=[1, 17, 48, 64],
+        shape_signature=[1, 17, 48, 64],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["indices"] = TensorIR(
+        name="indices",
+        dtype="INT32",
+        shape=[6, 3],
+        shape_signature=[6, 3],
+        logical_layout="UNKNOWN",
+    )
+    model_ir.tensors["output"] = TensorIR(
+        name="output",
+        dtype="FLOAT32",
+        shape=[6, 17],
+        shape_signature=[6, 17],
+        logical_layout="UNKNOWN",
+    )
+    model_ir.operators.append(
+        OperatorIR(
+            op_type="GATHER_ND",
+            inputs=["data", "indices"],
+            outputs=["output"],
+            options={},
+        )
+    )
+
+    rewritten = _bridge_boundary_metadata_gather_nd_inputs(
+        [
+            "output=_apply_gather_nd(_torch_permute(input=data, perm=(0, 2, 3, 1)).permute(0, 2, 3, 1).contiguous(), indices, target_shape=[6, 17])"
+        ],
+        model_ir=model_ir,
+        tensor_var_names={"data": "data", "indices": "indices", "output": "output"},
+    )
+
+    assert rewritten == [
+        "output = _apply_gather_nd(_torch_permute(data, [0, 2, 3, 1]), indices, target_shape=[6, 17])",
+    ]
+
+
 def test_collapse_redundant_torch_permute_chains_keeps_compact_assignment_semantics() -> None:
     rewritten = _collapse_redundant_torch_permute_chains(
         ["out=_torch_permute(x, [0, 2, 3, 1]).permute(0, 2, 3, 1).contiguous()"]
+    )
+
+    assert rewritten == ["out=_torch_permute(x, [0, 2, 3, 1])"]
+
+
+def test_collapse_redundant_torch_permute_chains_accepts_keyword_tuple_permute() -> None:
+    rewritten = _collapse_redundant_torch_permute_chains(
+        ["out=_torch_permute(input=x, perm=(0, 2, 3, 1)).permute(0, 2, 3, 1).contiguous()"]
     )
 
     assert rewritten == ["out=_torch_permute(x, [0, 2, 3, 1])"]

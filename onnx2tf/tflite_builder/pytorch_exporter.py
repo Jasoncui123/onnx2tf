@@ -6881,18 +6881,6 @@ def _fold_channel_last_affine_conv_bridges(
     if len(lines) < 6:
         return [str(line) for line in lines]
 
-    materialize_re = re.compile(
-        r"^(?P<var>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<cf>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), (?P<target>\[[^\]]+\])\)$"
-    )
-    align_re = re.compile(
-        r"^(?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs\((?P<input>[A-Za-z0-9_]+), (?P<const>.+), (?P<target>\[[^\]]+\])\)$"
-    )
-    mul_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
-    )
-    add_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.add\((?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
-    )
     relu_re = re.compile(
         r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.relu\((?P<input>[A-Za-z0-9_]+)\)$"
     )
@@ -6900,21 +6888,103 @@ def _fold_channel_last_affine_conv_bridges(
         r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
 
+    def _parse_materialize_assign(line: str) -> Tuple[str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, shape_expr = align_parts
+        shape = _parse_rank4_shape_literal(shape_expr)
+        if shape is None:
+            return None
+        match = re.fullmatch(
+            r"(?P<cf>[A-Za-z0-9_]+)\.permute\(0,\s*2,\s*3,\s*1\)\.contiguous\(\)",
+            input_expr.strip(),
+        )
+        if match is None:
+            return None
+        return lhs, str(match.group("cf")), list(shape)
+
+    def _parse_align_binary_inputs_assign(line: str) -> Tuple[str, str, str, str, List[int]] | None:
+        assign_match = re.match(
+            r"^\(*\s*(?P<lhs>[A-Za-z0-9_]+)\s*,\s*(?P<rhs>[A-Za-z0-9_]+)\s*\)*\s*=\s*(?P<expr>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        expr = str(assign_match.group("expr")).strip()
+        prefix = "_align_binary_inputs("
+        if not expr.startswith(prefix) or not expr.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(expr[len(prefix) : -1])
+        input_expr: str | None = None
+        const_expr: str | None = None
+        target_expr: str | None = None
+        if len(parts) == 3 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+            input_expr, const_expr, target_expr = (part.strip() for part in parts)
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            const_expr = kwargs.get("other", kwargs.get("rhs"))
+            target_expr = kwargs.get("target_shape", kwargs.get("shape"))
+        shape = _parse_rank4_shape_literal(target_expr) if target_expr is not None else None
+        if input_expr is None or const_expr is None or shape is None:
+            return None
+        return (
+            str(assign_match.group("lhs")),
+            str(assign_match.group("rhs")),
+            input_expr,
+            const_expr,
+            list(shape),
+        )
+
+    def _parse_binary_aligned_assign(line: str, op_name: str) -> Tuple[str, str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, shape_expr = align_parts
+        shape = _parse_rank4_shape_literal(shape_expr)
+        if shape is None:
+            return None
+        binary_match = re.fullmatch(rf"torch\.{op_name}\((?P<args>.+)\)", input_expr.strip())
+        if binary_match is None:
+            return None
+        binary_args = (
+            _parse_binary_mul_args(str(binary_match.group("args")))
+            if op_name == "mul"
+            else _parse_binary_add_args(str(binary_match.group("args")))
+        )
+        if binary_args is None:
+            return None
+        return lhs, str(binary_args[0]).strip(), str(binary_args[1]).strip(), input_expr, list(shape)
+
     rewritten: List[str] = []
     index = 0
     while index < len(lines):
         if index + 5 >= len(lines):
             rewritten.extend(str(line) for line in lines[index:])
             break
-        materialize_match = materialize_re.match(str(lines[index]))
+        materialize_match = _parse_materialize_assign(str(lines[index]))
         if materialize_match is None:
             rewritten.append(str(lines[index]))
             index += 1
             continue
-        align1_match = align_re.match(str(lines[index + 1]))
-        mul_match = mul_re.match(str(lines[index + 2]))
-        align2_match = align_re.match(str(lines[index + 3]))
-        add_match = add_re.match(str(lines[index + 4]))
+        align1_match = _parse_align_binary_inputs_assign(str(lines[index + 1]))
+        mul_match = _parse_binary_aligned_assign(str(lines[index + 2]), "mul")
+        align2_match = _parse_align_binary_inputs_assign(str(lines[index + 3]))
+        add_match = _parse_binary_aligned_assign(str(lines[index + 4]), "add")
         if (
             align1_match is None
             or mul_match is None
@@ -6939,18 +7009,17 @@ def _fold_channel_last_affine_conv_bridges(
             rewritten.append(str(lines[index]))
             index += 1
             continue
-        target_literal = materialize_match.group("target")
         if (
-            align1_match.group("input") != materialize_match.group("var")
-            or align1_match.group("target") != target_literal
-            or mul_match.group("lhs") != align1_match.group("lhs")
-            or mul_match.group("rhs") != align1_match.group("rhs")
-            or mul_match.group("target") != target_literal
-            or align2_match.group("input") != mul_match.group("out")
-            or align2_match.group("target") != target_literal
-            or add_match.group("lhs") != align2_match.group("lhs")
-            or add_match.group("rhs") != align2_match.group("rhs")
-            or add_match.group("target") != target_literal
+            align1_match[2] != materialize_match[0]
+            or align1_match[4] != materialize_match[2]
+            or mul_match[1] != align1_match[0]
+            or mul_match[2] != align1_match[1]
+            or mul_match[4] != materialize_match[2]
+            or align2_match[2] != mul_match[0]
+            or align2_match[4] != materialize_match[2]
+            or add_match[1] != align2_match[0]
+            or add_match[2] != align2_match[1]
+            or add_match[4] != materialize_match[2]
         ):
             rewritten.append(str(lines[index]))
             index += 1
@@ -6962,52 +7031,45 @@ def _fold_channel_last_affine_conv_bridges(
                 index += 1
                 continue
             if (
-                resolved_relu_match.group("input") != add_match.group("out")
+                resolved_relu_match.group("input") != add_match[0]
                 or conv_match.group("input") != resolved_relu_match.group("out")
             ):
                 rewritten.append(str(lines[index]))
                 index += 1
                 continue
-        elif conv_match.group("input") != add_match.group("out"):
-            rewritten.append(str(lines[index]))
-            index += 1
-            continue
-        try:
-            target_shape = ast.literal_eval(target_literal)
-        except Exception:
+        elif conv_match.group("input") != add_match[0]:
             rewritten.append(str(lines[index]))
             index += 1
             continue
         if (
-            not isinstance(target_shape, list)
-            or len(target_shape) != 4
-            or int(target_shape[3]) <= 0
+            len(materialize_match[2]) != 4
+            or int(materialize_match[2][3]) <= 0
         ):
             rewritten.append(str(lines[index]))
             index += 1
             continue
-        if not all(token.strip().startswith("self.") for token in [align1_match.group("const"), align2_match.group("const")]):
+        if not all(token.strip().startswith("self.") for token in [align1_match[3], align2_match[3]]):
             rewritten.append(str(lines[index]))
             index += 1
             continue
-        channel_count = int(target_shape[3])
+        channel_count = int(materialize_match[2][3])
         channel_first_shape = [1, channel_count, 1, 1]
-        mul_cf_var = derive_local_var_name(f"{mul_match.group('out')}_cf")
-        add_cf_var = derive_local_var_name(f"{add_match.group('out')}_cf")
+        mul_cf_var = derive_local_var_name(f"{mul_match[0]}_cf")
+        add_cf_var = derive_local_var_name(f"{add_match[0]}_cf")
         final_cf_var = add_cf_var
         mul_rhs_expr = channel_first_constant_expr_for_buffer_attr(
-            align1_match.group("const"),
+            align1_match[3],
             channel_first_shape,
         )
         if mul_rhs_expr is None:
-            mul_rhs_expr = f"torch.reshape({align1_match.group('const')}, {repr(channel_first_shape)})"
+            mul_rhs_expr = f"torch.reshape({align1_match[3]}, {repr(channel_first_shape)})"
         add_rhs_expr = channel_first_constant_expr_for_buffer_attr(
-            align2_match.group("const"),
+            align2_match[3],
             channel_first_shape,
         )
         if add_rhs_expr is None:
-            add_rhs_expr = f"torch.reshape({align2_match.group('const')}, {repr(channel_first_shape)})"
-        rewritten.append(f"{mul_cf_var} = torch.mul({materialize_match.group('cf')}, {mul_rhs_expr})")
+            add_rhs_expr = f"torch.reshape({align2_match[3]}, {repr(channel_first_shape)})"
+        rewritten.append(f"{mul_cf_var} = torch.mul({materialize_match[1]}, {mul_rhs_expr})")
         rewritten.append(f"{add_cf_var} = torch.add({mul_cf_var}, {add_rhs_expr})")
         if has_relu:
             resolved_relu_match = relu_match
@@ -7025,19 +7087,58 @@ def _fold_channel_last_affine_conv_bridges(
 def _fold_channel_first_gap_conv_bridges(
     lines: Sequence[str],
 ) -> List[str]:
-    mean_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
-    )
     conv_re = re.compile(
         r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
 
+    def _parse_cf_gap_mean_assign(line: str) -> Tuple[str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        match = re.fullmatch(r"torch\.mean\((?P<args>.+)\)", rhs.strip())
+        if match is None:
+            return None
+        parts = _split_top_level_csv_exprs(str(match.group("args")))
+        input_expr: str | None = None
+        dim_expr: str | None = None
+        keepdim_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "dim":
+                    dim_expr = value
+                elif key == "keepdim":
+                    keepdim_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            positional_index += 1
+        if input_expr is None or dim_expr is None:
+            return None
+        try:
+            dim_value = ast.literal_eval(dim_expr)
+        except Exception:
+            return None
+        if list(dim_value) != [2, 3]:
+            return None
+        if keepdim_expr is not None and keepdim_expr != "True":
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        return lhs, input_expr
+
     rewritten = [str(line) for line in lines]
     channel_first_gap_vars: Set[str] = set()
     for index, line in enumerate(rewritten):
-        mean_match = mean_re.match(line)
-        if mean_match is not None:
-            channel_first_gap_vars.add(str(mean_match.group("out")))
+        parsed_mean = _parse_cf_gap_mean_assign(line)
+        if parsed_mean is not None:
+            channel_first_gap_vars.add(str(parsed_mean[0]))
             continue
         conv_match = conv_re.match(line)
         if conv_match is None:
@@ -7054,25 +7155,65 @@ def _fold_channel_first_gap_conv_bridges(
 def _rewrite_channel_first_gap_outputs_to_explicit_channel_last(
     lines: Sequence[str],
 ) -> List[str]:
-    mean_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
-    )
     permute_re = re.compile(
         r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
     )
+
+    def _parse_cf_gap_mean_assign(line: str) -> Tuple[str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        match = re.fullmatch(r"torch\.mean\((?P<args>.+)\)", rhs.strip())
+        if match is None:
+            return None
+        parts = _split_top_level_csv_exprs(str(match.group("args")))
+        input_expr: str | None = None
+        dim_expr: str | None = None
+        keepdim_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "dim":
+                    dim_expr = value
+                elif key == "keepdim":
+                    keepdim_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            positional_index += 1
+        if input_expr is None or dim_expr is None:
+            return None
+        try:
+            dim_value = ast.literal_eval(dim_expr)
+        except Exception:
+            return None
+        if list(dim_value) != [2, 3]:
+            return None
+        if keepdim_expr is not None and keepdim_expr != "True":
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        return lhs, input_expr
+
     rewritten = [str(line) for line in lines]
     for index in range(len(rewritten) - 1):
-        mean_match = mean_re.match(rewritten[index])
-        if mean_match is None:
+        parsed_mean = _parse_cf_gap_mean_assign(rewritten[index])
+        if parsed_mean is None:
             continue
         permute_match = permute_re.match(rewritten[index + 1])
         if permute_match is None:
             continue
-        if str(permute_match.group("input")) != str(mean_match.group("out")):
+        if str(permute_match.group("input")) != str(parsed_mean[0]):
             continue
         rewritten[index] = (
             f"{permute_match.group('out')} = torch.mean("
-            f"{mean_match.group('input')}.permute(0, 2, 3, 1).contiguous(), "
+            f"{parsed_mean[1]}.permute(0, 2, 3, 1).contiguous(), "
             f"dim=[1, 2], keepdim=True)"
         )
         rewritten[index + 1] = ""
@@ -7082,47 +7223,169 @@ def _rewrite_channel_first_gap_outputs_to_explicit_channel_last(
 def _rewrite_channel_last_gap_means_to_reduce_mean(
     lines: Sequence[str],
 ) -> List[str]:
-    pattern = re.compile(
-        r"torch\.mean\((?P<expr>.+?\.permute\(0, 2, 3, 1\)\.contiguous\(\)), dim=\[1, 2\], keepdim=True\)"
-    )
-    rank3_cf_materialize_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<cf>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\), (?P<target>\[[^\]]+\])\)$"
-    )
-    rank3_mean_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=2, keepdim=True\)$"
-    )
+    def _parse_rank3_cf_materialize_assign(line: str) -> Tuple[str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, shape_expr = align_parts
+        try:
+            shape_value = ast.literal_eval(shape_expr)
+        except Exception:
+            return None
+        if not isinstance(shape_value, (list, tuple)) or len(shape_value) != 3:
+            return None
+        match = re.fullmatch(
+            r"(?P<cf>[A-Za-z0-9_]+)\.permute\(0,\s*2,\s*1\)\.contiguous\(\)",
+            input_expr.strip(),
+        )
+        if match is None:
+            return None
+        try:
+            shape = [int(v) for v in shape_value]
+        except Exception:
+            return None
+        return lhs, str(match.group("cf")), shape
+
+    def _parse_rank3_mean_assign(line: str) -> Tuple[str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        match = re.fullmatch(r"torch\.mean\((?P<args>.+)\)", rhs.strip())
+        if match is None:
+            return None
+        parts = _split_top_level_csv_exprs(str(match.group("args")))
+        input_expr: str | None = None
+        dim_expr: str | None = None
+        keepdim_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "dim":
+                    dim_expr = value
+                elif key == "keepdim":
+                    keepdim_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                dim_expr = part.strip()
+            positional_index += 1
+        if input_expr is None or dim_expr is None:
+            return None
+        try:
+            dim_value = ast.literal_eval(dim_expr)
+        except Exception:
+            try:
+                dim_value = int(dim_expr)
+            except Exception:
+                return None
+        if isinstance(dim_value, (list, tuple)):
+            if list(dim_value) != [2]:
+                return None
+        elif int(dim_value) != 2:
+            return None
+        if keepdim_expr is not None and keepdim_expr != "True":
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        return lhs, input_expr
 
     def _rewrite_line(line: str) -> str:
-        match = pattern.search(line)
-        if match is None:
-            return line
-        expr = str(match.group("expr"))
-        replacement = (
-            f"_reduce_mean({expr}, _normalize_axes([1, 2], {expr}.ndim), keepdims=True)"
-        )
-        return line[: match.start()] + replacement + line[match.end() :]
+        search_from = 0
+        rewritten_line = str(line)
+        while True:
+            start = rewritten_line.find("torch.mean(", search_from)
+            if start < 0:
+                return rewritten_line
+            cursor = start + len("torch.mean(")
+            depth = 1
+            while cursor < len(rewritten_line) and depth > 0:
+                char = rewritten_line[cursor]
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                cursor += 1
+            if depth != 0:
+                return rewritten_line
+            end = cursor
+            args_expr = rewritten_line[start + len("torch.mean(") : end - 1]
+            parts = _split_top_level_csv_exprs(args_expr)
+            input_expr: str | None = None
+            dim_expr: str | None = None
+            keepdim_expr: str | None = None
+            positional_index = 0
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                    key, value = part.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key == "input":
+                        input_expr = value
+                    elif key == "dim":
+                        dim_expr = value
+                    elif key == "keepdim":
+                        keepdim_expr = value
+                    continue
+                if positional_index == 0:
+                    input_expr = part.strip()
+                elif positional_index == 1:
+                    dim_expr = part.strip()
+                positional_index += 1
+            if input_expr is None or dim_expr is None:
+                search_from = end
+                continue
+            try:
+                dim_value = ast.literal_eval(dim_expr)
+            except Exception:
+                search_from = end
+                continue
+            if not isinstance(dim_value, (list, tuple)) or list(dim_value) != [1, 2]:
+                search_from = end
+                continue
+            if keepdim_expr is not None and keepdim_expr != "True":
+                search_from = end
+                continue
+            expr_match = re.fullmatch(
+                r"(?P<expr>.+?\.permute\(0,\s*2,\s*3,\s*1\)\.contiguous\(\))",
+                input_expr.strip(),
+            )
+            if expr_match is None:
+                search_from = end
+                continue
+            expr = str(expr_match.group("expr"))
+            replacement = (
+                f"_reduce_mean({expr}, _normalize_axes([1, 2], {expr}.ndim), keepdims=True)"
+            )
+            rewritten_line = rewritten_line[:start] + replacement + rewritten_line[end:]
+            search_from = start + len(replacement)
 
     rewritten = [_rewrite_line(str(line)) for line in lines]
     for index in range(1, len(rewritten)):
-        materialize_match = rank3_cf_materialize_re.match(str(rewritten[index - 1]))
-        mean_match = rank3_mean_re.match(str(rewritten[index]))
+        materialize_match = _parse_rank3_cf_materialize_assign(str(rewritten[index - 1]))
+        mean_match = _parse_rank3_mean_assign(str(rewritten[index]))
         if materialize_match is None or mean_match is None:
             continue
-        if mean_match.group("input") != materialize_match.group("out"):
-            continue
-        try:
-            target_shape = ast.literal_eval(materialize_match.group("target"))
-        except Exception:
+        if mean_match[1] != materialize_match[0]:
             continue
         if (
-            not isinstance(target_shape, list)
-            or len(target_shape) != 3
-            or not all(isinstance(value, int) for value in list(target_shape))
+            len(materialize_match[2]) != 3
+            or not all(isinstance(value, int) for value in list(materialize_match[2]))
         ):
             continue
         rewritten[index] = (
-            f"{mean_match.group('out')} = torch.mean("
-            f"{materialize_match.group('cf')}, dim=1, keepdim=True)"
+            f"{mean_match[0]} = torch.mean("
+            f"{materialize_match[1]}, dim=1, keepdim=True)"
         )
     return rewritten
 
@@ -7130,9 +7393,6 @@ def _rewrite_channel_last_gap_means_to_reduce_mean(
 def _repair_channel_last_gap_conv_inputs(
     lines: Sequence[str],
 ) -> List[str]:
-    mean_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[1, 2\], keepdim=True\)$"
-    )
     reduce_mean_re = re.compile(
         r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*_reduce_mean\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[1, 2\], [A-Za-z0-9_]+\.ndim\), keepdims=True\)$"
     )
@@ -7140,10 +7400,56 @@ def _repair_channel_last_gap_conv_inputs(
         r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
     )
 
+    def _parse_channel_last_gap_mean_assign(line: str) -> Tuple[str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        match = re.fullmatch(r"torch\.mean\((?P<args>.+)\)", rhs.strip())
+        if match is None:
+            return None
+        parts = _split_top_level_csv_exprs(str(match.group("args")))
+        input_expr: str | None = None
+        dim_expr: str | None = None
+        keepdim_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "dim":
+                    dim_expr = value
+                elif key == "keepdim":
+                    keepdim_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            positional_index += 1
+        if input_expr is None or dim_expr is None:
+            return None
+        try:
+            dim_value = ast.literal_eval(dim_expr)
+        except Exception:
+            return None
+        if list(dim_value) != [1, 2]:
+            return None
+        if keepdim_expr is not None and keepdim_expr != "True":
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        return lhs, input_expr
+
     rewritten = [str(line) for line in lines]
     channel_last_gap_vars: Set[str] = set()
     for index, line in enumerate(rewritten):
-        mean_match = mean_re.match(line) or reduce_mean_re.match(line)
+        parsed_mean = _parse_channel_last_gap_mean_assign(line)
+        if parsed_mean is not None:
+            channel_last_gap_vars.add(str(parsed_mean[0]))
+            continue
+        mean_match = reduce_mean_re.match(line)
         if mean_match is not None:
             channel_last_gap_vars.add(str(mean_match.group("out")))
             continue
@@ -7178,12 +7484,6 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
     mul_out_re = re.compile(
         r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
     )
-    conv_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
-    )
-    mean_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[1, 2\], keepdim=True\)$"
-    )
     anchor_cf_re = re.compile(
         r"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
@@ -7203,6 +7503,80 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
 
     def _line_mentions_name(line: str, name: str) -> bool:
         return re.search(rf"\b{re.escape(name)}\b", line) is not None
+
+    def _parse_gap_mean_assign(line: str) -> Tuple[str, str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "torch.mean("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        dim_expr: str | None = None
+        keepdim_expr: str | None = None
+        if len(parts) >= 1 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts[:1]):
+            input_expr = parts[0].strip()
+            for part in parts[1:]:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                if key.strip() == "dim":
+                    dim_expr = value.strip()
+                elif key.strip() == "keepdim":
+                    keepdim_expr = value.strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            dim_expr = kwargs.get("dim")
+            keepdim_expr = kwargs.get("keepdim")
+        if input_expr is None or dim_expr is None or not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        try:
+            dim_value = ast.literal_eval(dim_expr)
+        except Exception:
+            return None
+        if isinstance(dim_value, tuple):
+            dim_list = [int(v) for v in list(dim_value)]
+        elif isinstance(dim_value, list):
+            dim_list = [int(v) for v in dim_value]
+        else:
+            return None
+        if dim_list != [1, 2]:
+            return None
+        if keepdim_expr is not None and keepdim_expr != "True":
+            return None
+        return indent, lhs, input_expr
+
+    def _parse_cf_conv_assign(line: str) -> Tuple[str, str, str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        match = re.fullmatch(
+            r"self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0,\s*3,\s*1,\s*2\)\.contiguous\(\)\)",
+            rhs.strip(),
+        )
+        if match is not None:
+            return indent, lhs, str(match.group("module")), str(match.group("input"))
+        stripped = rhs.strip()
+        prefix = "self."
+        open_paren = stripped.find("(")
+        if not stripped.startswith(prefix) or open_paren <= len(prefix) or not stripped.endswith(")"):
+            return None
+        module_name = stripped[len(prefix) : open_paren]
+        args_expr = stripped[open_paren + 1 : -1]
+        input_expr = _resolve_nhwc_to_nchw_bridge_source(args_expr)
+        if input_expr is None or not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        return indent, lhs, module_name, input_expr
 
     index = 0
     while index <= len(rewritten) - 5:
@@ -7268,12 +7642,12 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
             line = rewritten[lookahead_index]
             if not _line_mentions_name(line, gated_output):
                 continue
-            conv_match = conv_re.match(line)
-            if conv_match is not None and str(conv_match.group("input")) == gated_output:
+            conv_match = _parse_cf_conv_assign(line)
+            if conv_match is not None and str(conv_match[3]) == gated_output:
                 continue
-            mean_match = mean_re.match(line)
-            if mean_match is not None and str(mean_match.group("input")) == gated_output:
-                supported_gap_vars.add(str(mean_match.group("out")))
+            mean_match = _parse_gap_mean_assign(line)
+            if mean_match is not None and str(mean_match[2]) == gated_output:
+                supported_gap_vars.add(str(mean_match[1]))
                 continue
             anchor_cf_match = anchor_cf_re.match(line) or binary_cf_re.match(line)
             if anchor_cf_match is not None and gated_output in {
@@ -7298,11 +7672,11 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
                 line = rewritten[lookahead_index]
                 if not _line_mentions_name(line, gap_var):
                     continue
-                conv_match = conv_re.match(line)
-                if conv_match is not None and str(conv_match.group("input")) == gap_var:
+                conv_match = _parse_cf_conv_assign(line)
+                if conv_match is not None and str(conv_match[3]) == gap_var:
                     continue
-                mean_match = mean_re.match(line)
-                if mean_match is not None and str(mean_match.group("out")) == gap_var:
+                mean_match = _parse_gap_mean_assign(line)
+                if mean_match is not None and str(mean_match[1]) == gap_var:
                     continue
                 safe_to_rewrite = False
                 break
@@ -7322,26 +7696,26 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
             f"{mul_out_match.group('indent')}{gated_output} = torch.mul({source_input}, {clamp_out})"
         )
         for lookahead_index in range(index + 5, function_end):
-            conv_match = conv_re.match(rewritten[lookahead_index])
-            if conv_match is not None and str(conv_match.group("input")) == gated_output:
+            conv_match = _parse_cf_conv_assign(rewritten[lookahead_index])
+            if conv_match is not None and str(conv_match[3]) == gated_output:
                 rewritten[lookahead_index] = (
-                    f"{conv_match.group('indent')}{conv_match.group('out')} = "
-                    f"self.{conv_match.group('module')}({gated_output})"
+                    f"{conv_match[0]}{conv_match[1]} = "
+                    f"self.{conv_match[2]}({gated_output})"
                 )
                 continue
-            mean_match = mean_re.match(rewritten[lookahead_index])
-            if mean_match is not None and str(mean_match.group("input")) == gated_output:
-                gap_var = str(mean_match.group("out"))
+            mean_match = _parse_gap_mean_assign(rewritten[lookahead_index])
+            if mean_match is not None and str(mean_match[2]) == gated_output:
+                gap_var = str(mean_match[1])
                 rewritten[lookahead_index] = (
-                    f"{mean_match.group('indent')}{gap_var} = "
+                    f"{mean_match[0]}{gap_var} = "
                     f"torch.mean({gated_output}, dim=[2, 3], keepdim=True)"
                 )
                 continue
-            conv_match = conv_re.match(rewritten[lookahead_index])
-            if conv_match is not None and str(conv_match.group("input")) in supported_gap_vars:
+            conv_match = _parse_cf_conv_assign(rewritten[lookahead_index])
+            if conv_match is not None and str(conv_match[3]) in supported_gap_vars:
                 rewritten[lookahead_index] = (
-                    f"{conv_match.group('indent')}{conv_match.group('out')} = "
-                    f"self.{conv_match.group('module')}({conv_match.group('input')})"
+                    f"{conv_match[0]}{conv_match[1]} = "
+                    f"self.{conv_match[2]}({conv_match[3]})"
                 )
         index += 5
     return [line for line in rewritten if line != ""]
@@ -7350,24 +7724,117 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
 def _fold_boundary_transpose_pad_conv_bridges(
     lines: Sequence[str],
 ) -> List[str]:
-    conv_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\)\)$"
-    )
-    output_bridge_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
-    )
+    def _parse_nchw_to_nhwc_bridge_source(expr: str) -> str | None:
+        stripped = str(expr).strip()
+        if stripped.endswith(".contiguous()"):
+            stripped = stripped[: -len(".contiguous()")].strip()
+
+        def _parse_permute_like_args(args: str) -> str | None:
+            parts = _split_top_level_csv_exprs(str(args))
+            if len(parts) == 2 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+                source_expr = parts[0].strip()
+                dims_expr = _normalize_permute_dims_expr(parts[1])
+                if re.fullmatch(r"[A-Za-z0-9_]+", source_expr) is not None and dims_expr == "0,2,3,1":
+                    return source_expr
+                return None
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            source_expr = kwargs.get("input", kwargs.get("x"))
+            dims_expr = kwargs.get("dims", kwargs.get("perm"))
+            if (
+                source_expr is None
+                or dims_expr is None
+                or re.fullmatch(r"[A-Za-z0-9_]+", source_expr) is None
+                or _normalize_permute_dims_expr(dims_expr) != "0,2,3,1"
+            ):
+                return None
+            return source_expr
+
+        functional_match = re.match(r"^torch\.permute\((?P<args>.+)\)$", stripped)
+        if functional_match is not None:
+            return _parse_permute_like_args(str(functional_match.group("args")))
+
+        helper_match = re.match(r"^_torch_permute\((?P<args>.+)\)$", stripped)
+        if helper_match is not None:
+            return _parse_permute_like_args(str(helper_match.group("args")))
+
+        method_match = re.match(r"^(?P<src>[A-Za-z0-9_]+)\.permute\((?P<dims>.+)\)$", stripped)
+        if method_match is not None and _normalize_permute_dims_expr(str(method_match.group("dims"))) == "0,2,3,1":
+            return str(method_match.group("src"))
+        return None
+
+    def _parse_boundary_conv_assign(line: str) -> Tuple[str, str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        match = re.fullmatch(
+            r"self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0,\s*2,\s*3,\s*1\)\.contiguous\(\)\)",
+            rhs.strip(),
+        )
+        if match is not None:
+            return lhs, str(match.group("module")), str(match.group("input"))
+        stripped = rhs.strip()
+        prefix = "self."
+        open_paren = stripped.find("(")
+        if not stripped.startswith(prefix) or open_paren <= len(prefix) or not stripped.endswith(")"):
+            return None
+        module_name = stripped[len(prefix) : open_paren]
+        args_expr = stripped[open_paren + 1 : -1]
+        input_expr = _parse_nchw_to_nhwc_bridge_source(args_expr)
+        if input_expr is None or not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        return lhs, module_name, input_expr
+
+    def _parse_output_bridge_assign(line: str) -> Tuple[str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "_torch_permute("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        perm_expr: str | None = None
+        if len(parts) == 2 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+            input_expr, perm_expr = parts[0].strip(), parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            perm_expr = kwargs.get("perm")
+        if input_expr is None or perm_expr is None or not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        try:
+            perm_value = ast.literal_eval(perm_expr)
+        except Exception:
+            return None
+        if list(perm_value) != [0, 2, 3, 1]:
+            return None
+        return lhs, input_expr
+
     rewritten = [str(line) for line in lines]
     for index in range(len(rewritten) - 1):
-        conv_match = conv_re.match(rewritten[index])
+        conv_match = _parse_boundary_conv_assign(rewritten[index])
         if conv_match is None:
             continue
-        output_bridge_match = output_bridge_re.match(rewritten[index + 1])
+        output_bridge_match = _parse_output_bridge_assign(rewritten[index + 1])
         if output_bridge_match is None:
             continue
-        if str(output_bridge_match.group("input")) != str(conv_match.group("out")):
+        if str(output_bridge_match[1]) != str(conv_match[0]):
             continue
         rewritten[index] = (
-            f"{conv_match.group('out')} = self.{conv_match.group('module')}({conv_match.group('input')})"
+            f"{conv_match[0]} = self.{conv_match[1]}({conv_match[2]})"
         )
     return rewritten
 
@@ -7378,6 +7845,83 @@ def _bridge_boundary_metadata_gather_nd_inputs(
     model_ir: ModelIR,
     tensor_var_names: Dict[str, str],
 ) -> List[str]:
+    def _parse_torch_permute_expr(
+        expr: str,
+    ) -> Tuple[str, List[int]] | None:
+        stripped = expr.strip()
+        prefix = "_torch_permute("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        perm_expr: str | None = None
+        if len(parts) == 2 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+            input_expr, perm_expr = parts[0].strip(), parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            perm_expr = kwargs.get("perm")
+        if input_expr is None or perm_expr is None:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        try:
+            perm_value = ast.literal_eval(perm_expr)
+        except Exception:
+            return None
+        if not isinstance(perm_value, (list, tuple)):
+            return None
+        try:
+            perm = [int(v) for v in list(perm_value)]
+        except Exception:
+            return None
+        return input_expr, perm
+
+    def _parse_gather_nd_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "_apply_gather_nd("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        if len(parts) != 3:
+            return None
+        input_expr = parts[0].strip()
+        indices_expr = parts[1].strip()
+        target_part = parts[2].strip()
+        if not target_part.startswith("target_shape="):
+            return None
+        return lhs, input_expr, indices_expr, target_part[len("target_shape=") :].strip()
+
+    def _parse_redundant_double_permute_expr(
+        expr: str,
+    ) -> Tuple[str, List[int], List[int]] | None:
+        match = re.fullmatch(
+            r"(?P<base>.+)\.permute\((?P<perm_args>[^\)]+)\)\.contiguous\(\)",
+            expr.strip(),
+        )
+        if match is None:
+            return None
+        base = str(match.group("base"))
+        permute_match = _parse_torch_permute_expr(base)
+        if permute_match is None:
+            return None
+        try:
+            perm_args = [int(v.strip()) for v in str(match.group("perm_args")).split(",")]
+        except Exception:
+            return None
+        return permute_match[0], permute_match[1], perm_args
+
     gather_nd_input_perms: Dict[str, List[int]] = {}
     for op in model_ir.operators:
         if str(op.op_type) != "GATHER_ND" or len(op.inputs) < 2 or len(op.outputs) != 1:
@@ -7423,39 +7967,27 @@ def _bridge_boundary_metadata_gather_nd_inputs(
     if not gather_nd_input_perms:
         return [str(line) for line in lines]
 
-    gather_nd_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_apply_gather_nd\((?P<input>[A-Za-z0-9_]+), (?P<indices>.+), target_shape=(?P<target>.+)\)$"
-    )
-    double_perm_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_apply_gather_nd\(_torch_permute\((?P<input>[A-Za-z0-9_]+), (?P<perm>\[[^\]]+\])\)\.permute\((?P<perm_args>[^\)]+)\)\.contiguous\(\), (?P<indices>.+), target_shape=(?P<target>.+)\)$"
-    )
     rewritten = [str(line) for line in lines]
     for index, line in enumerate(rewritten):
-        double_perm_match = double_perm_re.match(line)
+        gather_assign = _parse_gather_nd_assign(line)
+        if gather_assign is None:
+            continue
+        lhs, input_expr, indices_expr, target_expr = gather_assign
+        double_perm_match = _parse_redundant_double_permute_expr(input_expr)
         if double_perm_match is not None:
-            try:
-                perm_values = [int(v) for v in ast.literal_eval(double_perm_match.group("perm"))]
-                perm_args = [int(v.strip()) for v in str(double_perm_match.group("perm_args")).split(",")]
-            except Exception:
-                perm_values = []
-                perm_args = []
+            input_var, perm_values, perm_args = double_perm_match
             if perm_values == perm_args:
                 rewritten[index] = (
-                    f"{double_perm_match.group('out')} = _apply_gather_nd(_torch_permute({double_perm_match.group('input')}, "
-                    f"{double_perm_match.group('perm')}), {double_perm_match.group('indices')}, "
-                    f"target_shape={double_perm_match.group('target')})"
+                    f"{lhs} = _apply_gather_nd(_torch_permute({input_var}, {repr(perm_values)}), "
+                    f"{indices_expr}, target_shape={target_expr})"
                 )
                 continue
-        match = gather_nd_re.match(line)
-        if match is None:
+        if input_expr not in gather_nd_input_perms:
             continue
-        input_var = str(match.group("input"))
-        if input_var not in gather_nd_input_perms:
-            continue
-        perm = gather_nd_input_perms[input_var]
+        perm = gather_nd_input_perms[input_expr]
         rewritten[index] = (
-            f"{match.group('out')} = _apply_gather_nd(_torch_permute({input_var}, {repr(perm)}), "
-            f"{match.group('indices')}, target_shape={match.group('target')})"
+            f"{lhs} = _apply_gather_nd(_torch_permute({input_expr}, {repr(perm)}), "
+            f"{indices_expr}, target_shape={target_expr})"
         )
     return rewritten
 
@@ -7463,25 +7995,79 @@ def _bridge_boundary_metadata_gather_nd_inputs(
 def _collapse_redundant_torch_permute_chains(
     lines: Sequence[str],
 ) -> List[str]:
-    pattern = re.compile(
-        r"_torch_permute\((?P<input>[A-Za-z0-9_]+), (?P<perm>\[[^\]]+\])\)\.permute\((?P<perm_args>[^\)]+)\)\.contiguous\(\)"
-    )
+    def _parse_torch_permute_expr(
+        expr: str,
+    ) -> Tuple[str, List[int]] | None:
+        stripped = expr.strip()
+        prefix = "_torch_permute("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        perm_expr: str | None = None
+        if len(parts) == 2 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+            input_expr, perm_expr = parts[0].strip(), parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            perm_expr = kwargs.get("perm")
+        if input_expr is None or perm_expr is None or not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        try:
+            perm_value = ast.literal_eval(perm_expr)
+        except Exception:
+            return None
+        if not isinstance(perm_value, (list, tuple)):
+            return None
+        try:
+            perm = [int(v) for v in list(perm_value)]
+        except Exception:
+            return None
+        return input_expr, perm
 
     def _rewrite_line(line: str) -> str:
-        match = pattern.search(line)
+        match = re.search(r"_torch_permute\(", line)
         if match is None:
             return line
+        start = int(match.start())
+        cursor = start
+        depth = 0
+        end: int | None = None
+        while cursor < len(line):
+            char = line[cursor]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    end = cursor + 1
+                    break
+            cursor += 1
+        if end is None:
+            return line
+        suffix = line[end:]
+        tail_match = re.match(r"\.permute\((?P<perm_args>[^\)]+)\)\.contiguous\(\)", suffix)
+        if tail_match is None:
+            return line
+        permute_match = _parse_torch_permute_expr(line[start:end])
+        if permute_match is None:
+            return line
         try:
-            perm_values = [int(v) for v in ast.literal_eval(match.group("perm"))]
-            perm_args = [int(v.strip()) for v in str(match.group("perm_args")).split(",")]
+            perm_args = [int(v.strip()) for v in str(tail_match.group("perm_args")).split(",")]
         except Exception:
             return line
+        input_expr, perm_values = permute_match
         if perm_values != perm_args:
             return line
         return (
-            line[: match.start()]
-            + f"_torch_permute({match.group('input')}, {match.group('perm')})"
-            + line[match.end() :]
+            line[:start]
+            + f"_torch_permute({input_expr}, {repr(perm_values)})"
+            + line[end + tail_match.end() :]
         )
 
     return [_rewrite_line(str(line)) for line in lines]
@@ -7511,38 +8097,66 @@ def _inline_trivial_public_layout_bridge_aliases(
 def _fold_channel_last_prelu_bridges(
     lines: Sequence[str],
 ) -> List[str]:
-    in_re = re.compile(
-        r"^(?P<var>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
-    )
     prelu_re = re.compile(
         r"^(?P<var>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>prelu_[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
     )
-    out_re = re.compile(
-        r"^(?P<var>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
-    )
+
+    def _parse_permute_assign(line: str, expected_perm: Sequence[int]) -> Tuple[str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "_torch_permute("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        perm_expr: str | None = None
+        if len(parts) == 2 and all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts):
+            input_expr, perm_expr = parts[0].strip(), parts[1].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_expr = kwargs.get("input")
+            perm_expr = kwargs.get("perm")
+        if input_expr is None or perm_expr is None or not re.fullmatch(r"[A-Za-z0-9_]+", input_expr):
+            return None
+        try:
+            perm_value = ast.literal_eval(perm_expr)
+        except Exception:
+            return None
+        if list(perm_value) != list(expected_perm):
+            return None
+        return lhs, input_expr
+
     rewritten = [str(line) for line in lines]
     index = 0
     while index <= len(rewritten) - 3:
-        in_match = in_re.match(rewritten[index])
+        in_match = _parse_permute_assign(rewritten[index], [0, 3, 1, 2])
         if in_match is None:
             index += 1
             continue
         prelu_match = prelu_re.match(rewritten[index + 1])
-        out_match = out_re.match(rewritten[index + 2])
+        out_match = _parse_permute_assign(rewritten[index + 2], [0, 2, 3, 1])
         if prelu_match is None or out_match is None:
             index += 1
             continue
-        bridge_var = str(in_match.group("var"))
+        bridge_var = str(in_match[0])
         if str(prelu_match.group("input")) != bridge_var:
             index += 1
             continue
         prelu_out_var = str(prelu_match.group("var"))
-        if str(out_match.group("input")) != prelu_out_var:
+        if str(out_match[1]) != prelu_out_var:
             index += 1
             continue
         rewritten[index] = (
-            f"{out_match.group('var')} = self.{prelu_match.group('module')}("
-            f"{in_match.group('input')}.permute(0, 3, 1, 2).contiguous()"
+            f"{out_match[0]} = self.{prelu_match.group('module')}("
+            f"{in_match[1]}.permute(0, 3, 1, 2).contiguous()"
             f").permute(0, 2, 3, 1).contiguous()"
         )
         rewritten[index + 1] = ""
@@ -7975,54 +8589,102 @@ def _fold_rank4_reshape_permute_conv_bridges(
         return [str(line) for line in lines]
 
     rewritten: List[str] = []
-    reshape_re = re.compile(
-        r"^(?P<out>\w+)\s*=\s*torch\.reshape\((?P<input>[^,]+), (?P<shape>\[[^\]]+\])\)$"
-    )
-    nhwc_bridge_re = re.compile(
-        r"^(?P<out>\w+)\s*=\s*torch\.reshape\((?P<input>\w+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), (?P<shape>\[[^\]]+\])\)$"
-    )
-    conv_bridge_re = re.compile(
-        r"^(?P<out>\w+)\s*=\s*_align_tensor_to_target_shape\(self\.(?P<module>\w+)\((?P<input>\w+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\), (?P<target>\[[^\]]+\])\)$"
-    )
+
+    def _parse_torch_reshape_assign(line: str) -> Tuple[str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        rhs = rhs.strip()
+        prefix = "torch.reshape("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "shape":
+                    shape_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                shape_expr = part.strip()
+            positional_index += 1
+        rank4_shape = _parse_rank4_shape_literal(shape_expr) if shape_expr is not None else None
+        if input_expr is None or rank4_shape is None:
+            return None
+        return lhs, input_expr, list(rank4_shape)
+
+    def _parse_nhwc_bridge_assign(line: str) -> Tuple[str, str, List[int]] | None:
+        parsed = _parse_torch_reshape_assign(line)
+        if parsed is None:
+            return None
+        lhs, input_expr, rank4_shape = parsed
+        match = re.fullmatch(
+            r"(?P<input>\w+)\.permute\(0,\s*2,\s*3,\s*1\)\.contiguous\(\)",
+            input_expr,
+        )
+        if match is None:
+            return None
+        return lhs, str(match.group("input")), rank4_shape
+
+    def _parse_conv_bridge_assign(line: str) -> Tuple[str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, target_expr = align_parts
+        target_shape = _parse_rank4_shape_literal(target_expr)
+        if target_shape is None:
+            return None
+        match = re.fullmatch(
+            r"self\.(?P<module>\w+)\((?P<input>\w+)\.permute\(0,\s*3,\s*1,\s*2\)\.contiguous\(\)\)",
+            input_expr.strip(),
+        )
+        if match is None:
+            return None
+        return lhs, str(match.group("module")), str(match.group("input")), list(target_shape)
 
     index = 0
     while index < len(lines):
         if index + 2 >= len(lines):
             rewritten.extend(str(line) for line in lines[index:])
             break
-        reshape_match = reshape_re.match(str(lines[index]))
-        bridge_match = nhwc_bridge_re.match(str(lines[index + 1]))
-        conv_match = conv_bridge_re.match(str(lines[index + 2]))
+        reshape_match = _parse_torch_reshape_assign(str(lines[index]))
+        bridge_match = _parse_nhwc_bridge_assign(str(lines[index + 1]))
+        conv_match = _parse_conv_bridge_assign(str(lines[index + 2]))
         if (
             reshape_match is None
             or bridge_match is None
             or conv_match is None
-            or bridge_match.group("input") != reshape_match.group("out")
-            or conv_match.group("input") != bridge_match.group("out")
+            or bridge_match[1] != reshape_match[0]
+            or conv_match[2] != bridge_match[0]
         ):
             rewritten.append(str(lines[index]))
             index += 1
             continue
-        try:
-            reshape_shape = ast.literal_eval(reshape_match.group("shape"))
-            bridge_shape = ast.literal_eval(bridge_match.group("shape"))
-        except Exception:
-            rewritten.append(str(lines[index]))
-            index += 1
-            continue
         if (
-            not isinstance(reshape_shape, list)
-            or not isinstance(bridge_shape, list)
-            or len(reshape_shape) != 4
-            or len(bridge_shape) != 4
-            or _permute_shape(reshape_shape, [0, 2, 3, 1]) != [int(v) for v in list(bridge_shape)]
+            len(reshape_match[2]) != 4
+            or len(bridge_match[2]) != 4
+            or _permute_shape(reshape_match[2], [0, 2, 3, 1]) != [int(v) for v in list(bridge_match[2])]
         ):
             rewritten.append(str(lines[index]))
             index += 1
             continue
         rewritten.append(str(lines[index]))
         rewritten.append(
-            f"{conv_match.group('out')} = _align_tensor_to_target_shape(self.{conv_match.group('module')}({reshape_match.group('out')}), {conv_match.group('target')})"
+            f"{conv_match[0]} = _align_tensor_to_target_shape(self.{conv_match[1]}({reshape_match[0]}), {repr(conv_match[3])})"
         )
         index += 3
     return rewritten
@@ -20437,66 +21099,6 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^\s*[A-Za-z0-9_]+\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
-    pidnet_spp_scale3_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.mul\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
-    )
-    pidnet_spp_scale3_mul_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.mul\(\(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
-    )
-    pidnet_spp_scale3_anchor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
-    )
-    pidnet_spp_scale3_anchor_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\(\(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?, \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
-    )
-    pidnet_spp_scale3_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
-    )
-    pidnet_spp_scale3_add_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\(\(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?, \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
-    )
-    pidnet_spp_scale3_mul_out_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), 1, (?P<d>\d+)\]\)$"
-    )
-    pidnet_spp_scale4_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.mul\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?\)$"
-    )
-    pidnet_spp_scale4_mul_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.mul\(\(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?\)$"
-    )
-    pidnet_spp_scale4_mul_reshape_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\(torch\.mul\(\(?(?P<input>[A-Za-z0-9_]+)\)?, "
-        r"\(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?\), \[1, 1, (?P<c>\d+), 1\]\)$"
-    )
-    pidnet_spp_scale4_mul_reshape_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\(torch\.mul\(\(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, "
-        r"\(?(?P<input>[A-Za-z0-9_]+)\)?\), \[1, 1, (?P<c>\d+), 1\]\)$"
-    )
-    pidnet_spp_scale4_mul_reshape_variant_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\(torch\.mul\(\(*(?P<input>[A-Za-z0-9_]+)\)*, "
-        r"torch\.reshape\(\(*(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)*, [\[\(][0-9, ]+[\]\)]\)\), "
-        r"[\[\(]1, 1, 1, (?P<c>\d+)[\]\)]\)$"
-    )
-    pidnet_spp_scale4_mul_reshape_variant_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\(torch\.mul\(torch\.reshape\(\(*(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)*, [\[\(][0-9, ]+[\]\)]\), "
-        r"\(*(?P<input>[A-Za-z0-9_]+)\)*\), [\[\(]1, 1, 1, (?P<c>\d+)[\]\)]\)$"
-    )
-    pidnet_spp_scale4_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\(\(?(?P<input>[A-Za-z0-9_]+)\)?, \(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \[1, 1, 1, (?P<c>\d+)\]\)$"
-    )
-    pidnet_spp_scale4_add_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\(\(?(?P<const_expr>(?:self\.)?[A-Za-z0-9_]+)\)?, \(?(?P<input>[A-Za-z0-9_]+)\)?, \[1, 1, 1, (?P<c>\d+)\]\)$"
-    )
-    pidnet_pag4_mul2_out_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
-        r"torch\.mul\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
-    )
-    pidnet_spp_scale3_add_out_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, (?P<c>\d+), 1, (?P=c)\]\)$"
-    )
-    pidnet_spp_scale4_add_out_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[1, 1, 1, (?P<c>\d+)\]\)$"
-    )
     reduce_sum_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_reduce_sum\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
     )
@@ -20960,6 +21562,496 @@ def _canonicalize_generated_model_source_for_raw_export(
             return None
         return str(const_expr), resolved_expr[len("self.") :]
 
+    def _parse_raw_pidnet_align_binary_out_assign(
+        line: str,
+        op: str,
+    ) -> Tuple[str, str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, shape_expr = align_parts
+        binary_match = re.fullmatch(rf"torch\.{op}\((?P<args>.+)\)", input_expr.strip())
+        if binary_match is None:
+            return None
+        binary_args = (
+            _parse_binary_mul_args(str(binary_match.group("args")))
+            if op == "mul"
+            else _parse_binary_add_args(str(binary_match.group("args")))
+        )
+        rank4_shape = _parse_rank4_shape_literal(shape_expr)
+        if binary_args is None or rank4_shape is None:
+            return None
+        return indent, lhs, str(binary_args[0]), str(binary_args[1]), list(rank4_shape)
+
+    def _parse_raw_pidnet_reshape_binary_out_assign(
+        line: str,
+        op: str,
+    ) -> Tuple[str, str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        prefix = "torch.reshape("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "shape":
+                    shape_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                shape_expr = part.strip()
+            positional_index += 1
+        if input_expr is None or shape_expr is None:
+            return None
+        binary_match = re.fullmatch(rf"torch\.{op}\((?P<args>.+)\)", input_expr.strip())
+        if binary_match is None:
+            return None
+        binary_args = (
+            _parse_binary_mul_args(str(binary_match.group("args")))
+            if op == "mul"
+            else _parse_binary_add_args(str(binary_match.group("args")))
+        )
+        rank4_shape = _parse_rank4_shape_literal(shape_expr)
+        if binary_args is None or rank4_shape is None:
+            return None
+        return indent, lhs, str(binary_args[0]), str(binary_args[1]), list(rank4_shape)
+
+    def _parse_raw_pidnet_scale4_mul_reshape_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, int] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        prefix = "torch.reshape("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "shape":
+                    shape_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                shape_expr = part.strip()
+            positional_index += 1
+        rank4_shape = _parse_rank4_shape_literal(str(shape_expr))
+        if input_expr is None or rank4_shape is None:
+            return None
+        if not (
+            int(rank4_shape[0]) == 1
+            and int(rank4_shape[1]) == 1
+            and int(rank4_shape[3]) == 1
+            and int(rank4_shape[2]) > 1
+        ):
+            return None
+        mul_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", str(input_expr).strip())
+        if mul_match is None:
+            return None
+        mul_args = _parse_binary_mul_args(str(mul_match.group("args")))
+        if mul_args is None:
+            return None
+        input_a = str(mul_args[0]).strip()
+        input_b = str(mul_args[1]).strip()
+        resolved_a = _resolve_raw_pidnet_const_expr(input_a)
+        resolved_b = _resolve_raw_pidnet_const_expr(input_b)
+        if resolved_a is not None and resolved_b is None:
+            return indent, lhs, input_b, resolved_a[0], int(rank4_shape[2])
+        if resolved_b is not None and resolved_a is None:
+            return indent, lhs, input_a, resolved_b[0], int(rank4_shape[2])
+        return None
+
+    def _parse_raw_pidnet_scale4_mul_reshape_variant_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, int] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        prefix = "torch.reshape("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "shape":
+                    shape_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                shape_expr = part.strip()
+            positional_index += 1
+        rank4_shape = _parse_rank4_shape_literal(str(shape_expr))
+        if input_expr is None or rank4_shape is None:
+            return None
+        if not (
+            int(rank4_shape[0]) == 1
+            and int(rank4_shape[1]) == 1
+            and int(rank4_shape[2]) == 1
+            and int(rank4_shape[3]) > 1
+        ):
+            return None
+        mul_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", str(input_expr).strip())
+        if mul_match is None:
+            return None
+        mul_args = _parse_binary_mul_args(str(mul_match.group("args")))
+        if mul_args is None:
+            return None
+        input_a = str(mul_args[0]).strip()
+        input_b = str(mul_args[1]).strip()
+
+        def _parse_inner_const_reshape(expr: str) -> str | None:
+            inner_stripped = str(expr).strip()
+            inner_prefix = "torch.reshape("
+            if not inner_stripped.startswith(inner_prefix) or not inner_stripped.endswith(")"):
+                return None
+            inner_parts = _split_top_level_csv_exprs(inner_stripped[len(inner_prefix) : -1])
+            inner_input_expr: str | None = None
+            for inner_index, inner_part in enumerate(inner_parts):
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", inner_part) is not None:
+                    key, value = inner_part.split("=", 1)
+                    if key.strip() == "input":
+                        inner_input_expr = value.strip()
+                    continue
+                if inner_index == 0:
+                    inner_input_expr = inner_part.strip()
+            if inner_input_expr is None:
+                return None
+            resolved_inner = _resolve_raw_pidnet_const_expr(inner_input_expr)
+            if resolved_inner is None:
+                return None
+            return resolved_inner[0]
+
+        const_expr_a = _parse_inner_const_reshape(input_a)
+        const_expr_b = _parse_inner_const_reshape(input_b)
+        if const_expr_a is not None and const_expr_b is None:
+            return indent, lhs, input_b, const_expr_a, int(rank4_shape[3])
+        if const_expr_b is not None and const_expr_a is None:
+            return indent, lhs, input_a, const_expr_b, int(rank4_shape[3])
+        return None
+
+    def _parse_raw_pidnet_scale4_mul_reshape_variant_reversed_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, int] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        prefix = "torch.reshape("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        shape_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "shape":
+                    shape_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                shape_expr = part.strip()
+            positional_index += 1
+        rank4_shape = _parse_rank4_shape_literal(str(shape_expr))
+        if input_expr is None or rank4_shape is None:
+            return None
+        if not (
+            int(rank4_shape[0]) == 1
+            and int(rank4_shape[1]) == 1
+            and int(rank4_shape[2]) == 1
+            and int(rank4_shape[3]) > 1
+        ):
+            return None
+        mul_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", str(input_expr).strip())
+        if mul_match is None:
+            return None
+        mul_args = _parse_binary_mul_args(str(mul_match.group("args")))
+        if mul_args is None:
+            return None
+        input_a = str(mul_args[0]).strip()
+        input_b = str(mul_args[1]).strip()
+
+        def _parse_inner_const_reshape(expr: str) -> str | None:
+            inner_stripped = str(expr).strip()
+            inner_prefix = "torch.reshape("
+            if not inner_stripped.startswith(inner_prefix) or not inner_stripped.endswith(")"):
+                return None
+            inner_parts = _split_top_level_csv_exprs(inner_stripped[len(inner_prefix) : -1])
+            inner_input_expr: str | None = None
+            for inner_index, inner_part in enumerate(inner_parts):
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", inner_part) is not None:
+                    key, value = inner_part.split("=", 1)
+                    if key.strip() == "input":
+                        inner_input_expr = value.strip()
+                    continue
+                if inner_index == 0:
+                    inner_input_expr = inner_part.strip()
+            if inner_input_expr is None:
+                return None
+            resolved_inner = _resolve_raw_pidnet_const_expr(inner_input_expr)
+            if resolved_inner is None:
+                return None
+            return resolved_inner[0]
+
+        const_expr_a = _parse_inner_const_reshape(input_a)
+        const_expr_b = _parse_inner_const_reshape(input_b)
+        if const_expr_a is not None and const_expr_b is None:
+            return indent, lhs, input_b, const_expr_a, int(rank4_shape[3])
+        if const_expr_b is not None and const_expr_a is None:
+            return indent, lhs, input_a, const_expr_b, int(rank4_shape[3])
+        return None
+
+    def _parse_raw_pidnet_scale4_direct_mul_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        mul_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", rhs.strip())
+        if mul_match is None:
+            return None
+        mul_args = _parse_binary_mul_args(str(mul_match.group("args")))
+        if mul_args is None:
+            return None
+        input_a = str(mul_args[0]).strip()
+        input_b = str(mul_args[1]).strip()
+        resolved_a = _resolve_raw_pidnet_const_expr(input_a)
+        resolved_b = _resolve_raw_pidnet_const_expr(input_b)
+        if resolved_a is not None and resolved_b is None:
+            return indent, lhs, input_b, resolved_a[0]
+        if resolved_b is not None and resolved_a is None:
+            return indent, lhs, input_a, resolved_b[0]
+        return None
+
+    def _parse_raw_pidnet_scale3_mul_align_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, int] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, shape_expr = align_parts
+        rank4_shape = _parse_rank4_shape_literal(shape_expr)
+        if rank4_shape is None:
+            return None
+        if not (
+            int(rank4_shape[0]) == 1
+            and int(rank4_shape[2]) == 1
+            and int(rank4_shape[1]) > 1
+            and int(rank4_shape[3]) > 1
+        ):
+            return None
+        mul_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", input_expr.strip())
+        if mul_match is None:
+            return None
+        mul_args = _parse_binary_mul_args(str(mul_match.group("args")))
+        if mul_args is None:
+            return None
+        input_a = str(mul_args[0]).strip()
+        input_b = str(mul_args[1]).strip()
+        resolved_a = _resolve_raw_pidnet_const_expr(input_a)
+        resolved_b = _resolve_raw_pidnet_const_expr(input_b)
+        if resolved_a is not None and resolved_b is None:
+            return indent, lhs, input_b, resolved_a[0], int(rank4_shape[1])
+        if resolved_b is not None and resolved_a is None:
+            return indent, lhs, input_a, resolved_b[0], int(rank4_shape[1])
+        return None
+
+    def _parse_raw_pidnet_scale3_add_anchor_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, str, int] | None:
+        assign_match = re.match(
+            r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        rhs = str(assign_match.group("rhs")).strip()
+        prefix = "_align_binary_inputs_to_anchor("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        input_a: str | None = None
+        input_b: str | None = None
+        shape_expr: str | None = None
+        if len(parts) == 3 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input_a = parts[0].strip()
+            input_b = parts[1].strip()
+            shape_expr = parts[2].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_a = kwargs.get("input", kwargs.get("a"))
+            input_b = kwargs.get("other", kwargs.get("b"))
+            shape_expr = kwargs.get("target_shape", kwargs.get("shape"))
+        if input_a is None or input_b is None or shape_expr is None:
+            return None
+        rank4_shape = _parse_rank4_shape_literal(shape_expr)
+        if rank4_shape is None:
+            return None
+        if not (
+            int(rank4_shape[0]) == 1
+            and int(rank4_shape[2]) == 1
+            and int(rank4_shape[1]) > 1
+            and int(rank4_shape[3]) > 1
+        ):
+            return None
+        resolved_a = _resolve_raw_pidnet_const_expr(input_a)
+        resolved_b = _resolve_raw_pidnet_const_expr(input_b)
+        if resolved_a is not None and resolved_b is None:
+            return (
+                str(assign_match.group("indent")),
+                str(assign_match.group("lhs0")),
+                str(assign_match.group("lhs1")),
+                input_b,
+                resolved_a[0],
+                int(rank4_shape[1]),
+            )
+        if resolved_b is not None and resolved_a is None:
+            return (
+                str(assign_match.group("indent")),
+                str(assign_match.group("lhs0")),
+                str(assign_match.group("lhs1")),
+                input_a,
+                resolved_b[0],
+                int(rank4_shape[1]),
+            )
+        return None
+
+    def _parse_raw_pidnet_scale3_const_anchor_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, str, int] | None:
+        parsed = _parse_raw_pidnet_scale3_add_anchor_assign(line)
+        if parsed is None:
+            return None
+        indent, lhs0, lhs1, input_name, const_expr, channel_count = parsed
+        if _resolve_raw_pidnet_const_expr(const_expr) is None and not str(const_expr).startswith("self."):
+            return None
+        return indent, lhs0, lhs1, input_name, const_expr, channel_count
+
+    def _parse_raw_pidnet_scale4_add_anchor_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, str, int] | None:
+        assign_match = re.match(
+            r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        rhs = str(assign_match.group("rhs")).strip()
+        prefix = "_align_binary_inputs_to_anchor("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        input_a: str | None = None
+        input_b: str | None = None
+        shape_expr: str | None = None
+        if len(parts) == 3 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input_a = parts[0].strip()
+            input_b = parts[1].strip()
+            shape_expr = parts[2].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_a = kwargs.get("input", kwargs.get("a"))
+            input_b = kwargs.get("other", kwargs.get("b"))
+            shape_expr = kwargs.get("target_shape", kwargs.get("shape"))
+        if input_a is None or input_b is None or shape_expr is None:
+            return None
+        rank4_shape = _parse_rank4_shape_literal(shape_expr)
+        if rank4_shape is None:
+            return None
+        if not (
+            int(rank4_shape[0]) == 1
+            and int(rank4_shape[1]) == 1
+            and int(rank4_shape[2]) == 1
+            and int(rank4_shape[3]) > 1
+        ):
+            return None
+        resolved_a = _resolve_raw_pidnet_const_expr(input_a)
+        resolved_b = _resolve_raw_pidnet_const_expr(input_b)
+        if resolved_a is not None and resolved_b is None:
+            return (
+                str(assign_match.group("indent")),
+                str(assign_match.group("lhs0")),
+                str(assign_match.group("lhs1")),
+                input_b,
+                resolved_a[0],
+                int(rank4_shape[3]),
+            )
+        if resolved_b is not None and resolved_a is None:
+            return (
+                str(assign_match.group("indent")),
+                str(assign_match.group("lhs0")),
+                str(assign_match.group("lhs1")),
+                input_a,
+                resolved_b[0],
+                int(rank4_shape[3]),
+            )
+        return None
+
     inside_nms_method = False
     for index, line in enumerate(lines):
         stripped_line = line.strip()
@@ -21067,109 +22159,84 @@ def _canonicalize_generated_model_source_for_raw_export(
             lines[index] = scalar_as_tensor_replaced
             changed = True
             line = scalar_as_tensor_replaced
-        pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_re.match(line)
-        if pidnet_spp_scale3_mul_match is None:
-            pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_reversed_re.match(line)
-        pidnet_spp_scale3_anchor_match = pidnet_spp_scale3_anchor_re.match(line)
-        if (
-            pidnet_spp_scale3_anchor_match is not None
-            and _resolve_raw_pidnet_const_expr(str(pidnet_spp_scale3_anchor_match.group("const_expr"))) is None
-        ):
-            pidnet_spp_scale3_anchor_match = None
-        if pidnet_spp_scale3_anchor_match is None:
-            pidnet_spp_scale3_anchor_match = pidnet_spp_scale3_anchor_reversed_re.match(line)
-        if pidnet_spp_scale3_anchor_match is not None:
-            resolved_const_expr = _resolve_raw_pidnet_const_expr(
-                str(pidnet_spp_scale3_anchor_match.group("const_expr"))
-            )
-            if resolved_const_expr is None:
-                continue
-            const_expr_text, _ = resolved_const_expr
+        parsed_pidnet_spp_scale3_anchor = _parse_raw_pidnet_scale3_const_anchor_assign(line)
+        if parsed_pidnet_spp_scale3_anchor is not None:
+            (
+                pidnet_spp_scale3_anchor_indent,
+                pidnet_spp_scale3_anchor_lhs0,
+                pidnet_spp_scale3_anchor_lhs1,
+                pidnet_spp_scale3_anchor_input,
+                pidnet_spp_scale3_anchor_const_expr,
+                pidnet_spp_scale3_anchor_c,
+            ) = parsed_pidnet_spp_scale3_anchor
             lines[index] = (
-                f"{pidnet_spp_scale3_anchor_match.group('indent')}{pidnet_spp_scale3_anchor_match.group('lhs0')}, "
-                f"{pidnet_spp_scale3_anchor_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                f"{pidnet_spp_scale3_anchor_match.group('input')}, "
-                f"torch.reshape({const_expr_text}, [1, {pidnet_spp_scale3_anchor_match.group('c')}, 1, 1]), "
-                f"[1, {pidnet_spp_scale3_anchor_match.group('c')}, 1, 1])"
+                f"{pidnet_spp_scale3_anchor_indent}{pidnet_spp_scale3_anchor_lhs0}, "
+                f"{pidnet_spp_scale3_anchor_lhs1} = _align_binary_inputs_to_anchor("
+                f"{pidnet_spp_scale3_anchor_input}, "
+                f"torch.reshape({pidnet_spp_scale3_anchor_const_expr}, [1, {pidnet_spp_scale3_anchor_c}, 1, 1]), "
+                f"[1, {pidnet_spp_scale3_anchor_c}, 1, 1])"
             )
             changed = True
             line = lines[index]
-        pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_re.match(line)
-        if (
-            pidnet_spp_scale3_mul_match is not None
-            and _resolve_raw_pidnet_const_expr(str(pidnet_spp_scale3_mul_match.group("const_expr"))) is None
-        ):
-            pidnet_spp_scale3_mul_match = None
-        if pidnet_spp_scale3_mul_match is None:
-            pidnet_spp_scale3_mul_match = pidnet_spp_scale3_mul_reversed_re.match(line)
-        if pidnet_spp_scale3_mul_match is not None:
-            resolved_const_expr = _resolve_raw_pidnet_const_expr(
-                str(pidnet_spp_scale3_mul_match.group("const_expr"))
-            )
-            if resolved_const_expr is None:
-                continue
-            const_expr_text, _ = resolved_const_expr
+        parsed_pidnet_spp_scale3_mul = _parse_raw_pidnet_scale3_mul_align_assign(line)
+        if parsed_pidnet_spp_scale3_mul is not None:
+            pidnet_spp_scale3_mul_indent, pidnet_spp_scale3_mul_lhs, pidnet_spp_scale3_mul_input, pidnet_spp_scale3_mul_const_expr, pidnet_spp_scale3_mul_c = parsed_pidnet_spp_scale3_mul
             lines[index] = (
-                f"{pidnet_spp_scale3_mul_match.group('indent')}{pidnet_spp_scale3_mul_match.group('lhs')} = "
-                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_match.group('input')}, "
-                f"{const_expr_text}), [1, {pidnet_spp_scale3_mul_match.group('c')}, 1, 1])"
+                f"{pidnet_spp_scale3_mul_indent}{pidnet_spp_scale3_mul_lhs} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_input}, "
+                f"{pidnet_spp_scale3_mul_const_expr}), [1, {pidnet_spp_scale3_mul_c}, 1, 1])"
             )
             changed = True
             line = lines[index]
-        pidnet_spp_scale3_add_match = pidnet_spp_scale3_add_re.match(line)
-        if (
-            pidnet_spp_scale3_add_match is not None
-            and _resolve_raw_pidnet_const_expr(str(pidnet_spp_scale3_add_match.group("const_expr"))) is None
-        ):
-            pidnet_spp_scale3_add_match = None
-        if pidnet_spp_scale3_add_match is None:
-            pidnet_spp_scale3_add_match = pidnet_spp_scale3_add_reversed_re.match(line)
-        if (
-            pidnet_spp_scale3_add_match is not None
-            and int(pidnet_spp_scale3_add_match.group("c")) != 1
-        ):
-            resolved_const_expr = _resolve_raw_pidnet_const_expr(
-                str(pidnet_spp_scale3_add_match.group("const_expr"))
-            )
-            if resolved_const_expr is None:
-                continue
-            const_expr_text, _ = resolved_const_expr
+        parsed_pidnet_spp_scale3_add = _parse_raw_pidnet_scale3_add_anchor_assign(line)
+        if parsed_pidnet_spp_scale3_add is not None:
+            (
+                pidnet_spp_scale3_add_indent,
+                pidnet_spp_scale3_add_lhs0,
+                pidnet_spp_scale3_add_lhs1,
+                pidnet_spp_scale3_add_input,
+                pidnet_spp_scale3_add_const_expr,
+                pidnet_spp_scale3_add_c,
+            ) = parsed_pidnet_spp_scale3_add
             lines[index] = (
-                f"{pidnet_spp_scale3_add_match.group('indent')}{pidnet_spp_scale3_add_match.group('lhs0')}, "
-                f"{pidnet_spp_scale3_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                f"{pidnet_spp_scale3_add_match.group('input')}, "
-                f"torch.reshape({const_expr_text}, [1, {pidnet_spp_scale3_add_match.group('c')}, 1, 1]), "
-                f"[1, {pidnet_spp_scale3_add_match.group('c')}, 1, 1])"
+                f"{pidnet_spp_scale3_add_indent}{pidnet_spp_scale3_add_lhs0}, "
+                f"{pidnet_spp_scale3_add_lhs1} = _align_binary_inputs_to_anchor("
+                f"{pidnet_spp_scale3_add_input}, "
+                f"torch.reshape({pidnet_spp_scale3_add_const_expr}, [1, {pidnet_spp_scale3_add_c}, 1, 1]), "
+                f"[1, {pidnet_spp_scale3_add_c}, 1, 1])"
             )
             changed = True
             line = lines[index]
-        pidnet_spp_scale3_mul_out_match = pidnet_spp_scale3_mul_out_re.match(line)
-        if pidnet_spp_scale3_mul_out_match is not None:
+        parsed_pidnet_spp_scale3_mul_out = _parse_raw_pidnet_align_binary_out_assign(line, "mul")
+        if (
+            parsed_pidnet_spp_scale3_mul_out is not None
+            and parsed_pidnet_spp_scale3_mul_out[4][0] == 1
+            and parsed_pidnet_spp_scale3_mul_out[4][2] == 1
+        ):
+            pidnet_spp_scale3_mul_out_indent, pidnet_spp_scale3_mul_out_lhs, pidnet_spp_scale3_mul_out_a, pidnet_spp_scale3_mul_out_b, pidnet_spp_scale3_mul_out_shape = parsed_pidnet_spp_scale3_mul_out
             lines[index] = (
-                f"{pidnet_spp_scale3_mul_out_match.group('indent')}{pidnet_spp_scale3_mul_out_match.group('lhs')} = "
-                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_out_match.group('a')}, "
-                f"{pidnet_spp_scale3_mul_out_match.group('b')}), [1, {pidnet_spp_scale3_mul_out_match.group('c')}, 1, 1])"
+                f"{pidnet_spp_scale3_mul_out_indent}{pidnet_spp_scale3_mul_out_lhs} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_out_a}, "
+                f"{pidnet_spp_scale3_mul_out_b}), [1, {pidnet_spp_scale3_mul_out_shape[1]}, 1, 1])"
             )
             changed = True
             line = lines[index]
-        pidnet_spp_scale4_mul_match = pidnet_spp_scale4_mul_re.match(line)
-        if (
-            pidnet_spp_scale4_mul_match is not None
-            and _resolve_raw_pidnet_const_expr(str(pidnet_spp_scale4_mul_match.group("const_expr"))) is None
-        ):
-            pidnet_spp_scale4_mul_match = None
-        if pidnet_spp_scale4_mul_match is None:
-            pidnet_spp_scale4_mul_match = pidnet_spp_scale4_mul_reversed_re.match(line)
-        if pidnet_spp_scale4_mul_match is not None:
-            resolved_const_expr = _resolve_raw_pidnet_const_expr(
-                str(pidnet_spp_scale4_mul_match.group("const_expr"))
+        parsed_pidnet_spp_scale4_direct_mul = _parse_raw_pidnet_scale4_direct_mul_assign(line)
+        if parsed_pidnet_spp_scale4_direct_mul is not None:
+            (
+                pidnet_spp_scale4_mul_indent,
+                pidnet_spp_scale4_mul_lhs,
+                pidnet_spp_scale4_mul_input,
+                pidnet_spp_scale4_mul_const_expr,
+            ) = parsed_pidnet_spp_scale4_direct_mul
+            const_attr_name = (
+                str(pidnet_spp_scale4_mul_const_expr)[len("self.") :]
+                if str(pidnet_spp_scale4_mul_const_expr).startswith("self.")
+                else str(pidnet_spp_scale4_mul_const_expr)
             )
-            if resolved_const_expr is None:
-                continue
-            const_expr_text, const_attr_name = resolved_const_expr
-            preferred_channels = _infer_cf_channel_count(str(pidnet_spp_scale4_mul_match.group("input")))
+            preferred_channels = _infer_cf_channel_count(str(pidnet_spp_scale4_mul_input))
             if preferred_channels is None:
-                recent_shape = _find_recent_rank4_shape(str(pidnet_spp_scale4_mul_match.group("input")), index)
+                recent_shape = _find_recent_rank4_shape(str(pidnet_spp_scale4_mul_input), index)
                 if recent_shape is not None and len(recent_shape) == 4:
                     preferred_channels = int(recent_shape[1])
             if preferred_channels is None:
@@ -21178,120 +22245,130 @@ def _canonicalize_generated_model_source_for_raw_export(
                 continue
             channel_count = int(preferred_channels)
             lines[index] = (
-                f"{pidnet_spp_scale4_mul_match.group('indent')}{pidnet_spp_scale4_mul_match.group('lhs')} = "
-                f"torch.mul({pidnet_spp_scale4_mul_match.group('input')}, "
-                f"torch.reshape({const_expr_text}, [1, {channel_count}, 1, 1]))"
+                f"{pidnet_spp_scale4_mul_indent}{pidnet_spp_scale4_mul_lhs} = "
+                f"torch.mul({pidnet_spp_scale4_mul_input}, "
+                f"torch.reshape({pidnet_spp_scale4_mul_const_expr}, [1, {channel_count}, 1, 1]))"
             )
             changed = True
             line = lines[index]
-        pidnet_spp_scale4_mul_reshape_match = pidnet_spp_scale4_mul_reshape_re.match(line)
-        if (
-            pidnet_spp_scale4_mul_reshape_match is not None
-            and _resolve_raw_pidnet_const_expr(str(pidnet_spp_scale4_mul_reshape_match.group("const_expr"))) is None
-        ):
-            pidnet_spp_scale4_mul_reshape_match = None
-        if pidnet_spp_scale4_mul_reshape_match is None:
-            pidnet_spp_scale4_mul_reshape_match = pidnet_spp_scale4_mul_reshape_reversed_re.match(line)
-        if pidnet_spp_scale4_mul_reshape_match is not None:
-            resolved_const_expr = _resolve_raw_pidnet_const_expr(
-                str(pidnet_spp_scale4_mul_reshape_match.group("const_expr"))
-            )
-            if resolved_const_expr is None:
-                continue
-            const_expr_text, _ = resolved_const_expr
+        parsed_pidnet_spp_scale4_mul_reshape = _parse_raw_pidnet_scale4_mul_reshape_assign(line)
+        if parsed_pidnet_spp_scale4_mul_reshape is not None:
+            (
+                pidnet_spp_scale4_mul_reshape_indent,
+                pidnet_spp_scale4_mul_reshape_lhs,
+                pidnet_spp_scale4_mul_reshape_input,
+                pidnet_spp_scale4_mul_reshape_const_expr,
+                pidnet_spp_scale4_mul_reshape_c,
+            ) = parsed_pidnet_spp_scale4_mul_reshape
             lines[index] = (
-                f"{pidnet_spp_scale4_mul_reshape_match.group('indent')}{pidnet_spp_scale4_mul_reshape_match.group('lhs')} = "
-                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_match.group('input')}, "
-                f"torch.reshape({const_expr_text}, [1, {pidnet_spp_scale4_mul_reshape_match.group('c')}, 1, 1])), [1, {pidnet_spp_scale4_mul_reshape_match.group('c')}, 1, 1])"
+                f"{pidnet_spp_scale4_mul_reshape_indent}{pidnet_spp_scale4_mul_reshape_lhs} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_input}, "
+                f"torch.reshape({pidnet_spp_scale4_mul_reshape_const_expr}, [1, {pidnet_spp_scale4_mul_reshape_c}, 1, 1])), "
+                f"[1, {pidnet_spp_scale4_mul_reshape_c}, 1, 1])"
             )
             changed = True
             line = lines[index]
-        pidnet_spp_scale4_mul_reshape_variant_match = pidnet_spp_scale4_mul_reshape_variant_re.match(line)
-        if pidnet_spp_scale4_mul_reshape_variant_match is None:
-            pidnet_spp_scale4_mul_reshape_variant_match = (
-                pidnet_spp_scale4_mul_reshape_variant_reversed_re.match(line)
+        parsed_pidnet_spp_scale4_mul_reshape_variant = _parse_raw_pidnet_scale4_mul_reshape_variant_assign(line)
+        if parsed_pidnet_spp_scale4_mul_reshape_variant is not None:
+            (
+                pidnet_spp_scale4_mul_reshape_variant_indent,
+                pidnet_spp_scale4_mul_reshape_variant_lhs,
+                pidnet_spp_scale4_mul_reshape_variant_input,
+                pidnet_spp_scale4_mul_reshape_variant_const_expr,
+                pidnet_spp_scale4_mul_reshape_variant_c,
+            ) = parsed_pidnet_spp_scale4_mul_reshape_variant
+            lines[index] = (
+                f"{pidnet_spp_scale4_mul_reshape_variant_indent}{pidnet_spp_scale4_mul_reshape_variant_lhs} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_input}, "
+                f"torch.reshape({pidnet_spp_scale4_mul_reshape_variant_const_expr}, [1, {pidnet_spp_scale4_mul_reshape_variant_c}, 1, 1])), "
+                f"[1, {pidnet_spp_scale4_mul_reshape_variant_c}, 1, 1])"
             )
-        if pidnet_spp_scale4_mul_reshape_variant_match is not None:
-            resolved_const_expr = _resolve_raw_pidnet_const_expr(
-                str(pidnet_spp_scale4_mul_reshape_variant_match.group("const_expr"))
+            changed = True
+            line = lines[index]
+        else:
+            parsed_pidnet_spp_scale4_mul_reshape_variant_reversed = (
+                _parse_raw_pidnet_scale4_mul_reshape_variant_reversed_assign(line)
             )
-            if resolved_const_expr is None:
-                continue
-            const_expr_text, const_attr_name = resolved_const_expr
-            preferred_channels = _infer_cf_channel_count(
-                str(pidnet_spp_scale4_mul_reshape_variant_match.group("input"))
-            )
-            if preferred_channels is None:
-                recent_shape = _find_recent_rank4_shape(
-                    str(pidnet_spp_scale4_mul_reshape_variant_match.group("input")),
-                    index,
+            if parsed_pidnet_spp_scale4_mul_reshape_variant_reversed is not None:
+                (
+                    pidnet_spp_scale4_mul_reshape_variant_indent,
+                    pidnet_spp_scale4_mul_reshape_variant_lhs,
+                    pidnet_spp_scale4_mul_reshape_variant_input,
+                    pidnet_spp_scale4_mul_reshape_variant_const_expr,
+                    pidnet_spp_scale4_mul_reshape_variant_c,
+                ) = parsed_pidnet_spp_scale4_mul_reshape_variant_reversed
+                lines[index] = (
+                    f"{pidnet_spp_scale4_mul_reshape_variant_indent}{pidnet_spp_scale4_mul_reshape_variant_lhs} = "
+                    f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_input}, "
+                    f"torch.reshape({pidnet_spp_scale4_mul_reshape_variant_const_expr}, [1, {pidnet_spp_scale4_mul_reshape_variant_c}, 1, 1])), "
+                    f"[1, {pidnet_spp_scale4_mul_reshape_variant_c}, 1, 1])"
                 )
-                if recent_shape is not None and len(recent_shape) == 4:
-                    preferred_channels = int(recent_shape[1])
-            if preferred_channels is None:
-                preferred_channels = _buffer_channel_count(const_attr_name)
-            channel_count = (
-                int(preferred_channels)
-                if preferred_channels is not None
-                else int(pidnet_spp_scale4_mul_reshape_variant_match.group("c"))
-            )
+                changed = True
+                line = lines[index]
+        parsed_pidnet_spp_scale4_add = _parse_raw_pidnet_scale4_add_anchor_assign(line)
+        if parsed_pidnet_spp_scale4_add is not None:
+            (
+                pidnet_spp_scale4_add_indent,
+                pidnet_spp_scale4_add_lhs0,
+                pidnet_spp_scale4_add_lhs1,
+                pidnet_spp_scale4_add_input,
+                pidnet_spp_scale4_add_const_expr,
+                pidnet_spp_scale4_add_c,
+            ) = parsed_pidnet_spp_scale4_add
             lines[index] = (
-                f"{pidnet_spp_scale4_mul_reshape_variant_match.group('indent')}{pidnet_spp_scale4_mul_reshape_variant_match.group('lhs')} = "
-                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_match.group('input')}, "
-                f"torch.reshape({const_expr_text}, [1, {channel_count}, 1, 1])), [1, {channel_count}, 1, 1])"
-            )
-            changed = True
-            line = lines[index]
-        pidnet_spp_scale4_add_match = pidnet_spp_scale4_add_re.match(line)
-        if (
-            pidnet_spp_scale4_add_match is not None
-            and _resolve_raw_pidnet_const_expr(str(pidnet_spp_scale4_add_match.group("const_expr"))) is None
-        ):
-            pidnet_spp_scale4_add_match = None
-        if pidnet_spp_scale4_add_match is None:
-            pidnet_spp_scale4_add_match = pidnet_spp_scale4_add_reversed_re.match(line)
-        if pidnet_spp_scale4_add_match is not None:
-            resolved_const_expr = _resolve_raw_pidnet_const_expr(
-                str(pidnet_spp_scale4_add_match.group("const_expr"))
-            )
-            if resolved_const_expr is None:
-                continue
-            const_expr_text, _ = resolved_const_expr
-            lines[index] = (
-                f"{pidnet_spp_scale4_add_match.group('indent')}{pidnet_spp_scale4_add_match.group('lhs0')}, "
-                f"{pidnet_spp_scale4_add_match.group('lhs1')} = _align_binary_inputs_to_anchor("
-                f"{pidnet_spp_scale4_add_match.group('input')}, "
-                f"torch.reshape({const_expr_text}, [1, {pidnet_spp_scale4_add_match.group('c')}, 1, 1]), "
-                f"[1, {pidnet_spp_scale4_add_match.group('c')}, 1, 1])"
+                f"{pidnet_spp_scale4_add_indent}{pidnet_spp_scale4_add_lhs0}, "
+                f"{pidnet_spp_scale4_add_lhs1} = _align_binary_inputs_to_anchor("
+                f"{pidnet_spp_scale4_add_input}, "
+                f"torch.reshape({pidnet_spp_scale4_add_const_expr}, [1, {pidnet_spp_scale4_add_c}, 1, 1]), "
+                f"[1, {pidnet_spp_scale4_add_c}, 1, 1])"
             )
             changed = True
             line = lines[index]
             continue
-        pidnet_pag4_mul2_out_match = pidnet_pag4_mul2_out_re.match(line)
-        if pidnet_pag4_mul2_out_match is not None:
+        parsed_pidnet_pag4_mul2_out = _parse_raw_pidnet_align_binary_out_assign(line, "mul")
+        if (
+            parsed_pidnet_pag4_mul2_out is not None
+            and parsed_pidnet_pag4_mul2_out[4][0] == 1
+            and parsed_pidnet_pag4_mul2_out[4][2] > 1
+            and parsed_pidnet_pag4_mul2_out[4][3] > 1
+        ):
+            pidnet_pag4_mul2_out_indent, pidnet_pag4_mul2_out_lhs, pidnet_pag4_mul2_out_a, pidnet_pag4_mul2_out_b, pidnet_pag4_mul2_out_shape = parsed_pidnet_pag4_mul2_out
             lines[index] = (
-                f"{pidnet_pag4_mul2_out_match.group('indent')}{pidnet_pag4_mul2_out_match.group('lhs')} = "
-                f"_align_tensor_to_target_shape(torch.mul({pidnet_pag4_mul2_out_match.group('a')}, "
-                f"{pidnet_pag4_mul2_out_match.group('b')}), [1, {pidnet_pag4_mul2_out_match.group('c')}, {pidnet_pag4_mul2_out_match.group('h')}, {pidnet_pag4_mul2_out_match.group('w')}])"
+                f"{pidnet_pag4_mul2_out_indent}{pidnet_pag4_mul2_out_lhs} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_pag4_mul2_out_a}, "
+                f"{pidnet_pag4_mul2_out_b}), "
+                f"[1, {pidnet_pag4_mul2_out_shape[1]}, {pidnet_pag4_mul2_out_shape[2]}, {pidnet_pag4_mul2_out_shape[3]}])"
             )
-            cf_aliases.add(str(pidnet_pag4_mul2_out_match.group("lhs")))
+            cf_aliases.add(str(pidnet_pag4_mul2_out_lhs))
             changed = True
             line = lines[index]
-        pidnet_spp_scale3_add_out_match = pidnet_spp_scale3_add_out_re.match(line)
-        if pidnet_spp_scale3_add_out_match is not None:
+        parsed_pidnet_spp_scale3_add_out = _parse_raw_pidnet_align_binary_out_assign(line, "add")
+        if (
+            parsed_pidnet_spp_scale3_add_out is not None
+            and parsed_pidnet_spp_scale3_add_out[4][0] == 1
+            and parsed_pidnet_spp_scale3_add_out[4][2] == 1
+            and parsed_pidnet_spp_scale3_add_out[4][1] == parsed_pidnet_spp_scale3_add_out[4][3]
+        ):
+            pidnet_spp_scale3_add_out_indent, pidnet_spp_scale3_add_out_lhs, pidnet_spp_scale3_add_out_a, pidnet_spp_scale3_add_out_b, pidnet_spp_scale3_add_out_shape = parsed_pidnet_spp_scale3_add_out
             lines[index] = (
-                f"{pidnet_spp_scale3_add_out_match.group('indent')}{pidnet_spp_scale3_add_out_match.group('lhs')} = "
-                f"_align_tensor_to_target_shape(torch.add({pidnet_spp_scale3_add_out_match.group('a')}, "
-                f"{pidnet_spp_scale3_add_out_match.group('b')}), [1, {pidnet_spp_scale3_add_out_match.group('c')}, 1, 1])"
+                f"{pidnet_spp_scale3_add_out_indent}{pidnet_spp_scale3_add_out_lhs} = "
+                f"_align_tensor_to_target_shape(torch.add({pidnet_spp_scale3_add_out_a}, "
+                f"{pidnet_spp_scale3_add_out_b}), [1, {pidnet_spp_scale3_add_out_shape[1]}, 1, 1])"
             )
             changed = True
             line = lines[index]
-        pidnet_spp_scale4_add_out_match = pidnet_spp_scale4_add_out_re.match(line)
-        if pidnet_spp_scale4_add_out_match is not None:
+        parsed_pidnet_spp_scale4_add_out = _parse_raw_pidnet_reshape_binary_out_assign(line, "add")
+        if (
+            parsed_pidnet_spp_scale4_add_out is not None
+            and parsed_pidnet_spp_scale4_add_out[4][0] == 1
+            and parsed_pidnet_spp_scale4_add_out[4][1] == 1
+            and parsed_pidnet_spp_scale4_add_out[4][2] == 1
+        ):
+            pidnet_spp_scale4_add_out_indent, pidnet_spp_scale4_add_out_lhs, pidnet_spp_scale4_add_out_a, pidnet_spp_scale4_add_out_b, pidnet_spp_scale4_add_out_shape = parsed_pidnet_spp_scale4_add_out
             lines[index] = (
-                f"{pidnet_spp_scale4_add_out_match.group('indent')}{pidnet_spp_scale4_add_out_match.group('lhs')} = "
-                f"_align_tensor_to_target_shape(torch.add({pidnet_spp_scale4_add_out_match.group('a')}, "
-                f"{pidnet_spp_scale4_add_out_match.group('b')}), [1, {pidnet_spp_scale4_add_out_match.group('c')}, 1, 1])"
+                f"{pidnet_spp_scale4_add_out_indent}{pidnet_spp_scale4_add_out_lhs} = "
+                f"_align_tensor_to_target_shape(torch.add({pidnet_spp_scale4_add_out_a}, "
+                f"{pidnet_spp_scale4_add_out_b}), [1, {pidnet_spp_scale4_add_out_shape[3]}, 1, 1])"
             )
             changed = True
             line = lines[index]
@@ -25102,42 +26179,43 @@ def _canonicalize_generated_model_source_for_raw_export(
             current_function_assigned.add(assigned_name)
             current_function_defined.add(assigned_name)
     for index, line in enumerate(lines):
-        pidnet_spp_scale4_mul_reshape_variant_match = pidnet_spp_scale4_mul_reshape_variant_re.match(line)
-        if pidnet_spp_scale4_mul_reshape_variant_match is None:
-            pidnet_spp_scale4_mul_reshape_variant_match = (
-                pidnet_spp_scale4_mul_reshape_variant_reversed_re.match(line)
+        parsed_pidnet_spp_scale4_mul_reshape_variant = _parse_raw_pidnet_scale4_mul_reshape_variant_assign(line)
+        if parsed_pidnet_spp_scale4_mul_reshape_variant is not None:
+            (
+                pidnet_spp_scale4_mul_reshape_variant_indent,
+                pidnet_spp_scale4_mul_reshape_variant_lhs,
+                pidnet_spp_scale4_mul_reshape_variant_input,
+                pidnet_spp_scale4_mul_reshape_variant_const_expr,
+                pidnet_spp_scale4_mul_reshape_variant_c,
+            ) = parsed_pidnet_spp_scale4_mul_reshape_variant
+            lines[index] = (
+                f"{pidnet_spp_scale4_mul_reshape_variant_indent}{pidnet_spp_scale4_mul_reshape_variant_lhs} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_input}, "
+                f"torch.reshape({pidnet_spp_scale4_mul_reshape_variant_const_expr}, [1, {pidnet_spp_scale4_mul_reshape_variant_c}, 1, 1])), "
+                f"[1, {pidnet_spp_scale4_mul_reshape_variant_c}, 1, 1])"
             )
-        if pidnet_spp_scale4_mul_reshape_variant_match is None:
+            changed = True
             continue
-        resolved_const_expr = _resolve_raw_pidnet_const_expr(
-            str(pidnet_spp_scale4_mul_reshape_variant_match.group("const_expr"))
+        parsed_pidnet_spp_scale4_mul_reshape_variant_reversed = (
+            _parse_raw_pidnet_scale4_mul_reshape_variant_reversed_assign(line)
         )
-        if resolved_const_expr is None:
-            continue
-        const_expr_text, const_attr_name = resolved_const_expr
-        preferred_channels = _infer_cf_channel_count(
-            str(pidnet_spp_scale4_mul_reshape_variant_match.group("input"))
-        )
-        if preferred_channels is None:
-            recent_shape = _find_recent_rank4_shape(
-                str(pidnet_spp_scale4_mul_reshape_variant_match.group("input")),
-                index,
+        if parsed_pidnet_spp_scale4_mul_reshape_variant_reversed is not None:
+            (
+                pidnet_spp_scale4_mul_reshape_variant_indent,
+                pidnet_spp_scale4_mul_reshape_variant_lhs,
+                pidnet_spp_scale4_mul_reshape_variant_input,
+                pidnet_spp_scale4_mul_reshape_variant_const_expr,
+                pidnet_spp_scale4_mul_reshape_variant_c,
+            ) = parsed_pidnet_spp_scale4_mul_reshape_variant_reversed
+            lines[index] = (
+                f"{pidnet_spp_scale4_mul_reshape_variant_indent}{pidnet_spp_scale4_mul_reshape_variant_lhs} = "
+                f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_input}, "
+                f"torch.reshape({pidnet_spp_scale4_mul_reshape_variant_const_expr}, [1, {pidnet_spp_scale4_mul_reshape_variant_c}, 1, 1])), "
+                f"[1, {pidnet_spp_scale4_mul_reshape_variant_c}, 1, 1])"
             )
-            if recent_shape is not None and len(recent_shape) == 4:
-                preferred_channels = int(recent_shape[1])
-        if preferred_channels is None:
-            preferred_channels = _buffer_channel_count(const_attr_name)
-        channel_count = (
-            int(preferred_channels)
-            if preferred_channels is not None
-            else int(pidnet_spp_scale4_mul_reshape_variant_match.group("c"))
-        )
-        lines[index] = (
-            f"{pidnet_spp_scale4_mul_reshape_variant_match.group('indent')}{pidnet_spp_scale4_mul_reshape_variant_match.group('lhs')} = "
-            f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale4_mul_reshape_variant_match.group('input')}, "
-            f"torch.reshape({const_expr_text}, [1, {channel_count}, 1, 1])), [1, {channel_count}, 1, 1])"
-        )
-        changed = True
+            changed = True
+            continue
+        continue
     for index, line in enumerate(lines):
         singleton_const_anchor_fix_match = singleton_const_anchor_fix_re.match(line)
         if singleton_const_anchor_fix_match is None:
@@ -25154,15 +26232,26 @@ def _canonicalize_generated_model_source_for_raw_export(
         )
         changed = True
     for index, line in enumerate(lines):
-        pidnet_spp_scale3_mul_out_match = pidnet_spp_scale3_mul_out_re.match(line)
-        if pidnet_spp_scale3_mul_out_match is None:
+        parsed_pidnet_spp_scale3_mul_out = _parse_raw_pidnet_align_binary_out_assign(line, "mul")
+        if (
+            parsed_pidnet_spp_scale3_mul_out is None
+            or parsed_pidnet_spp_scale3_mul_out[4][0] != 1
+            or parsed_pidnet_spp_scale3_mul_out[4][2] != 1
+        ):
             continue
-        if int(pidnet_spp_scale3_mul_out_match.group("d")) == 1:
+        if int(parsed_pidnet_spp_scale3_mul_out[4][3]) == 1:
             continue
+        (
+            pidnet_spp_scale3_mul_out_indent,
+            pidnet_spp_scale3_mul_out_lhs,
+            pidnet_spp_scale3_mul_out_a,
+            pidnet_spp_scale3_mul_out_b,
+            pidnet_spp_scale3_mul_out_shape,
+        ) = parsed_pidnet_spp_scale3_mul_out
         lines[index] = (
-            f"{pidnet_spp_scale3_mul_out_match.group('indent')}{pidnet_spp_scale3_mul_out_match.group('lhs')} = "
-            f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_out_match.group('a')}, "
-            f"{pidnet_spp_scale3_mul_out_match.group('b')}), [1, {pidnet_spp_scale3_mul_out_match.group('c')}, 1, 1])"
+            f"{pidnet_spp_scale3_mul_out_indent}{pidnet_spp_scale3_mul_out_lhs} = "
+            f"_align_tensor_to_target_shape(torch.mul({pidnet_spp_scale3_mul_out_a}, "
+            f"{pidnet_spp_scale3_mul_out_b}), [1, {pidnet_spp_scale3_mul_out_shape[1]}, 1, 1])"
         )
         changed = True
     for index in range(len(lines) - 1):
@@ -32385,12 +33474,14 @@ def _is_bread_resize_like_expr(expr: str, known_resize_outputs: Set[str]) -> boo
 
 def _parse_binary_add_args(expr: str) -> Tuple[str, str] | None:
     parts = _split_top_level_csv_exprs(str(expr))
-    if len(parts) == 2 and all("=" not in part for part in parts):
+    if len(parts) == 2 and all(
+        re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+    ):
         return parts[0].strip(), parts[1].strip()
 
     kwargs: Dict[str, str] = {}
     for part in parts:
-        if "=" not in part:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
             continue
         key, value = part.split("=", 1)
         kwargs[key.strip()] = value.strip()
@@ -32403,12 +33494,14 @@ def _parse_binary_add_args(expr: str) -> Tuple[str, str] | None:
 
 def _parse_binary_mul_args(expr: str) -> Tuple[str, str] | None:
     parts = _split_top_level_csv_exprs(str(expr))
-    if len(parts) == 2 and all("=" not in part for part in parts):
+    if len(parts) == 2 and all(
+        re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+    ):
         return parts[0].strip(), parts[1].strip()
 
     kwargs: Dict[str, str] = {}
     for part in parts:
-        if "=" not in part:
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
             continue
         key, value = part.split("=", 1)
         kwargs[key.strip()] = value.strip()
@@ -33607,52 +34700,6 @@ def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
 
 
 def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
-    pad_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), "
-        r"[\[\(](?P<p0>\d+), (?P<p1>\d+), (?P<p2>\d+), (?P<p3>\d+)[\]\)], mode='constant', value=0\.0\)$"
-    )
-    global_mean_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=[\[\(]2, 3[\]\)], keepdim=True\)$"
-    )
-    self_const_alias_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*self\.(?P<const_attr>[A-Za-z0-9_]+)\s*\)*$"
-    )
-    generic_alias_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*$"
-    )
-    tuple_const_alias_re = re.compile(
-        r"^\s*\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*,\s*"
-        r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*"
-        r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*$"
-    )
-    const_pair_alias_re = re.compile(
-        r"^\s*(?P<pair>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*"
-        r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*$"
-    )
-    tuple_const_unpack_re = re.compile(
-        r"^\s*\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*,\s*"
-        r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*$"
-    )
-    scale4_mul_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.mul\(\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, "
-        r"torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\)\)$"
-    )
-    scale4_mul_reversed_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.mul\(torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), "
-        r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*\)$"
-    )
-    scale4_add_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\(\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, "
-        r"torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), [\[\(]1, \d+, 1, 1[\]\)]\)$"
-    )
-    scale4_add_reversed_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+, [A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\(torch\.reshape\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\), "
-        r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, [\[\(]1, \d+, 1, 1[\]\)]\)$"
-    )
-    pag_mul_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.mul\(\(*\s*(?P<a>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<b>[A-Za-z0-9_]+)\s*\)*\), [\[\(]1, \d+, \d+, \d+[\]\)]\)$"
-    )
-
     padded_inputs: Set[str] = set()
     mean_inputs: Set[str] = set()
     scale4_mul_inputs: Set[str] = set()
@@ -33683,14 +34730,219 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
                 return None
             resolved = aliased
 
-    def _parse_pidnet_skip_scale4_const_reshape(expr: str) -> str | None:
-        reshape_match = re.fullmatch(
-            r"torch\.reshape\(\(*\s*(?P<input>.+?)\s*\)*,\s*[\[\(]\s*1\s*,\s*\d+\s*,\s*1\s*,\s*1\s*[\]\)]\)",
-            str(expr).strip(),
+    def _parse_pidnet_skip_plain_alias(line: str) -> tuple[str, str] | None:
+        assign_match = re.match(
+            r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*(?P<rhs>.+)$",
+            str(line),
         )
-        if reshape_match is None:
+        if assign_match is None:
             return None
-        return _resolve_const_expr(str(reshape_match.group("input")).strip())
+        lhs = str(assign_match.group("lhs"))
+        rhs = str(assign_match.group("rhs")).strip()
+        rhs_match = re.fullmatch(
+            r"\(*\s*(?P<input>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*",
+            rhs,
+        )
+        if rhs_match is None:
+            return None
+        return lhs, str(rhs_match.group("input"))
+
+    def _parse_pidnet_skip_const_pair_alias(
+        line: str,
+    ) -> tuple[str, str, str] | None:
+        assign_match = re.match(
+            r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*(?P<rhs>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        lhs = str(assign_match.group("lhs"))
+        rhs = str(assign_match.group("rhs")).strip()
+        rhs_match = re.fullmatch(
+            r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*",
+            rhs,
+        )
+        if rhs_match is None:
+            return None
+        return lhs, str(rhs_match.group("input0")), str(rhs_match.group("input1"))
+
+    def _parse_pidnet_skip_tuple_const_alias(
+        line: str,
+    ) -> tuple[str, str, str, str] | None:
+        assign_match = re.match(
+            r"^\s*\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*,\s*"
+            r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        rhs = str(assign_match.group("rhs")).strip()
+        rhs_match = re.fullmatch(
+            r"\(*\s*\(*(?P<input0>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*,\s*\(*(?P<input1>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*\s*\)*",
+            rhs,
+        )
+        if rhs_match is None:
+            return None
+        return (
+            str(assign_match.group("lhs0")),
+            str(assign_match.group("lhs1")),
+            str(rhs_match.group("input0")),
+            str(rhs_match.group("input1")),
+        )
+
+    def _parse_pidnet_skip_tuple_const_unpack(
+        line: str,
+    ) -> tuple[str, str, str] | None:
+        assign_match = re.match(
+            r"^\s*\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*,\s*"
+            r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        rhs_match = re.fullmatch(r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*", str(assign_match.group("rhs")).strip())
+        if rhs_match is None:
+            return None
+        return (
+            str(assign_match.group("lhs0")),
+            str(assign_match.group("lhs1")),
+            str(rhs_match.group("input")),
+        )
+
+    def _parse_pidnet_skip_scale4_const_reshape(expr: str) -> str | None:
+        stripped = str(expr).strip()
+        input_expr: str | None = None
+        shape_expr: str | None = None
+
+        prefix = "torch.reshape("
+        if stripped.startswith(prefix) and stripped.endswith(")"):
+            parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+            positional_index = 0
+            for part in parts:
+                if "=" in part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                    key, value = part.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key == "input":
+                        input_expr = value
+                    elif key == "shape":
+                        shape_expr = value
+                    continue
+                if positional_index == 0:
+                    input_expr = part.strip()
+                elif positional_index == 1:
+                    shape_expr = part.strip()
+                positional_index += 1
+        else:
+            method_match = re.fullmatch(
+                r"(?P<input>[A-Za-z0-9_]+)\.(?:reshape|view)\((?P<shape>.+)\)",
+                stripped,
+            )
+            if method_match is None:
+                return None
+            input_expr = str(method_match.group("input"))
+            shape_expr = str(method_match.group("shape")).strip()
+        if input_expr is None or shape_expr is None:
+            return None
+        rank4_shape = _parse_rank4_shape_expr(shape_expr)
+        if rank4_shape is None:
+            return None
+        shape_values = [int(v) for v in list(rank4_shape)]
+        non_singleton = [int(v) for v in shape_values if int(v) > 1]
+        if len(non_singleton) != 1 or int(shape_values[0]) != 1:
+            return None
+        return _resolve_const_expr(input_expr)
+
+    def _parse_pidnet_skip_pad_input(line: str) -> str | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, _, rhs = assign
+        prefix = "F.pad("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        pad_expr: str | None = None
+        mode_expr: str | None = None
+        value_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if "=" in part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "pad":
+                    pad_expr = value
+                elif key == "mode":
+                    mode_expr = value
+                elif key == "value":
+                    value_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                pad_expr = part.strip()
+            elif positional_index == 2:
+                mode_expr = part.strip()
+            elif positional_index == 3:
+                value_expr = part.strip()
+            positional_index += 1
+        if input_expr is None or pad_expr is None or mode_expr != "'constant'" or value_expr != "0.0":
+            return None
+        pad_match = re.fullmatch(
+            r"[\[\(]\s*(?P<p0>\d+)\s*,\s*(?P<p1>\d+)\s*,\s*(?P<p2>\d+)\s*,\s*(?P<p3>\d+)\s*[\]\)]",
+            pad_expr,
+        )
+        if pad_match is None:
+            return None
+        pad_values = [int(pad_match.group(f"p{i}")) for i in range(4)]
+        if len(set(pad_values)) != 1 or int(pad_values[0]) <= 0:
+            return None
+        return _resolve_local_alias(input_expr)
+
+    def _parse_pidnet_skip_mean_input(line: str) -> str | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, _, rhs = assign
+        prefix = "torch.mean("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        dim_expr: str | None = None
+        keepdim_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if "=" in part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "dim":
+                    dim_expr = value
+                elif key == "keepdim":
+                    keepdim_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                dim_expr = part.strip()
+            elif positional_index == 2:
+                keepdim_expr = part.strip()
+            positional_index += 1
+        if input_expr is None or keepdim_expr != "True":
+            return None
+        dim_match = re.fullmatch(r"[\[\(]\s*2\s*,\s*3\s*[\]\)]", str(dim_expr).strip())
+        if dim_match is None:
+            return None
+        return _resolve_local_alias(input_expr)
 
     def _parse_pidnet_skip_scale4_mul_input(line: str) -> str | None:
         assign = _parse_simple_assignment_line(line)
@@ -33725,13 +34977,15 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
         parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
         input_a: str | None = None
         input_b: str | None = None
-        if len(parts) == 3 and all("=" not in part for part in parts):
+        if len(parts) == 3 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
             input_a = parts[0].strip()
             input_b = parts[1].strip()
         else:
             kwargs: Dict[str, str] = {}
             for part in parts:
-                if "=" not in part:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
                     continue
                 key, value = part.split("=", 1)
                 kwargs[key.strip()] = value.strip()
@@ -33745,103 +34999,94 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
             return _resolve_local_alias(input_a)
         return None
 
+    def _parse_pidnet_skip_pag_mul_pair(line: str) -> tuple[str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, _, rhs = assign
+        align_parts = _parse_align_tensor_target_shape_expr(rhs)
+        if align_parts is None:
+            return None
+        input_expr, _ = align_parts
+        mul_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", input_expr.strip())
+        if mul_match is None:
+            return None
+        mul_args = _parse_binary_mul_args(str(mul_match.group("args")))
+        if mul_args is None:
+            return None
+        lhs_root = _resolve_local_alias(str(mul_args[0]))
+        rhs_root = _resolve_local_alias(str(mul_args[1]))
+        if lhs_root == rhs_root:
+            return None
+        return tuple(sorted((lhs_root, rhs_root)))
+
     for line in lines:
         current_line = str(line)
-        pad_match = pad_re.match(current_line)
-        if pad_match is not None:
-            pad_values = [
-                int(pad_match.group("p0")),
-                int(pad_match.group("p1")),
-                int(pad_match.group("p2")),
-                int(pad_match.group("p3")),
-            ]
-            if len(set(pad_values)) == 1 and int(pad_values[0]) > 0:
-                padded_inputs.add(_resolve_local_alias(str(pad_match.group("input"))))
+        parsed_pad_input = _parse_pidnet_skip_pad_input(current_line)
+        if parsed_pad_input is not None:
+            padded_inputs.add(str(parsed_pad_input))
             continue
-        mean_match = global_mean_re.match(current_line)
-        if mean_match is not None:
-            mean_inputs.add(_resolve_local_alias(str(mean_match.group("input"))))
+        parsed_mean_input = _parse_pidnet_skip_mean_input(current_line)
+        if parsed_mean_input is not None:
+            mean_inputs.add(str(parsed_mean_input))
             continue
-        self_const_alias_match = self_const_alias_re.match(current_line)
-        if self_const_alias_match is not None:
-            const_alias_sources[str(self_const_alias_match.group("lhs"))] = (
-                f"self.{self_const_alias_match.group('const_attr')}"
-            )
+        parsed_plain_alias = _parse_pidnet_skip_plain_alias(current_line)
+        if parsed_plain_alias is not None and str(parsed_plain_alias[1]).startswith("self."):
+            const_alias_sources[str(parsed_plain_alias[0])] = str(parsed_plain_alias[1])
             continue
-        generic_alias_match = generic_alias_re.match(current_line)
-        if generic_alias_match is not None:
-            aliased_input = str(generic_alias_match.group("input"))
+        if parsed_plain_alias is not None:
+            aliased_input = str(parsed_plain_alias[1])
             if not aliased_input.startswith("self."):
-                local_alias_sources[str(generic_alias_match.group("lhs"))] = _resolve_local_alias(aliased_input)
+                local_alias_sources[str(parsed_plain_alias[0])] = _resolve_local_alias(aliased_input)
             aliased_attr = const_alias_sources.get(aliased_input, None)
             if aliased_attr is not None:
-                const_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_attr
+                const_alias_sources[str(parsed_plain_alias[0])] = aliased_attr
             aliased_pair = const_pair_alias_sources.get(aliased_input, None)
             if aliased_pair is not None:
-                const_pair_alias_sources[str(generic_alias_match.group("lhs"))] = aliased_pair
+                const_pair_alias_sources[str(parsed_plain_alias[0])] = aliased_pair
             continue
-        tuple_const_alias_match = tuple_const_alias_re.match(current_line)
-        if tuple_const_alias_match is not None:
+        parsed_tuple_const_alias = _parse_pidnet_skip_tuple_const_alias(current_line)
+        if parsed_tuple_const_alias is not None:
             tuple_pairs = (
-                (str(tuple_const_alias_match.group("lhs0")), str(tuple_const_alias_match.group("input0"))),
-                (str(tuple_const_alias_match.group("lhs1")), str(tuple_const_alias_match.group("input1"))),
+                (str(parsed_tuple_const_alias[0]), str(parsed_tuple_const_alias[2])),
+                (str(parsed_tuple_const_alias[1]), str(parsed_tuple_const_alias[3])),
             )
             for lhs_name, rhs_name in tuple_pairs:
                 resolved_const = _resolve_const_expr(rhs_name)
                 if resolved_const is not None:
                     const_alias_sources[lhs_name] = f"self.{resolved_const}"
             continue
-        const_pair_alias_match = const_pair_alias_re.match(current_line)
-        if const_pair_alias_match is not None:
-            input0_name = str(const_pair_alias_match.group("input0"))
-            input1_name = str(const_pair_alias_match.group("input1"))
+        parsed_const_pair_alias = _parse_pidnet_skip_const_pair_alias(current_line)
+        if parsed_const_pair_alias is not None:
+            input0_name = str(parsed_const_pair_alias[1])
+            input1_name = str(parsed_const_pair_alias[2])
             resolved0 = _resolve_const_expr(input0_name)
             resolved1 = _resolve_const_expr(input1_name)
             if resolved0 is not None and resolved1 is not None:
-                const_pair_alias_sources[str(const_pair_alias_match.group("pair"))] = (
+                const_pair_alias_sources[str(parsed_const_pair_alias[0])] = (
                     f"self.{resolved0}",
                     f"self.{resolved1}",
                 )
             continue
-        tuple_const_unpack_match = tuple_const_unpack_re.match(current_line)
-        if tuple_const_unpack_match is not None:
-            pair_sources = const_pair_alias_sources.get(str(tuple_const_unpack_match.group("input")), None)
+        parsed_tuple_const_unpack = _parse_pidnet_skip_tuple_const_unpack(current_line)
+        if parsed_tuple_const_unpack is not None:
+            pair_sources = const_pair_alias_sources.get(str(parsed_tuple_const_unpack[2]), None)
             if pair_sources is not None:
-                const_alias_sources[str(tuple_const_unpack_match.group("lhs0"))] = str(pair_sources[0])
-                const_alias_sources[str(tuple_const_unpack_match.group("lhs1"))] = str(pair_sources[1])
+                const_alias_sources[str(parsed_tuple_const_unpack[0])] = str(pair_sources[0])
+                const_alias_sources[str(parsed_tuple_const_unpack[1])] = str(pair_sources[1])
             continue
         parsed_scale4_mul_input = _parse_pidnet_skip_scale4_mul_input(current_line)
         if parsed_scale4_mul_input is not None:
             scale4_mul_inputs.add(str(parsed_scale4_mul_input))
             continue
-        scale4_mul_match = scale4_mul_re.match(current_line)
-        if scale4_mul_match is None:
-            scale4_mul_match = scale4_mul_reversed_re.match(current_line)
-        if (
-            scale4_mul_match is not None
-            and _resolve_const_expr(str(scale4_mul_match.group("const_expr"))) is not None
-        ):
-            scale4_mul_inputs.add(_resolve_local_alias(str(scale4_mul_match.group("input"))))
-            continue
         parsed_scale4_add_input = _parse_pidnet_skip_scale4_add_input(current_line)
         if parsed_scale4_add_input is not None:
             scale4_add_inputs.add(str(parsed_scale4_add_input))
             continue
-        scale4_add_match = scale4_add_re.match(current_line)
-        if scale4_add_match is None:
-            scale4_add_match = scale4_add_reversed_re.match(current_line)
-        if (
-            scale4_add_match is not None
-            and _resolve_const_expr(str(scale4_add_match.group("const_expr"))) is not None
-        ):
-            scale4_add_inputs.add(_resolve_local_alias(str(scale4_add_match.group("input"))))
+        parsed_pag_mul_pair = _parse_pidnet_skip_pag_mul_pair(current_line)
+        if parsed_pag_mul_pair is not None:
+            pag_mul_root_pairs.add(parsed_pag_mul_pair)
             continue
-        pag_mul_match = pag_mul_re.match(current_line)
-        if pag_mul_match is not None:
-            lhs_root = _resolve_local_alias(str(pag_mul_match.group("a")))
-            rhs_root = _resolve_local_alias(str(pag_mul_match.group("b")))
-            if lhs_root != rhs_root:
-                pag_mul_root_pairs.add(tuple(sorted((lhs_root, rhs_root))))
     return (
         bool(padded_inputs & mean_inputs)
         and bool(scale4_mul_inputs & scale4_add_inputs)
