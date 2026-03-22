@@ -31534,6 +31534,45 @@ def _count_lines_matching(lines: Sequence[str], pattern: str) -> int:
     return sum(1 for line in lines if regex.search(str(line)) is not None)
 
 
+def _split_top_level_csv_exprs(expr: str) -> List[str]:
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for char in str(expr):
+        if char == "," and depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+        current.append(char)
+        if char in "([{":
+            depth += 1
+        elif char in ")]}" and depth > 0:
+            depth -= 1
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _is_bread_resize_like_expr(expr: str, known_resize_outputs: Set[str]) -> bool:
+    stripped = str(expr).strip()
+    if stripped in known_resize_outputs:
+        return True
+    if re.match(
+        r"^_apply_resize\([A-Za-z0-9_]+, \[\d+, \d+\], method='[^']+', "
+        r"target_shape=\[1, \d+, \d+, \d+\], align_corners=(?:True|False), "
+        r"half_pixel_centers=(?:True|False), channel_last=True\)$",
+        stripped,
+    ) is not None:
+        return True
+    for candidate in re.findall(r"\b[A-Za-z0-9_]+\b", stripped):
+        if candidate.endswith("_resize_out_nhwc") or candidate.endswith("_upup_resize_out_nhwc"):
+            return True
+    return False
+
+
 def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
     resize_assign_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\([A-Za-z0-9_]+, \[\d+, \d+\], method='[^']+', "
@@ -31541,11 +31580,11 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
         r"half_pixel_centers=(?:True|False), channel_last=True\)$"
     )
     apply_concat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=(?:1|3), "
+        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>.+)\], axis=(?:1|3), "
         r"target_shape=\[[0-9, ]+\], fused='[^']+'\)$"
     )
     torch_cat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
+        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>.+)\], dim=1\)$"
     )
 
     resize_like_inputs: Set[str] = set()
@@ -31559,9 +31598,6 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
             if candidate.endswith("_resize_out_nhwc") or candidate.endswith("_upup_resize_out_nhwc"):
                 resize_like_inputs.add(candidate)
 
-    if not resize_like_inputs:
-        return False
-
     for line in lines:
         current_line = str(line)
         concat_match = apply_concat_re.match(current_line)
@@ -31569,10 +31605,14 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
             concat_match = torch_cat_re.match(current_line)
         if concat_match is None:
             continue
-        inputs = [input_name.strip() for input_name in str(concat_match.group("inputs")).split(",") if input_name.strip()]
+        inputs = _split_top_level_csv_exprs(str(concat_match.group("inputs")))
         if len(inputs) < 2:
             continue
-        resize_inputs = [input_name for input_name in inputs if input_name in resize_like_inputs]
+        resize_inputs = [
+            input_name
+            for input_name in inputs
+            if _is_bread_resize_like_expr(input_name, resize_like_inputs)
+        ]
         if resize_inputs and len(resize_inputs) < len(inputs):
             return True
     return False
@@ -31593,6 +31633,8 @@ def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
     )
 
     returned_values: Set[str] = set()
+    alias_assignments: Dict[str, str] = {}
+    permute_outputs: Set[str] = set()
     for line in lines:
         current_line = str(line)
         return_match = return_single_re.match(current_line)
@@ -31601,19 +31643,31 @@ def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
             continue
         if return_permute_re.match(current_line) is not None:
             return True
+        alias_match = alias_assign_re.match(current_line)
+        if alias_match is not None:
+            alias_assignments[str(alias_match.group("lhs"))] = str(alias_match.group("src"))
+            continue
+        permute_match = permute_assign_re.match(current_line)
+        if permute_match is not None:
+            permute_outputs.add(str(permute_match.group("lhs")))
+            continue
     if not returned_values:
         return False
-    for line in lines:
-        current_line = str(line)
-        alias_match = alias_assign_re.match(current_line)
-        if alias_match is not None and str(alias_match.group("lhs")) in returned_values:
+    pending_values = set(returned_values)
+    seen_values: Set[str] = set()
+    while pending_values:
+        current_value = pending_values.pop()
+        if current_value in seen_values:
+            continue
+        seen_values.add(current_value)
+        if current_value in permute_outputs:
             return True
-        permute_match = permute_assign_re.match(current_line)
-        if permute_match is not None and str(permute_match.group("lhs")) in returned_values:
-            return True
-    if returned_values:
+        aliased_value = alias_assignments.get(current_value, None)
+        if aliased_value is not None:
+            pending_values.add(aliased_value)
+            continue
         return True
-    return False
+    return bool(returned_values)
 
 
 def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
@@ -31623,11 +31677,11 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
         r"half_pixel_centers=(?:True|False), channel_last=True\)$"
     )
     apply_concat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=(?:1|3), "
+        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>.+)\], axis=(?:1|3), "
         r"target_shape=\[[0-9, ]+\], fused='[^']+'\)$"
     )
     torch_cat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
+        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>.+)\], dim=1\)$"
     )
 
     resize_like_outputs: Set[str] = set()
@@ -31651,13 +31705,13 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
             concat_match = apply_concat_re.match(current_line)
         if concat_match is None:
             continue
-        inputs = [input_name.strip() for input_name in str(concat_match.group("inputs")).split(",") if input_name.strip()]
+        inputs = _split_top_level_csv_exprs(str(concat_match.group("inputs")))
         if len(inputs) != 2:
             continue
         resize_inputs = [
             input_name
             for input_name in inputs
-            if input_name in resize_like_outputs
+            if _is_bread_resize_like_expr(input_name, resize_like_outputs)
         ]
         if len(resize_inputs) != 1:
             continue
@@ -31667,18 +31721,18 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
 
 def _has_nanodet_head_signature(lines: Sequence[str]) -> bool:
     apply_concat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=1, "
+        r"^\s*[A-Za-z0-9_]+ = _apply_concat\(\[(?P<inputs>.+)\], axis=1, "
         r"target_shape=\[1, \d+, \d+\], fused='NONE'\)$"
     )
     torch_cat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
+        r"^\s*[A-Za-z0-9_]+ = torch\.cat\(\[(?P<inputs>.+)\], dim=1\)$"
     )
     return_apply_concat_re = re.compile(
-        r"^\s*return _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=1, "
+        r"^\s*return _apply_concat\(\[(?P<inputs>.+)\], axis=1, "
         r"target_shape=\[1, \d+, \d+\], fused='NONE'\)$"
     )
     return_torch_cat_re = re.compile(
-        r"^\s*return torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
+        r"^\s*return torch\.cat\(\[(?P<inputs>.+)\], dim=1\)$"
     )
 
     for line in lines:
@@ -31692,22 +31746,44 @@ def _has_nanodet_head_signature(lines: Sequence[str]) -> bool:
             concat_match = return_torch_cat_re.match(current_line)
         if concat_match is None:
             continue
-        inputs = [input_name.strip() for input_name in str(concat_match.group("inputs")).split(",") if input_name.strip()]
+        inputs = _split_top_level_csv_exprs(str(concat_match.group("inputs")))
         if len(inputs) == 4:
             return True
     return False
 
 
 def _has_nanodet_backbone_pool_signature(lines: Sequence[str]) -> bool:
-    has_backbone_pad = _any_line_matches(
-        lines,
-        r"^\s*[A-Za-z0-9_]*padded = F\.pad\((?:_align_tensor_to_target_shape\()?[A-Za-z0-9_]+(?:, \[[0-9, ]+\])?\)?, \[(?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\], mode='constant', value=-3\.4028234663852886e\+38\)$",
+    padded_assign_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?:_align_tensor_to_target_shape\()?[A-Za-z0-9_]+(?:, \[[0-9, ]+\])?\)?, "
+        r"\[(?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\], mode='constant', value=-3\.4028234663852886e\+38\)$"
     )
-    has_pool = _any_line_matches(
-        lines,
-        r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\([A-Za-z0-9_]*padded, .*is_max_pool=True, channel_last=(?:True|False)\)$",
+    pool_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\((?P<input>.+?),\s*filter_height=.*is_max_pool=True, channel_last=(?:True|False)\)$"
     )
-    return has_backbone_pad
+    inline_padded_re = re.compile(
+        r"^F\.pad\((?:_align_tensor_to_target_shape\()?[A-Za-z0-9_]+(?:, \[[0-9, ]+\])?\)?, "
+        r"\[(?:0, 0, 1, 1, 1, 1|1, 1, 1, 1)\], mode='constant', value=-3\.4028234663852886e\+38\)$"
+    )
+
+    padded_outputs: Set[str] = set()
+    for line in lines:
+        padded_match = padded_assign_re.match(str(line))
+        if padded_match is not None:
+            padded_outputs.add(str(padded_match.group("lhs")))
+
+    if padded_outputs:
+        return True
+
+    for line in lines:
+        pool_match = pool_re.match(str(line))
+        if pool_match is None:
+            continue
+        pool_input = str(pool_match.group("input")).strip()
+        if pool_input in padded_outputs:
+            return True
+        if inline_padded_re.match(pool_input) is not None:
+            return True
+    return False
 
 
 def _has_nanodet_resize_signature(lines: Sequence[str]) -> bool:
@@ -31735,8 +31811,16 @@ def _has_nhwc_stem_pool_bridge_signature(lines: Sequence[str]) -> bool:
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), "
         r"\[0, 0, 1, 1, 1, 1\], mode='constant', value=-3\.4028234663852886e\+38\)$"
     )
+    inline_padded_aligned_re = re.compile(
+        r"^F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+)(?:\.permute\([^)]*\)\.contiguous\(\))?, "
+        r"\[1, \d+, \d+, \d+\]\), \[0, 0, 1, 1, 1, 1\], mode='constant', value=-3\.4028234663852886e\+38\)$"
+    )
+    inline_padded_direct_re = re.compile(
+        r"^F\.pad\((?P<input>[A-Za-z0-9_]+), "
+        r"\[0, 0, 1, 1, 1, 1\], mode='constant', value=-3\.4028234663852886e\+38\)$"
+    )
     pool_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), .*is_max_pool=True, channel_last=True\)$"
+        r"^\s*[A-Za-z0-9_]+ = _apply_pool2d\((?P<input>.+?), .*is_max_pool=True, channel_last=True\)$"
     )
 
     stem_outputs: Set[str] = set()
@@ -31762,8 +31846,18 @@ def _has_nhwc_stem_pool_bridge_signature(lines: Sequence[str]) -> bool:
             padded_outputs.add(str(padded_match.group("lhs")))
             continue
         pool_match = pool_re.match(current_line)
-        if pool_match is not None and str(pool_match.group("input")) in padded_outputs:
-            return bool(stem_outputs) and bool(nhwc_bridge_outputs)
+        if pool_match is not None:
+            pool_input = str(pool_match.group("input")).strip()
+            if pool_input in padded_outputs:
+                return bool(stem_outputs) and bool(nhwc_bridge_outputs)
+            inline_padded_match = inline_padded_aligned_re.match(pool_input)
+            if inline_padded_match is None:
+                inline_padded_match = inline_padded_direct_re.match(pool_input)
+            if inline_padded_match is None:
+                continue
+            padded_input = str(inline_padded_match.group("input"))
+            if padded_input in nhwc_bridge_outputs or padded_input in stem_outputs:
+                return bool(stem_outputs)
     return False
 
 

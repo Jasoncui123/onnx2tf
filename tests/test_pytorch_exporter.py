@@ -9927,6 +9927,30 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_semantic_signature_
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_with_inline_resize_source(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_inline_resize_source_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem0_cf, stem1_cf, up0_in, up1_in, pred_map):",
+                "        merge0 = torch.cat([stem0_cf, _apply_resize(up0_in, [90, 160], method='bilinear', target_shape=[1, 90, 160, 64], align_corners=False, half_pixel_centers=True, channel_last=True)], dim=1)",
+                "        merge1 = _apply_concat([stem1_cf, _apply_resize(up1_in, [180, 320], method='bilinear', target_shape=[1, 180, 320, 32], align_corners=False, half_pixel_centers=True, channel_last=True)], axis=3, target_shape=[1, 64, 180, 320], fused='NONE')",
+                "        return _torch_permute(pred_map, [0, 3, 1, 2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_with_generic_output_bridge_name(
     tmp_path,
 ) -> None:
@@ -9988,6 +10012,32 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_with_direct_return_
                 "    def forward(self, stem_cf, decoder_resize_out_nhwc, pred_map):",
                 "        decoder_merge = torch.cat([stem_cf, decoder_resize_out_nhwc], dim=1)",
                 "        return _torch_permute(pred_map, [0, 3, 1, 2])",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_with_output_bridge_alias_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_output_bridge_alias_chain_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_cf, decoder_resize_out_nhwc, pred_map):",
+                "        decoder_merge = torch.cat([stem_cf, decoder_resize_out_nhwc], dim=1)",
+                "        public_output = _torch_permute(pred_map, [0, 3, 1, 2])",
+                "        out_alias0 = public_output",
+                "        out_alias1 = out_alias0",
+                "        return out_alias1",
                 "",
             ]
         ),
@@ -10202,6 +10252,30 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nhwc_stem_pool_bridge_wit
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nhwc_stem_pool_bridge_with_inline_padded_pool(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "inline_padded_pool_nhwc_stem_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, image_tensor):",
+                "        stem_cf = self.conv_block_7(image_tensor)",
+                "        stem_pool = _apply_pool2d(F.pad(_align_tensor_to_target_shape(stem_cf, [1, 112, 112, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38), filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 56, 56, 64], is_max_pool=True, channel_last=True)",
+                "        return stem_pool",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_package(
     tmp_path,
 ) -> None:
@@ -10360,6 +10434,32 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_current_channel_l
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_inline_pad_pool(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_inline_pad_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data, neck_in_nhwc, det0, det1, det2, det3):",
+                "        backbone_cf = self.conv_block_0(data)",
+                "        backbone_pool = _apply_pool2d(F.pad(backbone_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38), filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 104, 104], is_max_pool=True, channel_last=False)",
+                "        neck_up = _apply_resize(neck_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        public_logits = _apply_concat([det0, det1, det2, det3], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return backbone_pool, public_logits",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_semantic_signature_without_fixed_names(
     tmp_path,
 ) -> None:
@@ -10428,6 +10528,57 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_direct_retur
                 "        neck_pool = _apply_pool2d(neck_pool_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
                 "        neck_up = _apply_resize(neck_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
                 "        return _apply_concat([det0, det1, det2, det3], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_inline_head_expr(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_inline_head_expr_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pyramid_cf, neck_in_nhwc, det0, det1, det2, det3):",
+                "        neck_pool_padded = F.pad(pyramid_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        neck_pool = _apply_pool2d(neck_pool_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
+                "        neck_up = _apply_resize(neck_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        public_logits = _apply_concat([det0, _align_tensor_to_target_shape(det1, [1, 899, 37]), det2, det3], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        return public_logits",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_direct_return_inline_head_expr(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_direct_return_inline_head_expr_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pyramid_cf, neck_in_nhwc, det0, det1, det2, det3):",
+                "        neck_pool_padded = F.pad(pyramid_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        neck_pool = _apply_pool2d(neck_pool_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
+                "        neck_up = _apply_resize(neck_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        return torch.cat([det0, det1, _align_tensor_to_target_shape(det2, [1, 899, 37]), det3], dim=1)",
                 "",
             ]
         ),
@@ -13381,6 +13532,55 @@ def test_should_skip_expensive_raw_canonicalize_for_bread_with_apply_concat_deco
                 "        decoder_merge = _apply_concat([encoder_cf, decoder_up], axis=3, target_shape=[1, 128, 180, 320], fused='NONE')",
                 "        out = out_nhwc",
                 "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_bread_with_inline_resize_decoder_merge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_inline_resize_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, encoder_cf, decoder_in, out_nhwc):",
+                "        decoder_merge = torch.cat([encoder_cf, _apply_resize(decoder_in, [180, 320], method='bilinear', target_shape=[1, 180, 320, 64], align_corners=False, half_pixel_centers=True, channel_last=True)], dim=1)",
+                "        out = out_nhwc",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_bread_with_output_bridge_alias_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_output_bridge_alias_chain_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, encoder_cf, decoder_in, out_nhwc):",
+                "        decoder_merge = torch.cat([encoder_cf, _apply_resize(decoder_in, [180, 320], method='bilinear', target_shape=[1, 180, 320, 64], align_corners=False, half_pixel_centers=True, channel_last=True)], dim=1)",
+                "        out_alias0 = out_nhwc",
+                "        out_alias1 = out_alias0",
+                "        return out_alias1",
                 "",
             ]
         ),
