@@ -8682,6 +8682,35 @@ def test_should_skip_expensive_raw_canonicalize_for_humanseg_generic_cat_signatu
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_skip_expensive_raw_canonicalize_for_humanseg_with_generic_conv_index(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "humanseg_generic_conv_idx_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, relu_tail, a, b, c, d):",
+                "        low_merge = _align_tensor_to_target_shape(torch.add(a, b), [1, 8, 16, 16])",
+                "        mid_merge = _align_tensor_to_target_shape(torch.add(c, d), [1, 16, 8, 8])",
+                "        low_up = _apply_resize(low_merge, [32, 64], method='bilinear', target_shape=[1, 8, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        mid_up = _apply_resize(mid_merge, [32, 64], method='bilinear', target_shape=[1, 16, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        aux_up = _apply_resize(mid_merge, [32, 64], method='bilinear', target_shape=[1, 16, 32, 64], align_corners=False, half_pixel_centers=True, channel_last=False)",
+                "        merge_tensor = torch.cat([relu_tail, low_up, mid_up, aux_up], dim=1)",
+                "        conv_out = self.conv_block_9(merge_tensor)",
+                "        return conv_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_skip_expensive_raw_canonicalize_for_version_rfb_semantic_signature(
     tmp_path,
 ) -> None:
@@ -8699,6 +8728,32 @@ def test_should_skip_expensive_raw_canonicalize_for_version_rfb_semantic_signatu
                 "        scores = _apply_concat([c0, c1, c2, c3], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
                 "        boxes = _apply_concat([b0, b1], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
                 "        return scores, boxes, head_out",
+                "",
+            ]
+        ),
+        encoding='utf-8',
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_version_rfb_with_generic_conv_and_boxes_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "version_rfb_generic_names_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, a, b, c0, c1, c2, c3, b0, b1):",
+                "        merge_features = _align_tensor_to_target_shape(torch.add(a, b), [1, 60, 80, 64])",
+                "        head_out = self.conv_block_7(merge_features.permute(0, 3, 1, 2).contiguous())",
+                "        scores = _apply_concat([c0, c1, c2, c3], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
+                "        coords = _apply_concat([b0, b1], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
+                "        return scores, coords, head_out",
                 "",
             ]
         ),
@@ -8726,6 +8781,33 @@ def test_should_skip_expensive_raw_canonicalize_for_iat_llie_semantic_signature(
                 "        img_high = _align_tensor_to_target_shape(torch.add(c, d), [1, 180, 320, 3])",
                 "        out = _torch_permute(out_public_layout_bridge, [0, 3, 1, 2])",
                 "        return cv25_in_cf, mix64, cv108_out_cf, img_high, out",
+                "",
+            ]
+        ),
+        encoding='utf-8',
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_iat_llie_with_generic_conv_indices(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "iat_llie_generic_conv_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_in, tail_in, a, b, c, d, layout_bridge):",
+                "        stem_cf = self.conv_block_3(stem_in.permute(0, 3, 1, 2).contiguous())",
+                "        mix64 = _align_tensor_to_target_shape(torch.add(a, b), [1, 45, 80, 64])",
+                "        tail_cf = self.conv_block_19(tail_in.permute(0, 3, 1, 2).contiguous())",
+                "        img_high = _align_tensor_to_target_shape(torch.add(c, d), [1, 180, 320, 3])",
+                "        out = _torch_permute(layout_bridge, [0, 3, 1, 2])",
+                "        return stem_cf, mix64, tail_cf, img_high, out",
                 "",
             ]
         ),
@@ -9370,6 +9452,57 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_l1_packag
     assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_efficientformer_semantic_signature_with_generic_shapes(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "efficientformer_semantic_generic_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pooled_cf, stage_cf, residual_cf, attn_logits):",
+                "        pooled_out = _apply_pool2d(pooled_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 64, 40, 40], is_max_pool=False, channel_last=False)",
+                "        token_map = _align_tensor_to_target_shape(torch.add(stage_cf, residual_cf), [1, 8, 8, 320])",
+                "        attn_scores = _align_tensor_to_target_shape(torch.add(attn_logits, self.const_attn_bias), [1, 5, 64, 64])",
+                "        return pooled_out, token_map, attn_scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is False
+
+
+def test_should_not_avoid_model_ir_in_raw_canonicalize_for_efficientformer_with_mismatched_token_grid(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "efficientformer_semantic_mismatch_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pooled_cf, stage_cf, residual_cf, attn_logits):",
+                "        pooled_out = _apply_pool2d(pooled_cf, filter_height=3, filter_width=3, stride_h=1, stride_w=1, padding='SAME', target_shape=[1, 64, 40, 40], is_max_pool=False, channel_last=False)",
+                "        token_map = _align_tensor_to_target_shape(torch.add(stage_cf, residual_cf), [1, 8, 8, 320])",
+                "        attn_scores = _align_tensor_to_target_shape(torch.add(attn_logits, self.const_attn_bias), [1, 5, 49, 49])",
+                "        return pooled_out, token_map, attn_scores",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is False
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_package(
     tmp_path,
 ) -> None:
@@ -9495,6 +9628,57 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_semantic_signature_
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
 
 
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_semantic_signature_with_generic_resize_sources(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_semantic_resize_source_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem0_cf, stem1_cf, up0_in, up1_in, out_nhwc):",
+                "        decoder_up0 = _apply_resize(up0_in, [90, 160], method='bilinear', target_shape=[1, 90, 160, 64], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        decoder_up1 = _apply_resize(up1_in, [180, 320], method='bilinear', target_shape=[1, 180, 320, 32], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        merge0 = torch.cat([stem0_cf, decoder_up0], dim=1)",
+                "        merge1 = _apply_concat([stem1_cf, decoder_up1], axis=3, target_shape=[1, 64, 180, 320], fused='NONE')",
+                "        out = _torch_permute(out_nhwc, [0, 3, 1, 2])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_with_generic_output_bridge_name(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "bread_generic_output_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, stem_cf, decoder_resize_out_nhwc, pred_map):",
+                "        decoder_merge = torch.cat([stem_cf, decoder_resize_out_nhwc], dim=1)",
+                "        out = pred_map",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
 def test_should_avoid_model_ir_in_raw_canonicalize_for_bread_nonfm_package(
     tmp_path,
 ) -> None:
@@ -9587,6 +9771,84 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_resnet_package(
                 "        resnetv15_p0_fwd_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(resnetv15_p0_fwd_in_nhwc, [1, 112, 112, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
                 "        resnetv15_p0_fwd_out = _apply_pool2d(resnetv15_p0_fwd_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 64, 56, 56], is_max_pool=True, channel_last=True)",
                 "        return resnetv15_p0_fwd_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_generic_nhwc_stem_pool_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "generic_nhwc_stem_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, data):",
+                "        stem_cf = self.conv_block_0(data)",
+                "        stem_nhwc = _align_tensor_to_target_shape(stem_cf, [1, 112, 112, 64])",
+                "        stem_pad = F.pad(_align_tensor_to_target_shape(stem_nhwc, [1, 112, 112, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        stem_pool = _apply_pool2d(stem_pad, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 56, 56, 64], is_max_pool=True, channel_last=True)",
+                "        return stem_pool",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nhwc_stem_pool_bridge_with_generic_input_name(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "generic_input_nhwc_stem_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, image_tensor):",
+                "        stem_cf = self.conv_block_0(image_tensor)",
+                "        stem_nhwc = _align_tensor_to_target_shape(stem_cf, [1, 112, 112, 64])",
+                "        stem_pad = F.pad(_align_tensor_to_target_shape(stem_nhwc, [1, 112, 112, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        stem_pool = _apply_pool2d(stem_pad, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 56, 56, 64], is_max_pool=True, channel_last=True)",
+                "        return stem_pool",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_nhwc_stem_pool_bridge_with_generic_conv_block_index(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "generic_conv_idx_stem_pool_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, image_tensor):",
+                "        stem_cf = self.conv_block_7(image_tensor)",
+                "        stem_nhwc = _align_tensor_to_target_shape(stem_cf, [1, 112, 112, 64])",
+                "        stem_pad = F.pad(_align_tensor_to_target_shape(stem_nhwc, [1, 112, 112, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        stem_pool = _apply_pool2d(stem_pad, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 56, 56, 64], is_max_pool=True, channel_last=True)",
+                "        return stem_pool",
                 "",
             ]
         ),
@@ -9768,8 +10030,8 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_semantic_signatur
                 "    def forward(self, pyramid_cf, neck_in_nhwc, det0, det1, det2, det3):",
                 "        neck_pool_padded = F.pad(pyramid_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
                 "        neck_pool = _apply_pool2d(neck_pool_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
-                "        fpnupsample1_resize_out_nhwc = _apply_resize(neck_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
-                "        out = _apply_concat([head_rs_out0, head_rs1_out0, head_rs2_out0, head_rs3_out0], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
+                "        neck_up = _apply_resize(neck_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([det0, det1, det2, det3], axis=1, target_shape=[1, 3598, 37], fused='NONE')",
                 "        return out",
                 "",
             ]
@@ -9778,6 +10040,32 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_nanodet_semantic_signatur
     )
 
     assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_not_avoid_model_ir_in_raw_canonicalize_for_nanodet_with_three_head_branches(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "nanodet_three_heads_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, pyramid_cf, neck_in_nhwc, det0, det1, det2):",
+                "        neck_pool_padded = F.pad(pyramid_cf, [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        neck_pool = _apply_pool2d(neck_pool_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 104, 104, 24], is_max_pool=True, channel_last=True)",
+                "        neck_up = _apply_resize(neck_in_nhwc, [52, 52], method='bilinear', target_shape=[1, 52, 52, 96], align_corners=False, half_pixel_centers=True, channel_last=True)",
+                "        out = _apply_concat([det0, det1, det2], axis=1, target_shape=[1, 2048, 37], fused='NONE')",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is False
 
 
 def test_should_avoid_model_ir_in_raw_canonicalize_for_shadowformer_package(
