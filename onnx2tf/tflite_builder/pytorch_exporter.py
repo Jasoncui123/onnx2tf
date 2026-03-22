@@ -6882,22 +6882,22 @@ def _fold_channel_last_affine_conv_bridges(
         return [str(line) for line in lines]
 
     materialize_re = re.compile(
-        r"^(?P<var>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<cf>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), (?P<target>\[[^\]]+\])\)$"
+        r"^(?P<var>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<cf>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), (?P<target>\[[^\]]+\])\)$"
     )
     align_re = re.compile(
-        r"^(?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+) = _align_binary_inputs\((?P<input>[A-Za-z0-9_]+), (?P<const>.+), (?P<target>\[[^\]]+\])\)$"
+        r"^(?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs\((?P<input>[A-Za-z0-9_]+), (?P<const>.+), (?P<target>\[[^\]]+\])\)$"
     )
     mul_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
     )
     add_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.add\((?P<lhs>[A-Za-z0-9_]+), (?P<rhs>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
     )
     relu_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = torch\.relu\((?P<input>[A-Za-z0-9_]+)\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.relu\((?P<input>[A-Za-z0-9_]+)\)$"
     )
     conv_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
 
     rewritten: List[str] = []
@@ -7026,10 +7026,10 @@ def _fold_channel_first_gap_conv_bridges(
     lines: Sequence[str],
 ) -> List[str]:
     mean_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
     )
     conv_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
 
     rewritten = [str(line) for line in lines]
@@ -7055,10 +7055,10 @@ def _rewrite_channel_first_gap_outputs_to_explicit_channel_last(
     lines: Sequence[str],
 ) -> List[str]:
     mean_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[2, 3\], keepdim=True\)$"
     )
     permute_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
     )
     rewritten = [str(line) for line in lines]
     for index in range(len(rewritten) - 1):
@@ -7086,10 +7086,10 @@ def _rewrite_channel_last_gap_means_to_reduce_mean(
         r"torch\.mean\((?P<expr>.+?\.permute\(0, 2, 3, 1\)\.contiguous\(\)), dim=\[1, 2\], keepdim=True\)"
     )
     rank3_cf_materialize_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<cf>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\), (?P<target>\[[^\]]+\])\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<cf>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\), (?P<target>\[[^\]]+\])\)$"
     )
     rank3_mean_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=2, keepdim=True\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=2, keepdim=True\)$"
     )
 
     def _rewrite_line(line: str) -> str:
@@ -7131,13 +7131,13 @@ def _repair_channel_last_gap_conv_inputs(
     lines: Sequence[str],
 ) -> List[str]:
     mean_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[1, 2\], keepdim=True\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[1, 2\], keepdim=True\)$"
     )
     reduce_mean_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = _reduce_mean\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[1, 2\], [A-Za-z0-9_]+\.ndim\), keepdims=True\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*_reduce_mean\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[1, 2\], [A-Za-z0-9_]+\.ndim\), keepdims=True\)$"
     )
     conv_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
     )
 
     rewritten = [str(line) for line in lines]
@@ -7164,25 +7164,25 @@ def _fold_channel_first_hardsigmoid_gate_conv_bridges(
     lines: Sequence[str],
 ) -> List[str]:
     mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = torch\.mul\((?P<input>[A-Za-z0-9_]+), (?P<alpha>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mul\((?P<input>[A-Za-z0-9_]+), (?P<alpha>[-+0-9.eE]+)\)$"
     )
     add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<input>[A-Za-z0-9_]+), (?P<beta>[-+0-9.eE]+)\), (?P<target>\[[^\]]+\])\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.add\((?P<input>[A-Za-z0-9_]+), (?P<beta>[-+0-9.eE]+)\), (?P<target>\[[^\]]+\])\)$"
     )
     clamp_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = torch\.clamp\((?P<input>[A-Za-z0-9_]+), min=0\.0, max=1\.0\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.clamp\((?P<input>[A-Za-z0-9_]+), min=0\.0, max=1\.0\)$"
     )
     anchor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), (?P<target>\[[^\]]+\])\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), (?P<target>\[[^\]]+\])\)$"
     )
     mul_out_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.mul\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.mul\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+)\), (?P<target>\[[^\]]+\])\)$"
     )
     conv_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
     mean_re = re.compile(
-        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[1, 2\], keepdim=True\)$"
+        r"^(?P<indent>\s*)(?P<out>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), dim=\[1, 2\], keepdim=True\)$"
     )
     anchor_cf_re = re.compile(
         r"^\s*[A-Za-z0-9_]+,\s*[A-Za-z0-9_]+ = _align_binary_inputs_to_anchor\((?P<input0>[A-Za-z0-9_]+), (?P<input1>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
@@ -7351,10 +7351,10 @@ def _fold_boundary_transpose_pad_conv_bridges(
     lines: Sequence[str],
 ) -> List[str]:
     conv_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\)\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\)\)$"
     )
     output_bridge_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
     )
     rewritten = [str(line) for line in lines]
     for index in range(len(rewritten) - 1):
@@ -7424,10 +7424,10 @@ def _bridge_boundary_metadata_gather_nd_inputs(
         return [str(line) for line in lines]
 
     gather_nd_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = _apply_gather_nd\((?P<input>[A-Za-z0-9_]+), (?P<indices>.+), target_shape=(?P<target>.+)\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_apply_gather_nd\((?P<input>[A-Za-z0-9_]+), (?P<indices>.+), target_shape=(?P<target>.+)\)$"
     )
     double_perm_re = re.compile(
-        r"^(?P<out>[A-Za-z0-9_]+) = _apply_gather_nd\(_torch_permute\((?P<input>[A-Za-z0-9_]+), (?P<perm>\[[^\]]+\])\)\.permute\((?P<perm_args>[^\)]+)\)\.contiguous\(\), (?P<indices>.+), target_shape=(?P<target>.+)\)$"
+        r"^(?P<out>[A-Za-z0-9_]+)\s*=\s*_apply_gather_nd\(_torch_permute\((?P<input>[A-Za-z0-9_]+), (?P<perm>\[[^\]]+\])\)\.permute\((?P<perm_args>[^\)]+)\)\.contiguous\(\), (?P<indices>.+), target_shape=(?P<target>.+)\)$"
     )
     rewritten = [str(line) for line in lines]
     for index, line in enumerate(rewritten):
@@ -7491,7 +7491,7 @@ def _inline_trivial_public_layout_bridge_aliases(
     lines: Sequence[str],
 ) -> List[str]:
     assign_re = re.compile(
-        r"^(?P<alias>[A-Za-z0-9_]+_public_layout_bridge) = (?P<source>[A-Za-z0-9_]+)$"
+        r"^(?P<alias>[A-Za-z0-9_]+_public_layout_bridge)\s*=\s*(?P<source>[A-Za-z0-9_]+)$"
     )
     rewritten = [str(line) for line in lines]
     alias_map: Dict[str, str] = {}
@@ -7512,13 +7512,13 @@ def _fold_channel_last_prelu_bridges(
     lines: Sequence[str],
 ) -> List[str]:
     in_re = re.compile(
-        r"^(?P<var>[A-Za-z0-9_]+) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+        r"^(?P<var>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
     )
     prelu_re = re.compile(
-        r"^(?P<var>[A-Za-z0-9_]+) = self\.(?P<module>prelu_[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+        r"^(?P<var>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>prelu_[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
     )
     out_re = re.compile(
-        r"^(?P<var>[A-Za-z0-9_]+) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
+        r"^(?P<var>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
     )
     rewritten = [str(line) for line in lines]
     index = 0
@@ -20265,13 +20265,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"torch\.as_tensor\((?P<value>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?), dtype=torch\.[A-Za-z0-9_]+, device=_module_device\(self\)\)\)(?P<suffix>.*)$"
     )
     assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<alias>(?:[A-Za-z0-9_]+_public_layout_bridge|in_public_layout_bridge)) = _torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
+        r"^(?P<indent>\s*)(?P<alias>(?:[A-Za-z0-9_]+_public_layout_bridge|in_public_layout_bridge))\s*=\s*_torch_permute\((?P<input>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
     )
     trivial_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<alias>(?:[A-Za-z0-9_]+_public_layout_bridge|in_public_layout_bridge)) = (?P<input>[A-Za-z0-9_]+)$"
+        r"^(?P<indent>\s*)(?P<alias>(?:[A-Za-z0-9_]+_public_layout_bridge|in_public_layout_bridge))\s*=\s*(?P<input>[A-Za-z0-9_]+)$"
     )
     generic_alias_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<rhs>[A-Za-z0-9_]+)$"
     )
     return_value_re = re.compile(
         r"^(?P<indent>\s*)return (?P<value>[A-Za-z0-9_]+)$"
@@ -20284,10 +20284,10 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=src), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
     generic_expr_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>.+)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<rhs>.+)$"
     )
     generic_module_call_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
     )
     split_re = re.compile(
         r"^(?P<indent>\s*)(?P<outputs>[A-Za-z0-9_, ]+)\s*=\s*list\(torch\.tensor_split\((?P<alias>[A-Za-z0-9_]+), (?P<sections>\d+), dim=_normalize_dim\(3, (?P=alias)\.ndim\)\)\)$"
@@ -20296,31 +20296,31 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<outputs>[A-Za-z0-9_, ]+)\s*=\s*list\(torch\.tensor_split\((?P<input>[A-Za-z0-9_]+), (?P<sections>\d+), dim=_normalize_dim\((?P<axis>-?\d+), (?P=input)\.ndim\)\)\)$"
     )
     concat_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=3, target_shape=\[(?P<shape>[0-9, ]+)\], fused='NONE'\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=3, target_shape=\[(?P<shape>[0-9, ]+)\], fused='NONE'\)$"
     )
     generic_apply_concat_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=(?P<axis>-?\d+), target_shape=\[(?P<shape>[0-9, ]+)\], fused='(?P<fused>[^']+)'\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=(?P<axis>-?\d+), target_shape=\[(?P<shape>[0-9, ]+)\], fused='(?P<fused>[^']+)'\)$"
     )
     channel_last_gather_slice_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\[:, :, :, \[(?P<indices>[0-9,\s-]+)\]\]$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<input>[A-Za-z0-9_]+)\[:, :, :, \[(?P<indices>[0-9,\s-]+)\]\]$"
     )
     pad_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<shape>[0-9, ]+)\]\), \[(?P<pad>[0-9, ]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<shape>[0-9, ]+)\]\), \[(?P<pad>[0-9, ]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     rank3_const_pad_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     rank4_const_pad_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     rank4_const_pad6_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\((?P<input>[A-Za-z0-9_]+), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     aligned_rank4_const_pad6_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\), \[0, 0, (?P<pad0>-?\d+), (?P<pad1>-?\d+), (?P<pad2>-?\d+), (?P<pad3>-?\d+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     apply_pool2d_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<shape>[0-9, ]+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<shape>[0-9, ]+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     local_response_norm_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.local_response_norm\((?P<input>[A-Za-z0-9_]+), size=(?P<size>\d+), alpha=(?P<alpha>[-+0-9.eE]+), beta=(?P<beta>[-+0-9.eE]+), k=(?P<k>[-+0-9.eE]+)\)$"
@@ -20338,10 +20338,10 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     cf_concat_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=1\)$"
     )
     generic_torch_cat_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=(?P<axis>-?\d+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.cat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], dim=(?P<axis>-?\d+)\)$"
     )
     binary_same_permute_cf_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.(?P<op>add|sub)\("
@@ -20349,7 +20349,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"(?P<b>[A-Za-z0-9_]+)\.permute\(0, 2, 1\)\.contiguous\(\)\)$"
     )
     pool2d_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<shape>[0-9, ]+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<shape>[0-9, ]+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
     )
     binary_anchor_align_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
@@ -20361,13 +20361,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>torch\.(?:clamp|relu|neg|sigmoid|exp)\(.+\))$"
     )
     binary_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>torch\.(?:mul|add|sub|div|minimum|maximum)\(.+\))$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<expr>torch\.(?:mul|add|sub|div|minimum|maximum)\(.+\))$"
     )
     simple_binary_expr_re = re.compile(
         r"^torch\.(?P<op>add|sub|mul|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)$"
     )
     transpose_conv_input_bridge_re = re.compile(
-        r"^(?P<indent>\s*)(?P<alias>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
+        r"^(?P<indent>\s*)(?P<alias>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 2, 3, 1\]\)$"
     )
     transpose_conv_apply_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_module_transpose_conv2d\((?P<input>[A-Za-z0-9_]+), (?P<prefix>.+), target_shape=\[(?P<target>[0-9, ]+)\], fallback_shape=\[(?P<fallback>[0-9, ]+)\], target_logical_layout='NHWC', fused='(?P<fused>[^']+)'\)$"
@@ -20376,7 +20376,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)\[0:1, 0:1, (?P<start>\d+):(?P<end>\d+), 0:(?P<width>\d+)\]$"
     )
     transpose_conv_output_permute_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
     )
     self_permute_assign_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P=lhs)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
@@ -20388,13 +20388,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     simple_alias_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<src>[A-Za-z0-9_]+)$"
     )
     generic_aligned_tensor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<shape>[0-9, ]+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>.+), \[(?P<shape>[0-9, ]+)\]\)$"
     )
     permute_contiguous_cf_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)$"
     )
     singleton_const_anchor_fix_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
@@ -20413,10 +20413,10 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     aligned_nhwc_singleton_binary_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>torch\.(?:add|sub|mul|div|minimum|maximum)\(.+\)), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>torch\.(?:add|sub|mul|div|minimum|maximum)\(.+\)), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     aligned_nhwc_rank4_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     permuted_cf_module_input_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<module>self\.[A-Za-z0-9_]+)\((?P<src>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
@@ -20425,7 +20425,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)$"
     )
     apply_softmax_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)]\)$"
     )
     reduce_max_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _reduce_max\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
@@ -20523,13 +20523,13 @@ def _canonicalize_generated_model_source_for_raw_export(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.matmul\((?P<x>[A-Za-z0-9_]+), (?P<y>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     apply_resize_nhwc_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=True\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=True\)$"
     )
     apply_resize_cf_bad_target_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)](?P<rest>.*), channel_last=False\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)](?P<rest>.*), channel_last=False\)$"
     )
     apply_resize_cf_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=False\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=False\)$"
     )
     changed = False
     cf_pad_aliases: set[str] = set()
@@ -22385,7 +22385,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         out_w = int(resize_nhwc_match.group("out_w"))
         alias_match = (
             re.fullmatch(
-                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<src>[A-Za-z0-9_]+)",
                 lines[index + 1],
             )
             if index + 1 < len(lines)
@@ -24758,9 +24758,9 @@ def _canonicalize_generated_model_source_for_raw_export(
         )
         changed = True
     pidnet_forced_resize_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\("
-        r"(?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', "
-        r"target_shape=\[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\], "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\("
+        r"(?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', "
+        r"target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], "
         r"align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?:True|False)\)$"
     )
     for index, line in enumerate(lines):
@@ -24793,8 +24793,8 @@ def _canonicalize_generated_model_source_for_raw_export(
         )
         changed = True
     softmax_cf_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?P<input>[A-Za-z0-9_]+), "
-        r"axis=1, beta=(?P<beta>[-0-9.eE]+), target_shape=\[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), "
+        r"axis=1, beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)[\]\)]\)$"
     )
     for index, line in enumerate(lines):
         resize_match = (
@@ -24809,7 +24809,7 @@ def _canonicalize_generated_model_source_for_raw_export(
         consumer_index = index + 1
         alias_match = (
             re.fullmatch(
-                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<src>[A-Za-z0-9_]+)",
+                r"(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<src>[A-Za-z0-9_]+)",
                 lines[index + 1],
             )
             if index + 1 < len(lines)
@@ -25159,28 +25159,28 @@ def _build_fast_precanonicalize_repair_context(
     in_channels_re = re.compile(r"^\s*in_channels=(?P<channels>\d+),$")
     out_channels_re = re.compile(r"^\s*out_channels=(?P<channels>\d+),$")
     module_output_assign_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\)"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\)"
     )
     generic_expr_assign_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>.+)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<rhs>.+)$"
     )
     simple_alias_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<rhs>[A-Za-z0-9_]+)$"
     )
     aligned_rank4_any_re = re.compile(
         r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     apply_resize_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     apply_pool2d_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     apply_softmax_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)]\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)]\)$"
     )
     const_pad_assign_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pads>[0-9,\s]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pads>[0-9,\s]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     aliases: Dict[str, str] = {}
     consumers: Dict[str, List[int]] = {}
@@ -25753,7 +25753,7 @@ def _repair_cf_resize_target_shape(
     context: _FastPrecanonicalizeRepairContext,
 ) -> Tuple[str | None, str | None]:
     apply_resize_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     aligned_bn_const_re = re.compile(
         r"^\s*[A-Za-z0-9_]+ = _align_tensor_to_target_shape\(torch\.(?:mul|add)\((?P<input>[A-Za-z0-9_]+), (?:self|torch\.reshape\(self)\.(?P<const_attr>[A-Za-z0-9_]+).*$"
@@ -25834,7 +25834,7 @@ def _repair_cf_pool_target_shape(
     context: _FastPrecanonicalizeRepairContext,
 ) -> Tuple[str | None, str | None]:
     apply_pool2d_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     apply_pool2d_match = apply_pool2d_re.match(line)
     if apply_pool2d_match is None:
@@ -25902,7 +25902,7 @@ def _restore_channel_last_spatial_pool_chains(model_path: Path) -> None:
     lines = model_path.read_text(encoding="utf-8").splitlines()
     context = _build_fast_precanonicalize_repair_context(lines)
     apply_pool2d_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     changed = False
     for index, line in enumerate(lines):
@@ -25940,7 +25940,7 @@ def _repair_binary_alignment_layout(
     context: _FastPrecanonicalizeRepairContext,
 ) -> Tuple[str | None, str | None]:
     aligned_binary_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     aligned_binary_match = aligned_binary_re.match(line)
     if aligned_binary_match is None:
@@ -26052,10 +26052,10 @@ def _repair_terminal_classifier_tail_layout(
     context: _FastPrecanonicalizeRepairContext,
 ) -> Tuple[str | None, str | None]:
     sub_from_one_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.sub\(torch\.as_tensor\(1\.0, dtype=torch\.float32, device=_module_device\(self\)\), (?P<input>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.sub\(torch\.as_tensor\(1\.0, dtype=torch\.float32, device=_module_device\(self\)\), (?P<input>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     reshape_singleton_tail_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     sub_match = sub_from_one_re.match(line)
     if sub_match is not None and _fast_precanonicalize_is_cf_like(
@@ -26102,56 +26102,56 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     conv_block_decl_re = re.compile(r"^\s*self\.(?P<module>conv_block_[0-9]+) = _Conv2dBlock\($")
     out_channels_re = re.compile(r"^\s*out_channels=(?P<channels>\d+),$")
     module_output_assign_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\("
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\("
     )
     singleton_reshape_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<expr>.+), \[(?P<n>\d+), 1, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     binary_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<expr>torch\.(?:mul|add|sub|div|minimum|maximum)\(.+\))$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<expr>torch\.(?:mul|add|sub|div|minimum|maximum)\(.+\))$"
     )
     simple_alias_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>[A-Za-z0-9_]+)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<rhs>[A-Za-z0-9_]+)$"
     )
     rank3_reshape_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
         r"(?:_resolve_reshape_shape\(\[(?P<resolved_shape>[0-9,\- ]+)\], (?P=input), allow_zero=False\)|\[(?P<shape>[0-9,\- ]+)\])\)$"
     )
     simple_binary_expr_re = re.compile(
         r"^torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)$"
     )
     prelu_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.prelu_[0-9]+\((?P<input>[A-Za-z0-9_]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.prelu_[0-9]+\((?P<input>[A-Za-z0-9_]+)\)$"
     )
     channel_last_prelu_consumer_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.prelu_[0-9]+\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)\.permute\(0, 2, 3, 1\)\.contiguous\(\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.prelu_[0-9]+\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)\.permute\(0, 2, 3, 1\)\.contiguous\(\)$"
     )
     permuted_conv_input_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
     gather_slice_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\[:, :, :, \[(?P<indices>[0-9,\s-]+)\]\]$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<input>[A-Za-z0-9_]+)\[:, :, :, \[(?P<indices>[0-9,\s-]+)\]\]$"
     )
     depth_to_space_nhwc_gather_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<input>[A-Za-z0-9_]+)\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<input>[A-Za-z0-9_]+)\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
     )
     generic_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = (?P<rhs>.+)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<rhs>.+)$"
     )
     aligned_bn_const_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.(?P<op>mul|add)\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.(?P<op>mul|add)\((?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     aligned_bn_const_reshaped_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.(?P<op>mul|add)\((?P<input>[A-Za-z0-9_]+), torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, (?P<reshape_c>\d+), 1, 1\]\)\), \[(?P<n>\d+), (?P<c0>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.(?P<op>mul|add)\((?P<input>[A-Za-z0-9_]+), torch\.reshape\(self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, (?P<reshape_c>\d+), 1, 1\]\)\), \[(?P<n>\d+), (?P<c0>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     aligned_binary_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.(?P<op>mul|add|sub|div|minimum|maximum)\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)\]\)$"
     )
     aligned_rank4_any_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\((?P<expr>.+), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     aligned_scalar_binary_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
         r"torch\.(?P<op>mul|add|sub|div)\((?P<input>[A-Za-z0-9_]+), "
         r"(?P<scalar>[-+]?(?:[0-9]*\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?\d+)?)\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
@@ -26160,34 +26160,34 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         r"^(?P<indent>\s*)return (?P<value>[A-Za-z0-9_]+)$"
     )
     apply_resize_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?:size=)?[\[\(](?P<out_h>\d+), (?P<out_w>\d+)[\]\)], method='(?P<method>[^']+)', target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     apply_pool2d_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     dynamic_apply_pool2d_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=_tensor_shape_list\((?P<shape_input>[A-Za-z0-9_]+)\), is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=_tensor_shape_list\((?P<shape_input>[A-Za-z0-9_]+)\), is_max_pool=(?P<is_max>True|False), channel_last=False\)$"
     )
     const_pad_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pads>[0-9,\s]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\((?P<input>[A-Za-z0-9_]+), \[(?P<pads>[0-9,\s]+)\], mode='constant', value=(?P<value>[-+0-9.eE]+)\)$"
     )
     apply_softmax_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_softmax\((?:input=)?(?P<input>[A-Za-z0-9_]+), axis=(?P<axis>-?\d+), beta=(?P<beta>[-0-9.eE]+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)]\)$"
     )
     local_response_norm_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.local_response_norm\((?P<input>[A-Za-z0-9_]+), size=(?P<size>\d+), alpha=(?P<alpha>[-+0-9.eE]+), beta=(?P<beta>[-+0-9.eE]+), k=(?P<k>[-+0-9.eE]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.local_response_norm\((?P<input>[A-Za-z0-9_]+), size=(?P<size>\d+), alpha=(?P<alpha>[-+0-9.eE]+), beta=(?P<beta>[-+0-9.eE]+), k=(?P<k>[-+0-9.eE]+)\)$"
     )
     reduce_max_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _reduce_max\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_reduce_max\((?P<input>[A-Za-z0-9_]+), _normalize_axes\(\[(?P<axis>-?\d+)\], (?P=input)\.ndim\), (?P<keepdims>True|False)\)$"
     )
     sub_from_one_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.sub\(torch\.as_tensor\(1\.0, dtype=torch\.float32, device=_module_device\(self\)\), (?P<input>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.sub\(torch\.as_tensor\(1\.0, dtype=torch\.float32, device=_module_device\(self\)\), (?P<input>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     reshape_singleton_tail_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), \[(?P<n>\d+), (?P<h>\d+), (?P<w>\d+), 1\]\)$"
     )
     tensor786_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs\("
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs\("
         r"(?P<input>[A-Za-z0-9_]+), self\.(?P<const_attr>[A-Za-z0-9_]+), \[1, 2, (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     for line in lines:
@@ -27116,24 +27116,24 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         return max(int(shape[1]), int(shape[2]), int(shape[3]))
 
     pidnet_cf_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
         r"torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_cf_resize_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?P<input>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?P<input>[A-Za-z0-9_]+), "
         r"\[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', "
         r"target_shape=\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\], "
         r"align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), "
         r"channel_last=False\)$"
     )
     pidnet_cf_alias_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
         r"(?P<input>[A-Za-z0-9_]+)\.permute\(0, 2, 3, 1\)\.contiguous\(\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_binary_anchor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\("
         r"\(*\s*(?P<a>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<b>[A-Za-z0-9_]+)\s*\)*, "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
@@ -27143,29 +27143,29 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_mul_align_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
         r"torch\.mul\(\(*\s*(?P<a>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<b>[A-Za-z0-9_]+)\s*\)*\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_reduce_sum_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _reduce_sum\((?P<input>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_reduce_sum\((?P<input>[A-Za-z0-9_]+), "
         r"_normalize_axes\(\[(?P<axis>\d+)\], (?P=input)\.ndim\), True\)$"
     )
     pidnet_sigmoid_reshape_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.reshape\(torch\.sigmoid\((?P<input>[A-Za-z0-9_]+)\), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\(torch\.sigmoid\((?P<input>[A-Za-z0-9_]+)\), "
         r"\[(?P<n>\d+), (?P<c>\d+), (?P<h>\d+), (?P<w>\d+)\]\)$"
     )
     pidnet_cf_mean_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.mean\((?P<input>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.mean\((?P<input>[A-Za-z0-9_]+), "
         r"dim=\[(?P<axis0>\d+), (?P<axis1>\d+)\], keepdim=True\)$"
     )
     pidnet_bn_mul_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
         r"torch\.mul\(\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_bn_mul_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\("
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\("
         r"torch\.mul\(\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*\), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
@@ -27180,29 +27180,29 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_cf_pad_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*F\.pad\(_align_tensor_to_target_shape\((?P<input>[A-Za-z0-9_]+), "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\), "
         r"\[0, 0, (?P<pad_top>\d+), (?P<pad_bottom>\d+), (?P<pad_left>\d+), (?P<pad_right>\d+)\], "
         r"mode='constant', value=0\.0\)$"
     )
     pidnet_cf_pool_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?P<input>[A-Za-z0-9_]+), "
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?P<input>[A-Za-z0-9_]+), "
         r"filter_height=(?P<fh>\d+), filter_width=(?P<fw>\d+), stride_h=(?P<sh>\d+), stride_w=(?P<sw>\d+), "
         r"padding='(?P<padding>[^']+)', target_shape=\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\], "
         r"is_max_pool=(?P<is_max>True|False), channel_last=True\)$"
     )
     pidnet_scale3_anchor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\("
         r"\(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_scale3_anchor_reversed_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\("
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\("
         r"\(*\s*(?P<const_expr>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\s*\)*, \(*\s*(?P<input>[A-Za-z0-9_]+)\s*\)*, "
         r"\[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     pidnet_permute_conv_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
     pidnet_plain_alias_re = re.compile(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*(?P<input>self\.[A-Za-z0-9_]+|[A-Za-z0-9_]+)\)*$"
@@ -27878,22 +27878,22 @@ def _apply_humanseg_fast_precanonicalize_repairs(model_path: Path) -> None:
         return
     changed = False
     resize_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', target_shape=\[(?P<shape>[0-9, ]+)\], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?P<input>[A-Za-z0-9_]+), \[(?P<out_h>\d+), (?P<out_w>\d+)\], method='(?P<method>[^']+)', target_shape=\[(?P<shape>[0-9, ]+)\], align_corners=(?P<align>True|False), half_pixel_centers=(?P<hpc>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
     concat_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=3, target_shape=\[(?P<shape>[0-9, ]+)\], fused='(?P<fused>[^']+)'\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_concat\(\[(?P<inputs>[A-Za-z0-9_, ]+)\], axis=3, target_shape=\[(?P<shape>[0-9, ]+)\], fused='(?P<fused>[^']+)'\)$"
     )
     conv71_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_\d+)\((?P<src>[A-Za-z0-9_]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_\d+)\((?P<src>[A-Za-z0-9_]+)\)$"
     )
     align_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<shape>[0-9, ]+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<shape>[0-9, ]+)\]\)$"
     )
     binary_anchor_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+) = _align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<shape>[0-9, ]+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs0>[A-Za-z0-9_]+), (?P<lhs1>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs_to_anchor\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+), \[(?P<shape>[0-9, ]+)\]\)$"
     )
     conv71_permute_assign_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>conv_block_\d+)\(_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_\d+)\(_torch_permute\((?P<src>[A-Za-z0-9_]+), \[0, 3, 1, 2\]\)\)$"
     )
 
     def _normalized_resize_shape_from_match(match: re.Match[str]) -> List[int]:
@@ -28658,7 +28658,40 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         return
     model_source = model_path.read_text(encoding="utf-8")
     lines = model_source.splitlines()
+    depth_to_space_nhwc_gather_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<input>[A-Za-z0-9_]+)\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
+    )
+    changed = False
+    index = 0
+    while index < len(lines):
+        current_line = str(lines[index])
+        next_line = str(lines[index + 1]) if index + 1 < len(lines) else None
+        depth_to_space_gather_match = depth_to_space_nhwc_gather_re.match(current_line)
+        if depth_to_space_gather_match is not None:
+            lhs_name = str(depth_to_space_gather_match.group("lhs"))
+            input_name = str(depth_to_space_gather_match.group("input"))
+            next_assigns_depth_to_space = (
+                next_line is not None
+                and re.match(rf"^\s*[A-Za-z0-9_]+\s*=\s*{re.escape(lhs_name)}$", next_line) is not None
+                and "_depth_to_space_" in next_line
+            )
+            if (
+                input_name.endswith("_nhwc")
+                and (
+                    "depth_to" in lhs_name.lower()
+                    or "depthtospace" in lhs_name.lower()
+                    or next_assigns_depth_to_space
+                )
+            ):
+                lines[index] = (
+                    f"{depth_to_space_gather_match.group('indent')}{lhs_name} = "
+                    f"{input_name}[:, :, :, [{depth_to_space_gather_match.group('indices')}]]"
+                )
+                changed = True
+        index += 1
     if not _has_alike_fast_repair_signature(lines):
+        if changed:
+            model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return
     stage7_reshape_shape_pattern = r"(?:\[\s*-1\s*,\s*1\s*\]|\(\s*-1\s*,\s*1\s*\))"
 
@@ -28824,8 +28857,6 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*torch\.Tensor)?\s*=\s*\(?(?P<rhs>[A-Za-z0-9_]+)\)?$"
     )
 
-    changed = False
-    lines = model_source.splitlines()
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -28934,6 +28965,30 @@ def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
             changed = True
             index += 1
             continue
+        depth_to_space_gather_match = depth_to_space_nhwc_gather_re.match(current_line)
+        if depth_to_space_gather_match is not None:
+            lhs_name = str(depth_to_space_gather_match.group("lhs"))
+            input_name = str(depth_to_space_gather_match.group("input"))
+            next_assigns_depth_to_space = (
+                next_line is not None
+                and re.match(rf"^\s*[A-Za-z0-9_]+\s*=\s*{re.escape(lhs_name)}$", next_line) is not None
+                and "_depth_to_space_" in next_line
+            )
+            if (
+                input_name.endswith("_nhwc")
+                and (
+                    "depth_to" in lhs_name.lower()
+                    or "depthtospace" in lhs_name.lower()
+                    or next_assigns_depth_to_space
+                )
+            ):
+                lines[index] = (
+                    f"{depth_to_space_gather_match.group('indent')}{lhs_name} = "
+                    f"{input_name}[:, :, :, [{depth_to_space_gather_match.group('indices')}]]"
+                )
+                changed = True
+                index += 1
+                continue
         index += 1
 
     stage7_def_index = next(
@@ -32196,7 +32251,7 @@ def _resolve_nhwc_to_nchw_bridge_source(expr: str) -> str | None:
 
 def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
     resize_assign_re = re.compile(
-        r"^\s*(?P<lhs>[A-Za-z0-9_]+) = _apply_resize\((?:input=)?[A-Za-z0-9_]+, (?:size=)?[\[\(]\d+, \d+[\]\)], method='[^']+', "
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_resize\((?:input=)?[A-Za-z0-9_]+, (?:size=)?[\[\(]\d+, \d+[\]\)], method='[^']+', "
         r"target_shape=[\[\(]1, \d+, \d+, \d+[\]\)], align_corners=(?:True|False), "
         r"half_pixel_centers=(?:True|False), channel_last=True\)$"
     )
@@ -32204,7 +32259,7 @@ def _has_bread_decoder_merge_signature(lines: Sequence[str]) -> bool:
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<rhs>[A-Za-z0-9_]+)\s*\)*$"
     )
     apply_concat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_concat\((?:[\[\(](?P<inputs>.+)[\]\)]|inputs=[\[\(](?P<inputs_kw>.+)[\]\)]), axis=(?:1|3), "
+        r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_concat\((?:[\[\(](?P<inputs>.+)[\]\)]|inputs=[\[\(](?P<inputs_kw>.+)[\]\)]), axis=(?:1|3), "
         r"target_shape=[\[\(][0-9, ]+[\]\)], fused='[^']+'\)$"
     )
     resize_like_inputs: Set[str] = set()
@@ -32302,7 +32357,7 @@ def _has_bread_output_bridge_signature(lines: Sequence[str]) -> bool:
 
 def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
     resize_assign_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_resize\((?:input=)?[A-Za-z0-9_]+, (?:size=)?[\[\(]\d+, \d+[\]\)], method='[^']+', "
+        r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_resize\((?:input=)?[A-Za-z0-9_]+, (?:size=)?[\[\(]\d+, \d+[\]\)], method='[^']+', "
         r"target_shape=[\[\(]1, \d+, \d+, \d+[\]\)], align_corners=(?:True|False), "
         r"half_pixel_centers=(?:True|False), channel_last=True\)$"
     )
@@ -32310,7 +32365,7 @@ def _has_bread_fast_skip_signature(lines: Sequence[str]) -> bool:
         r"^\s*(?P<lhs>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*=\s*\(*\s*(?P<rhs>[A-Za-z0-9_]+)\s*\)*$"
     )
     apply_concat_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = _apply_concat\((?:[\[\(](?P<inputs>.+)[\]\)]|inputs=[\[\(](?P<inputs_kw>.+)[\]\)]), axis=(?:1|3), "
+        r"^\s*[A-Za-z0-9_]+\s*=\s*_apply_concat\((?:[\[\(](?P<inputs>.+)[\]\)]|inputs=[\[\(](?P<inputs_kw>.+)[\]\)]), axis=(?:1|3), "
         r"target_shape=[\[\(][0-9, ]+[\]\)], fused='[^']+'\)$"
     )
     resize_like_outputs: Set[str] = set()
@@ -32665,7 +32720,7 @@ def _has_efficientformer_attention_signature(lines: Sequence[str]) -> bool:
 
 def _has_humanseg_fast_repair_signature(lines: Sequence[str]) -> bool:
     conv_assign_re = re.compile(
-        r"^\s*[A-Za-z0-9_]+ = self\.conv_block_\d+\((?P<src_expr>.+)\)$"
+        r"^\s*[A-Za-z0-9_]+\s*=\s*self\.conv_block_\d+\((?P<src_expr>.+)\)$"
     )
     for index in range(len(lines) - 4):
         assign0 = _parse_simple_assignment_line(str(lines[index]))
@@ -33589,40 +33644,47 @@ def _temporarily_rewrite_generated_model_source_for_exported_program(
 
 def _repair_exported_program_channel_last_pool_targets(lines: List[str]) -> List[str]:
     rewritten = list(lines)
-    repair_context = _build_fast_precanonicalize_repair_context(rewritten)
     apply_pool2d_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_pool2d\((?:input=)?(?P<input>[A-Za-z0-9_]+), (?P<rest>.+), target_shape=[\[\(](?P<n>\d+), (?P<h>\d+), (?P<w>\d+), (?P<c>\d+)[\]\)], is_max_pool=(?P<is_max>True|False), channel_last=(?P<channel_last>True|False)\)$"
     )
-    for index, line in enumerate(rewritten):
-        apply_pool2d_match = apply_pool2d_re.match(line)
-        if apply_pool2d_match is None:
-            continue
-        lhs_name = str(apply_pool2d_match.group("lhs"))
-        if not _fast_precanonicalize_has_channel_last_spatial_consumer(
-            lhs_name,
-            index,
-            rewritten,
-            repair_context,
-        ):
-            continue
-        current_shape = [
-            int(apply_pool2d_match.group("n")),
-            int(apply_pool2d_match.group("h")),
-            int(apply_pool2d_match.group("w")),
-            int(apply_pool2d_match.group("c")),
-        ]
-        if (
-            str(apply_pool2d_match.group("channel_last")) == "True"
-            and _fast_precanonicalize_rank4_layout_hint(current_shape) == "nhwc"
-        ):
-            continue
-        normalized_shape = _normalize_nhwc_rank4_shape(current_shape)
-        rewritten[index] = (
-            f"{apply_pool2d_match.group('indent')}{lhs_name} = _apply_pool2d("
-            f"{apply_pool2d_match.group('input')}, {apply_pool2d_match.group('rest')}, "
-            f"target_shape={repr(normalized_shape)}, "
-            f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=True)"
-        )
+    changed = True
+    while changed:
+        changed = False
+        repair_context = _build_fast_precanonicalize_repair_context(rewritten)
+        for index, line in enumerate(rewritten):
+            apply_pool2d_match = apply_pool2d_re.match(line)
+            if apply_pool2d_match is None:
+                continue
+            lhs_name = str(apply_pool2d_match.group("lhs"))
+            if not _fast_precanonicalize_has_channel_last_spatial_consumer(
+                lhs_name,
+                index,
+                rewritten,
+                repair_context,
+            ):
+                continue
+            current_shape = [
+                int(apply_pool2d_match.group("n")),
+                int(apply_pool2d_match.group("h")),
+                int(apply_pool2d_match.group("w")),
+                int(apply_pool2d_match.group("c")),
+            ]
+            if (
+                str(apply_pool2d_match.group("channel_last")) == "True"
+                and _fast_precanonicalize_rank4_layout_hint(current_shape) == "nhwc"
+            ):
+                continue
+            normalized_shape = _normalize_nhwc_rank4_shape(current_shape)
+            rewritten_line = (
+                f"{apply_pool2d_match.group('indent')}{lhs_name} = _apply_pool2d("
+                f"{apply_pool2d_match.group('input')}, {apply_pool2d_match.group('rest')}, "
+                f"target_shape={repr(normalized_shape)}, "
+                f"is_max_pool={apply_pool2d_match.group('is_max')}, channel_last=True)"
+            )
+            if rewritten_line == line:
+                continue
+            rewritten[index] = rewritten_line
+            changed = True
     return rewritten
 
 
@@ -33631,13 +33693,13 @@ def _repair_exported_program_direct_conv_cf_add_targets(lines: List[str]) -> Lis
     conv_block_decl_re = re.compile(r"^\s*self\.(?P<module>[A-Za-z0-9_]+) = _Conv2dBlock\($")
     in_channels_re = re.compile(r"^\s*in_channels=(?P<channels>\d+),$")
     aligned_add_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = _align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_align_tensor_to_target_shape\(torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), \[(?P<n>\d+), (?P<d1>\d+), (?P<d2>\d+), (?P<d3>\d+)\]\)$"
     )
     relu_same_lhs_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = torch\.relu\((?P=lhs)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.relu\((?P=lhs)\)$"
     )
     module_call_re = re.compile(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+) = self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>[A-Za-z0-9_]+)\((?P<input>[A-Za-z0-9_]+)\)$"
     )
 
     conv_block_in_channels: Dict[str, int] = {}
