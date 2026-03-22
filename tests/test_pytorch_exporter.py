@@ -10030,6 +10030,51 @@ def test_apply_fast_precanonicalize_repairs_repairs_cf_pool_and_binary_alignment
     assert "merged = _align_tensor_to_target_shape(torch.add(pooled, residual_cf), [1, 24, 104, 104])" in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_preserves_cf_binary_and_pool_shapes_with_reused_names(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_reused_cf_name_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(",
+                "            in_channels=1,",
+                "            out_channels=128,",
+                "        )",
+                "        self.conv_block_1 = _Conv2dBlock(",
+                "            in_channels=128,",
+                "            out_channels=32,",
+                "        )",
+                "        self.register_buffer('const_BatchNormalization_2_bn_add', torch.zeros([1, 1, 1, 128], dtype=torch.float32), persistent=True)",
+                "        self.register_buffer('const_batch_normalization2_x128_x1_902c', torch.zeros([1, 128, 1, 1], dtype=torch.float32), persistent=False)",
+                "",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        x_cf = self.conv_block_0(x)",
+                "        _binary_lhs_1, _binary_rhs_1 = _align_binary_inputs_to_anchor(x_cf, torch.reshape(self.const_batch_normalization2_x128_x1_902c, [1, 128, 1, 1]), [1, 128, 1, 1])",
+                "        x = _align_tensor_to_target_shape(torch.add(_binary_lhs_1, _binary_rhs_1), [1, 128, 1, 86])",
+                "        x = _apply_pool2d(x, filter_height=1, filter_width=2, stride_h=3, stride_w=3, padding='VALID', target_shape=[1, 128, 1, 29], is_max_pool=True, channel_last=False)",
+                "        x_cf = self.conv_block_1(x)",
+                "        return x_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "x = _align_tensor_to_target_shape(torch.add(_binary_lhs_1, _binary_rhs_1), [1, 128, 1, 86])" in rewritten
+    assert "x = _apply_pool2d(x, filter_height=1, filter_width=2, stride_h=3, stride_w=3, padding='VALID', target_shape=[1, 128, 1, 29], is_max_pool=True, channel_last=False)" in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_restores_channel_last_pool_after_permute(
     tmp_path,
 ) -> None:

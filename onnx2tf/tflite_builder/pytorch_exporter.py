@@ -28227,28 +28227,86 @@ def _fast_precanonicalize_preferred_channel_count(
     dynamic_cf_like_names: Set[str],
     dynamic_nhwc_like_names: Set[str],
     context: _FastPrecanonicalizeRepairContext,
+    shape_hint: Sequence[int] | None = None,
 ) -> int | None:
     resolved = _fast_precanonicalize_resolve_alias(str(name), context.aliases)
+    resolved_is_cf_like = _fast_precanonicalize_is_cf_like(
+        resolved,
+        dynamic_cf_like_names,
+        context,
+    )
+    resolved_is_nhwc_like = _fast_precanonicalize_is_nhwc_like(
+        resolved,
+        dynamic_nhwc_like_names,
+        context,
+    )
+    shape_hint_values = (
+        [int(value) for value in list(shape_hint)]
+        if shape_hint is not None and len(list(shape_hint)) == 4
+        else None
+    )
+
+    def _pick_shape_hint_candidate(candidates: Sequence[int]) -> int | None:
+        if shape_hint_values is None:
+            return None
+        hinted_candidates: list[tuple[int, str]] = []
+        for candidate in candidates:
+            layout_hint = _fast_precanonicalize_rank4_layout_hint(
+                shape_hint_values,
+                preferred_channel_count=int(candidate),
+            )
+            if layout_hint is not None:
+                hinted_candidates.append((int(candidate), layout_hint))
+        if len(hinted_candidates) == 0:
+            return None
+        if resolved_is_cf_like:
+            for candidate, layout_hint in hinted_candidates:
+                if layout_hint == "cf":
+                    return int(candidate)
+        if resolved_is_nhwc_like:
+            for candidate, layout_hint in hinted_candidates:
+                if layout_hint == "nhwc":
+                    return int(candidate)
+        unique_candidates: list[int] = []
+        for candidate, _ in hinted_candidates:
+            if int(candidate) not in unique_candidates:
+                unique_candidates.append(int(candidate))
+        if len(unique_candidates) == 1:
+            return int(unique_candidates[0])
+        return None
+
     consumer_modules = context.module_input_consumers.get(resolved, [])
+    consumer_channel_candidates: list[int] = []
     for consumer_module in consumer_modules:
         consumer_channels = context.conv_block_in_channels.get(consumer_module, None)
-        if consumer_channels is not None:
-            return int(consumer_channels)
+        if consumer_channels is None:
+            continue
+        consumer_channel_value = int(consumer_channels)
+        if consumer_channel_value not in consumer_channel_candidates:
+            consumer_channel_candidates.append(consumer_channel_value)
+    hinted_consumer_channel = _pick_shape_hint_candidate(consumer_channel_candidates)
+    if hinted_consumer_channel is not None:
+        return int(hinted_consumer_channel)
+    if len(consumer_channel_candidates) > 0:
+        return int(consumer_channel_candidates[0])
     producer_name = context.module_output_producers.get(resolved, None)
     if producer_name is not None:
         producer_channels = context.conv_block_out_channels.get(producer_name, None)
         if producer_channels is not None:
+            hinted_producer_channel = _pick_shape_hint_candidate([int(producer_channels)])
+            if hinted_producer_channel is not None:
+                return int(hinted_producer_channel)
             return int(producer_channels)
     static_shape = context.static_shapes.get(resolved, None)
     if static_shape is not None and len(static_shape) == 4:
         static_layout_hint = _fast_precanonicalize_rank4_layout_hint(static_shape)
         if (
-            _fast_precanonicalize_is_cf_like(resolved, dynamic_cf_like_names, context)
+            resolved_is_cf_like
             and static_layout_hint == "cf"
         ):
             return int(static_shape[1])
         if (
-            _fast_precanonicalize_is_nhwc_like(resolved, dynamic_nhwc_like_names, context)
+            resolved_is_nhwc_like
             and static_layout_hint == "nhwc"
         ):
             return int(static_shape[3])
@@ -28429,6 +28487,7 @@ def _fast_precanonicalize_infer_consumer_layout(
                 dynamic_cf_like_names,
                 dynamic_nhwc_like_names,
                 context,
+                shape_hint=list(align_rank4_shape),
             )
             layout_hint = _fast_precanonicalize_rank4_layout_hint(
                 list(align_rank4_shape),
@@ -28671,6 +28730,7 @@ def _repair_cf_resize_target_shape(
         dynamic_cf_like_names,
         dynamic_nhwc_like_names,
         context,
+        shape_hint=current_shape,
     )
     if preferred_channel_count is None:
         preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
@@ -28678,6 +28738,7 @@ def _repair_cf_resize_target_shape(
             dynamic_cf_like_names,
             dynamic_nhwc_like_names,
             context,
+            shape_hint=current_shape,
         )
     if _fast_precanonicalize_rank4_layout_hint(
         current_shape,
@@ -28738,6 +28799,7 @@ def _repair_cf_pool_target_shape(
         dynamic_cf_like_names,
         dynamic_nhwc_like_names,
         context,
+        shape_hint=current_shape,
     )
     if preferred_channel_count is None:
         preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
@@ -28745,6 +28807,7 @@ def _repair_cf_pool_target_shape(
             dynamic_cf_like_names,
             dynamic_nhwc_like_names,
             context,
+            shape_hint=current_shape,
         )
     if (
         input_is_immediate_nhwc_bridge
@@ -28873,11 +28936,13 @@ def _repair_binary_alignment_layout(
     )
     if not operands_are_cf_like and consumer_layout != "cf":
         return None, None
+    current_shape = [int(v) for v in list(target_shape)]
     preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
         lhs_name,
         dynamic_cf_like_names,
         dynamic_nhwc_like_names,
         context,
+        shape_hint=current_shape,
     )
     if preferred_channel_count is None:
         preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
@@ -28885,15 +28950,16 @@ def _repair_binary_alignment_layout(
             dynamic_cf_like_names,
             dynamic_nhwc_like_names,
             context,
+            shape_hint=current_shape,
         )
     if preferred_channel_count is None:
         preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
             arg_b,
             dynamic_cf_like_names,
-            dynamic_nhwc_like_names,
-            context,
-        )
-    current_shape = [int(v) for v in list(target_shape)]
+        dynamic_nhwc_like_names,
+        context,
+        shape_hint=current_shape,
+    )
     if _fast_precanonicalize_rank4_layout_hint(
         current_shape,
         preferred_channel_count=preferred_channel_count,
@@ -29708,6 +29774,12 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                     cf_like_names,
                     nhwc_like_names,
                     repair_context,
+                    shape_hint=[
+                        int(aligned_binary_match.group("n")),
+                        int(aligned_binary_match.group("h")),
+                        int(aligned_binary_match.group("w")),
+                        int(aligned_binary_match.group("c")),
+                    ],
                 ),
             )
             operands_are_cf_like = (
@@ -29801,6 +29873,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         cf_like_names,
                         nhwc_like_names,
                         repair_context,
+                        shape_hint=current_shape,
                     ),
                 ) != "cf"
                 and (
@@ -29816,6 +29889,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         cf_like_names,
                         nhwc_like_names,
                         repair_context,
+                        shape_hint=current_shape,
                     )
                 if preferred_channel_count is None:
                     preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
@@ -29823,6 +29897,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         cf_like_names,
                         nhwc_like_names,
                         repair_context,
+                        shape_hint=current_shape,
                     )
                 normalized_shape = _normalize_cf_rank4_shape(
                     current_shape,
@@ -29900,6 +29975,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                     cf_like_names,
                     nhwc_like_names,
                     repair_context,
+                    shape_hint=pool_shape,
                 )
                 if preferred_channel_count is None:
                     preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
@@ -29907,6 +29983,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         cf_like_names,
                         nhwc_like_names,
                         repair_context,
+                        shape_hint=pool_shape,
                     )
                 normalized_shape = _normalize_nhwc_rank4_shape(
                     pool_shape,
@@ -29965,6 +30042,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         cf_like_names,
                         nhwc_like_names,
                         repair_context,
+                        shape_hint=pool_shape,
                     ),
                 ) != "cf"
                 and
@@ -29998,6 +30076,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         cf_like_names,
                         nhwc_like_names,
                         repair_context,
+                        shape_hint=current_shape,
                     )
                     if preferred_channel_count is None:
                         preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
@@ -30005,6 +30084,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                             cf_like_names,
                             nhwc_like_names,
                             repair_context,
+                            shape_hint=current_shape,
                         )
                     normalized_shape = _normalize_cf_rank4_shape(
                         current_shape,
@@ -30042,6 +30122,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         cf_like_names,
                         nhwc_like_names,
                         repair_context,
+                        shape_hint=pool_shape,
                     )
                 )
                 if preferred_channel_count is None:
