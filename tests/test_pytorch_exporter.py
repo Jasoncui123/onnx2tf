@@ -283,6 +283,54 @@ def test_rewrite_channel_last_binary_bridge_chains_accepts_helper_permute_bridge
     ]
 
 
+def test_rewrite_channel_last_binary_bridge_chains_accepts_functional_permute_and_keyword_shapes() -> None:
+    lines = [
+        "in_public_layout_bridge = torch.permute(input=in_t, dims=(0, 2, 3, 1)).contiguous()",
+        "_binary_lhs_1, _binary_rhs_1 = _align_binary_inputs(input=in_public_layout_bridge, other=self.const_tensor_623_nhwc, target_shape=(1, 3, 64, 64))",
+        "cv65_in = _align_tensor_to_target_shape(input=torch.sub(input=_binary_lhs_1, other=_binary_rhs_1), target_shape=(1, 3, 64, 64))",
+        "cv65_out_nhwc_cf = self.conv_block_0(_torch_permute(input=cv65_in, perm=(0, 3, 1, 2)))",
+    ]
+
+    rewritten = _rewrite_channel_last_binary_bridge_chains(
+        lines,
+        derive_local_var_name=lambda base_name: f"{base_name}_tmp",
+        channel_first_constant_expr_for_buffer_attr=lambda buffer_expr, target_shape: (
+            "self.const_tensor623_nhwc_ch_first1_x3_x1_x1"
+            if buffer_expr == "self.const_tensor_623_nhwc" and list(target_shape) == [1, 3, 1, 1]
+            else None
+        ),
+    )
+
+    assert rewritten == [
+        "cv65_in_cf_tmp = torch.sub(in_t, self.const_tensor623_nhwc_ch_first1_x3_x1_x1)",
+        "cv65_out_nhwc_cf = self.conv_block_0(cv65_in_cf_tmp)",
+    ]
+
+
+def test_rewrite_channel_last_binary_bridge_chains_accepts_functional_transpose_back() -> None:
+    lines = [
+        "seed = torch.relu(out_cf)",
+        "out_nhwc = _align_tensor_to_target_shape(input=_torch_permute(input=out_cf, perm=(0, 2, 3, 1)), target_shape=(1, 8, 8, 4))",
+        "out_binary = _align_tensor_to_target_shape(input=torch.add(input=out_nhwc, other=self.const_add_any), target_shape=(1, 8, 8, 4))",
+        "out_cf_next = torch.permute(input=out_binary, dims=(0, 3, 1, 2)).contiguous()",
+    ]
+
+    rewritten = _rewrite_channel_last_binary_bridge_chains(
+        lines,
+        derive_local_var_name=lambda base_name: f"{base_name}_tmp",
+        channel_first_constant_expr_for_buffer_attr=lambda buffer_expr, target_shape: (
+            "self.const_add_cf"
+            if buffer_expr == "self.const_add_any" and list(target_shape) == [1, 4, 1, 1]
+            else None
+        ),
+    )
+
+    assert rewritten == [
+        "seed = torch.relu(out_cf)",
+        "out_cf_next = torch.add(out_cf, self.const_add_cf)",
+    ]
+
+
 def test_fold_channel_last_affine_conv_bridges_handles_compact_assignments() -> None:
     lines = [
         "x_nhwc=_align_tensor_to_target_shape(x_cf.permute(0, 2, 3, 1).contiguous(), [1, 8, 8, 4])",
@@ -445,6 +493,21 @@ def test_fold_rank4_reshape_permute_conv_bridges_accepts_keyword_tuple_shapes() 
         "x_reshaped = torch.reshape(input=x_cf, shape=(1, 16, 4, 4))",
         "x_nhwc = torch.reshape(input=x_reshaped.permute(0, 2, 3, 1).contiguous(), shape=(1, 4, 4, 16))",
         "y = _align_tensor_to_target_shape(self.conv_block_0(x_nhwc.permute(0, 3, 1, 2).contiguous()), (1, 32, 4, 4))",
+    ]
+
+    rewritten = _fold_rank4_reshape_permute_conv_bridges(lines)
+
+    assert rewritten == [
+        "x_reshaped = torch.reshape(input=x_cf, shape=(1, 16, 4, 4))",
+        "y = _align_tensor_to_target_shape(self.conv_block_0(x_reshaped), [1, 32, 4, 4])",
+    ]
+
+
+def test_fold_rank4_reshape_permute_conv_bridges_accepts_helper_and_functional_permute() -> None:
+    lines = [
+        "x_reshaped = torch.reshape(input=x_cf, shape=(1, 16, 4, 4))",
+        "x_nhwc = torch.reshape(input=torch.permute(input=x_reshaped, dims=(0, 2, 3, 1)).contiguous(), shape=(1, 4, 4, 16))",
+        "y = _align_tensor_to_target_shape(self.conv_block_0(_torch_permute(input=x_nhwc, perm=(0, 3, 1, 2))), (1, 32, 4, 4))",
     ]
 
     rewritten = _fold_rank4_reshape_permute_conv_bridges(lines)
@@ -41216,6 +41279,18 @@ def test_repair_channel_last_gap_conv_inputs_accepts_keyword_tuple_dims() -> Non
     ]
 
 
+def test_repair_channel_last_gap_conv_inputs_accepts_helper_reduce_mean() -> None:
+    lines = [
+        "        gap = _reduce_mean(_torch_permute(input=features_cf, perm=(0, 2, 3, 1)), _normalize_axes([1, 2], features_cf.ndim), keepdims=True)",
+        "        y = self.conv_block_66(gap)",
+    ]
+    repaired = _repair_channel_last_gap_conv_inputs(lines)
+    assert repaired == [
+        "        gap = _reduce_mean(_torch_permute(input=features_cf, perm=(0, 2, 3, 1)), _normalize_axes([1, 2], features_cf.ndim), keepdims=True)",
+        "        y = self.conv_block_66(gap.permute(0, 3, 1, 2).contiguous())",
+    ]
+
+
 def test_fold_channel_first_gap_conv_bridges_repairs_compact_assignment_chain() -> None:
     lines = [
         "gap=torch.mean(features_cf, dim=[2, 3], keepdim=True)",
@@ -41281,6 +41356,22 @@ def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_accepts_keyw
 
     assert repaired == [
         "gap_nhwc = torch.mean(features_cf.permute(0, 2, 3, 1).contiguous(), dim=[1, 2], keepdim=True)",
+    ]
+
+
+def test_rewrite_channel_first_gap_outputs_to_explicit_channel_last_accepts_helper_and_functional_permute() -> None:
+    lines = [
+        "gap = torch.mean(input=features_cf, dim=(2, 3), keepdim=True)",
+        "gap_nhwc = torch.permute(input=gap, dims=(0, 2, 3, 1)).contiguous()",
+        "gap2 = torch.mean(input=features_cf, dim=(2, 3), keepdim=True)",
+        "gap_nhwc_2 = _torch_permute(input=gap2, perm=(0, 2, 3, 1))",
+    ]
+
+    repaired = _rewrite_channel_first_gap_outputs_to_explicit_channel_last(lines)
+
+    assert repaired == [
+        "gap_nhwc = torch.mean(features_cf.permute(0, 2, 3, 1).contiguous(), dim=[1, 2], keepdim=True)",
+        "gap_nhwc_2 = torch.mean(features_cf.permute(0, 2, 3, 1).contiguous(), dim=[1, 2], keepdim=True)",
     ]
 
 
@@ -41397,6 +41488,29 @@ def test_fold_channel_first_hardsigmoid_gate_conv_bridges_accepts_helper_permute
     ]
 
 
+def test_fold_channel_first_hardsigmoid_gate_conv_bridges_accepts_keyword_tuple_gate_ops() -> None:
+    lines = [
+        "        gate_mul = torch.mul(input=features_cf, other=0.1666666716337204)",
+        "        gate_add = _align_tensor_to_target_shape(input=torch.add(input=gate_mul, other=0.5), target_shape=(1, 8, 16, 960))",
+        "        gate_sig = torch.clamp(gate_add, min=0.0, max=1.0)",
+        "        _binary_rhs_0, _binary_lhs_0 = _align_binary_inputs_to_anchor(a=gate_sig, b=features_cf, target_shape=(1, 8, 16, 960))",
+        "        gated_nhwc = _align_tensor_to_target_shape(input=torch.mul(input=_binary_lhs_0, other=_binary_rhs_0), target_shape=(1, 8, 16, 960))",
+        "        y0 = self.conv_block_62(_torch_permute(input=gated_nhwc, perm=(0, 3, 1, 2)))",
+        "        gap = torch.mean(input=gated_nhwc, dim=(1, 2), keepdim=True)",
+        "        ygap = self.conv_block_66(_torch_permute(input=gap, perm=(0, 3, 1, 2)))",
+    ]
+
+    rewritten = _fold_channel_first_hardsigmoid_gate_conv_bridges(lines)
+
+    assert rewritten == [
+        "        gate_sig = torch.nn.functional.hardsigmoid(features_cf)",
+        "        gated_nhwc = torch.mul(features_cf, gate_sig)",
+        "        y0 = self.conv_block_62(gated_nhwc)",
+        "        gap = torch.mean(gated_nhwc, dim=[2, 3], keepdim=True)",
+        "        ygap = self.conv_block_66(gap)",
+    ]
+
+
 def test_inline_trivial_public_layout_bridge_aliases_rewrites_compact_alias_assignment() -> None:
     lines = [
         "foo_public_layout_bridge=foo_cf",
@@ -41451,6 +41565,22 @@ def test_fold_boundary_transpose_pad_conv_bridges_accepts_helper_permute_input()
     assert rewritten == [
         "conv0 = self.conv_block_0(x_nhwc)",
         "y = _torch_permute(input=conv0, perm=(0, 2, 3, 1))",
+    ]
+
+
+def test_fold_boundary_transpose_pad_conv_bridges_accepts_functional_and_method_output_permute() -> None:
+    lines = [
+        "conv0 = self.conv_block_0(_torch_permute(input=x_nhwc, perm=(0, 2, 3, 1)))",
+        "y = torch.permute(input=conv0, dims=(0, 2, 3, 1)).contiguous()",
+        "z = conv0.permute(0, 2, 3, 1).contiguous()",
+    ]
+
+    rewritten = _fold_boundary_transpose_pad_conv_bridges(lines)
+
+    assert rewritten == [
+        "conv0 = self.conv_block_0(x_nhwc)",
+        "y = torch.permute(input=conv0, dims=(0, 2, 3, 1)).contiguous()",
+        "z = conv0.permute(0, 2, 3, 1).contiguous()",
     ]
 
 
@@ -41621,6 +41751,53 @@ def test_bridge_boundary_metadata_gather_nd_inputs_collapses_keyword_tuple_doubl
     ]
 
 
+def test_bridge_boundary_metadata_gather_nd_inputs_collapses_functional_double_permute() -> None:
+    model_ir = ModelIR(name="boundary_metadata_gather_nd_functional_double_permute_helper")
+    model_ir.inputs = ["data", "indices"]
+    model_ir.outputs = ["output"]
+    model_ir.tensors["data"] = TensorIR(
+        name="data",
+        dtype="FLOAT32",
+        shape=[1, 17, 48, 64],
+        shape_signature=[1, 17, 48, 64],
+        logical_layout="NCHW",
+    )
+    model_ir.tensors["indices"] = TensorIR(
+        name="indices",
+        dtype="INT32",
+        shape=[6, 3],
+        shape_signature=[6, 3],
+        logical_layout="UNKNOWN",
+    )
+    model_ir.tensors["output"] = TensorIR(
+        name="output",
+        dtype="FLOAT32",
+        shape=[6, 17],
+        shape_signature=[6, 17],
+        logical_layout="UNKNOWN",
+    )
+    model_ir.operators.append(
+        OperatorIR(
+            op_type="GATHER_ND",
+            inputs=["data", "indices"],
+            outputs=["output"],
+            options={},
+        )
+    )
+
+    rewritten = _bridge_boundary_metadata_gather_nd_inputs(
+        [
+            "output=_apply_gather_nd(torch.permute(input=data, dims=(0, 2, 3, 1)).contiguous().permute(0, 2, 3, 1).contiguous(), indices, target_shape=[6, 17])"
+        ],
+        model_ir=model_ir,
+        tensor_var_names={"data": "data", "indices": "indices", "output": "output"},
+    )
+
+    assert rewritten == [
+        "output = _apply_gather_nd(_torch_permute(data, [0, 2, 3, 1]), indices, target_shape=[6, 17])",
+    ]
+
+
 def test_collapse_redundant_torch_permute_chains_keeps_compact_assignment_semantics() -> None:
     rewritten = _collapse_redundant_torch_permute_chains(
         ["out=_torch_permute(x, [0, 2, 3, 1]).permute(0, 2, 3, 1).contiguous()"]
@@ -41632,6 +41809,14 @@ def test_collapse_redundant_torch_permute_chains_keeps_compact_assignment_semant
 def test_collapse_redundant_torch_permute_chains_accepts_keyword_tuple_permute() -> None:
     rewritten = _collapse_redundant_torch_permute_chains(
         ["out=_torch_permute(input=x, perm=(0, 2, 3, 1)).permute(0, 2, 3, 1).contiguous()"]
+    )
+
+    assert rewritten == ["out=_torch_permute(x, [0, 2, 3, 1])"]
+
+
+def test_collapse_redundant_torch_permute_chains_accepts_functional_permute() -> None:
+    rewritten = _collapse_redundant_torch_permute_chains(
+        ["out=torch.permute(input=x, dims=(0, 2, 3, 1)).contiguous().permute(0, 2, 3, 1).contiguous()"]
     )
 
     assert rewritten == ["out=_torch_permute(x, [0, 2, 3, 1])"]
