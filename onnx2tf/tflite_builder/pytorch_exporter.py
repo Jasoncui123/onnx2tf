@@ -17481,6 +17481,7 @@ print(json.dumps({"file_name": dynamo_onnx_path.name}))
                 "Dynamo ONNX export failed for the generated native PyTorch package. "
                 f"package_dir={package_dir} details={last_error_message}"
             )
+        _reapply_post_export_final_model_repairs(package_path)
         return None
     try:
         _sanitize_dynamo_exported_onnx_metadata(dynamo_onnx_path)
@@ -17500,6 +17501,7 @@ print(json.dumps({"file_name": dynamo_onnx_path.name}))
                 "Dynamo ONNX sanitize failed for the generated native PyTorch package. "
                 f"package_dir={package_dir} artifact={dynamo_onnx_path} details={ex}"
             ) from ex
+        _reapply_post_export_final_model_repairs(package_path)
         return None
     _write_generated_package_export_metadata(
         metadata_path=metadata_path,
@@ -17509,6 +17511,7 @@ print(json.dumps({"file_name": dynamo_onnx_path.name}))
         example_input_shapes=example_input_shapes,
         dynamic_inputs_present=dynamic_inputs_present,
     )
+    _reapply_post_export_final_model_repairs(package_path)
     return str(dynamo_onnx_path)
 
 
@@ -19438,6 +19441,7 @@ print(json.dumps({"file_name": exported_program_path.name}))
                 "ExportedProgram export failed for the generated native PyTorch package. "
                 f"package_dir={package_dir} details={last_error_message}"
             )
+        _reapply_post_export_final_model_repairs(package_path)
         return None
     try:
         _strip_stack_traces_from_exported_program_archive(exported_program_path)
@@ -19460,6 +19464,7 @@ print(json.dumps({"file_name": exported_program_path.name}))
         example_input_shapes=example_input_shapes,
         dynamic_inputs_present=dynamic_inputs_present,
     )
+    _reapply_post_export_final_model_repairs(package_path)
     return str(exported_program_path)
 
 
@@ -25806,6 +25811,7 @@ def _canonicalize_generated_model_source_for_raw_export(
             input_name = str(aligned_rank4_const_pad6_match.group("input"))
             if (
                 _is_known_cf_name(input_name, singleton_cf_seeds)
+                and "_nhwc" not in input_name
                 and not _tensor_name_suggests_channel_last_layout_for_codegen(input_name)
             ):
                 indent = str(aligned_rank4_const_pad6_match.group("indent"))
@@ -28223,6 +28229,75 @@ def _parse_int_list_literal(text: str) -> List[int]:
     ]
 
 
+def _convert_nhwc_pad_to_nchw_pad_values(pad_values: Sequence[int]) -> List[int] | None:
+    values = [int(value) for value in list(pad_values)]
+    if len(values) % 2 != 0 or len(values) > 8:
+        return None
+    nhwc_inner_to_outer = ["C", "W", "H", "N"]
+    nchw_inner_to_outer = ["W", "H", "C", "N"]
+    semantic_pairs = {name: [0, 0] for name in nhwc_inner_to_outer}
+    pair_count = len(values) // 2
+    for idx in range(pair_count):
+        semantic_pairs[nhwc_inner_to_outer[idx]] = [
+            int(values[idx * 2]),
+            int(values[idx * 2 + 1]),
+        ]
+    output_pairs = [semantic_pairs[name] for name in nchw_inner_to_outer]
+    last_nonzero = -1
+    for idx, pair in enumerate(output_pairs):
+        if pair != [0, 0]:
+            last_nonzero = idx
+    if last_nonzero < 0:
+        return []
+    flattened: List[int] = []
+    for pair in output_pairs[: last_nonzero + 1]:
+        flattened.extend([int(pair[0]), int(pair[1])])
+    return flattened
+
+
+def _convert_nchw_pad_to_nhwc_pad_values(pad_values: Sequence[int]) -> List[int] | None:
+    values = [int(value) for value in list(pad_values)]
+    if len(values) % 2 != 0 or len(values) > 8:
+        return None
+    nchw_inner_to_outer = ["W", "H", "C", "N"]
+    nhwc_inner_to_outer = ["C", "W", "H", "N"]
+    semantic_pairs = {name: [0, 0] for name in nchw_inner_to_outer}
+    pair_count = len(values) // 2
+    for idx in range(pair_count):
+        semantic_pairs[nchw_inner_to_outer[idx]] = [
+            int(values[idx * 2]),
+            int(values[idx * 2 + 1]),
+        ]
+    output_pairs = [semantic_pairs[name] for name in nhwc_inner_to_outer]
+    last_nonzero = -1
+    for idx, pair in enumerate(output_pairs):
+        if pair != [0, 0]:
+            last_nonzero = idx
+    if last_nonzero < 0:
+        return []
+    flattened: List[int] = []
+    for pair in output_pairs[: last_nonzero + 1]:
+        flattened.extend([int(pair[0]), int(pair[1])])
+    return flattened
+
+
+def _infer_unique_channel_count_from_rank4_shape(shape: Sequence[int]) -> int | None:
+    shape_values = [int(value) for value in list(shape)]
+    if len(shape_values) != 4:
+        return None
+    dims = [int(value) for value in shape_values[1:]]
+    candidates = [
+        int(value)
+        for value in dims
+        if int(value) > 1 and dims.count(int(value)) == 1
+    ]
+    if len(candidates) == 1:
+        return int(candidates[0])
+    if len(candidates) > 1:
+        return int(max(candidates))
+    return None
+
+
 def _fast_precanonicalize_expr_identifiers(expr: str) -> Set[str]:
     return {
         token
@@ -29307,6 +29382,23 @@ def _repair_nhwc_average_pool_binary_bridge(
         pool_shape,
         preferred_channel_count=preferred_channel_count,
     )
+    changed = False
+    if index > 0:
+        previous_pad_assign = _parse_constant_pad_assign(lines[index - 1])
+        if (
+            previous_pad_assign is not None
+            and previous_pad_assign[1] == pool_input_name
+            and re.fullmatch(r"[A-Za-z0-9_]+", previous_pad_assign[2]) is not None
+        ):
+            nhwc_pad_values = _convert_nchw_pad_to_nhwc_pad_values(previous_pad_assign[3])
+            if nhwc_pad_values is not None:
+                rewritten_pad_line = (
+                    f"{previous_pad_assign[0]}{previous_pad_assign[1]} = "
+                    f"F.pad({previous_pad_assign[2]}, {repr(nhwc_pad_values)}, mode='constant', value={previous_pad_assign[4]})"
+                )
+                if rewritten_pad_line != lines[index - 1]:
+                    lines[index - 1] = rewritten_pad_line
+                    changed = True
 
     def _rewrite_binary_other_expr(expr: str) -> str:
         stripped = str(expr).strip()
@@ -29349,7 +29441,6 @@ def _repair_nhwc_average_pool_binary_bridge(
     )
     rewritten_input_a = pool_lhs_name if str(input_a).strip() == pool_lhs_name else rewritten_other_expr
     rewritten_input_b = rewritten_other_expr if str(input_a).strip() == pool_lhs_name else pool_lhs_name
-    changed = False
     rewritten_pool_line = (
         f"{pool_indent}{pool_lhs_name} = _apply_pool2d("
         f"{pool_input_name}, {pool_rest}, "
@@ -31197,7 +31288,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     _apply_pidnet_fast_precanonicalize_repairs(model_path)
     _apply_humanseg_fast_precanonicalize_repairs(model_path)
-    _apply_fastestdet_fast_precanonicalize_repairs(model_path)
+    _apply_structural_fast_precanonicalize_repairs(model_path)
     _apply_alike_fast_precanonicalize_repairs(model_path)
     _apply_shadowformer_fast_precanonicalize_repairs(model_path)
     _restore_channel_last_spatial_pool_chains(model_path)
@@ -33317,147 +33408,492 @@ def _has_alike_fast_repair_signature(lines: Sequence[str]) -> bool:
         and has_stage7_return
     )
 
-def _apply_fastestdet_fast_precanonicalize_repairs(model_path: Path) -> None:
-    if not model_path.exists():
-        return
-    lines = model_path.read_text(encoding="utf-8").splitlines()
+def _infer_structural_rank4_channel_count(
+    tensor_name: str,
+    shape: Sequence[int],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> int | None:
+    preferred_channel_count = _fast_precanonicalize_preferred_channel_count(
+        tensor_name,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+        shape_hint=shape,
+    )
+    if preferred_channel_count is not None:
+        return int(preferred_channel_count)
+    return _infer_unique_channel_count_from_rank4_shape(shape)
+
+
+def _rewrite_structural_mixed_layout_binary_anchor_and_add(
+    lines: List[str],
+    index: int,
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    parsed_anchor = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[index])
+    if parsed_anchor is None:
+        return False
+    indent, lhs0, lhs1, input_a, input_b, current_shape = parsed_anchor
+    input_a_is_cf = _fast_precanonicalize_is_cf_like(input_a, dynamic_cf_like_names, context)
+    input_b_is_cf = _fast_precanonicalize_is_cf_like(input_b, dynamic_cf_like_names, context)
+    input_a_is_nhwc = _fast_precanonicalize_is_nhwc_like(input_a, dynamic_nhwc_like_names, context)
+    input_b_is_nhwc = _fast_precanonicalize_is_nhwc_like(input_b, dynamic_nhwc_like_names, context)
+    if not (
+        (input_a_is_cf and input_b_is_nhwc)
+        or (input_b_is_cf and input_a_is_nhwc)
+    ):
+        return False
+    cf_name = input_a if input_a_is_cf else input_b
+    preferred_channel_count = _infer_structural_rank4_channel_count(
+        cf_name,
+        current_shape,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    )
+    if preferred_channel_count is None:
+        return False
+    normalized_shape = _normalize_nhwc_rank4_shape(
+        current_shape,
+        preferred_channel_count=preferred_channel_count,
+    )
     changed = False
-    for index, line in enumerate(lines):
-        indent = line[: len(line) - len(line.lstrip())]
-        stripped = str(line).strip()
-        if stripped == "max_p2_in_nhwc = max_p2_in_nhwc_cf":
-            if index + 2 < len(lines):
-                next_line = str(lines[index + 1]).strip()
-                next_next_line = str(lines[index + 2]).strip()
-                if (
-                    next_line.startswith("max_p2_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p2_in_nhwc, [1, 176, 176, 24]),")
-                    and next_next_line.startswith("max_p2_out_nhwc = _apply_pool2d(max_p2_in_nhwc_padded,")
-                ):
-                    lines[index + 1] = (
-                        f"{indent}max_p2_in_cf_padded = "
-                        "F.pad(max_p2_in_nhwc_cf, [1, 1, 1, 1], mode='constant', "
-                        "value=-3.4028234663852886e+38)"
-                    )
-                    lines[index + 2] = (
-                        f"{indent}max_p2_out_nhwc = "
-                        "_apply_pool2d(max_p2_in_cf_padded, filter_height=3, filter_width=3, "
-                        "stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 88, 88], "
-                        "is_max_pool=True, channel_last=False)"
-                    )
+    rewritten_anchor = (
+        f"{indent}{lhs0}, {lhs1} = _align_binary_inputs_to_anchor("
+        f"{input_a}, {input_b}, {repr(normalized_shape)})"
+    )
+    if rewritten_anchor != lines[index]:
+        lines[index] = rewritten_anchor
+        dynamic_nhwc_like_names.update({lhs0, lhs1})
+        changed = True
+    if index + 1 < len(lines):
+        parsed_add = _parse_dynamic_binary_add_align_assign(lines[index + 1])
+        if parsed_add is not None and {parsed_add[2], parsed_add[3]} == {lhs0, lhs1}:
+            rewritten_add = (
+                f"{parsed_add[0]}{parsed_add[1]} = _align_tensor_to_target_shape("
+                f"torch.add({parsed_add[2]}, {parsed_add[3]}), {repr(normalized_shape)})"
+            )
+            if rewritten_add != lines[index + 1]:
+                lines[index + 1] = rewritten_add
+                dynamic_nhwc_like_names.add(parsed_add[1])
+                changed = True
+        else:
+            parsed_static_add = _parse_static_binary_add_align_assign(lines[index + 1])
+            if parsed_static_add is not None and {parsed_static_add[2], parsed_static_add[3]} == {lhs0, lhs1}:
+                rewritten_static_add = (
+                    f"{parsed_static_add[0]}{parsed_static_add[1]} = _align_tensor_to_target_shape("
+                    f"torch.add({parsed_static_add[2]}, {parsed_static_add[3]}), {repr(normalized_shape)})"
+                )
+                if rewritten_static_add != lines[index + 1]:
+                    lines[index + 1] = rewritten_static_add
+                    dynamic_nhwc_like_names.add(parsed_static_add[1])
                     changed = True
-            continue
-        if stripped.startswith("average_p229_in_nhwc_padded = F.pad(cv57_in_nhwc,"):
-            lines[index] = (
-                f"{indent}average_p229_in_nhwc_padded = "
-                "F.pad(cv57_in_nhwc, [0, 0, 1, 1, 1, 1], mode='constant', value=0.0)"
-            )
-            changed = True
-            continue
-        if stripped.startswith("average_p229_out_nhwc_include_pad = _apply_pool2d("):
-            lines[index] = (
-                f"{indent}average_p229_out_nhwc_include_pad = "
-                "_apply_pool2d(average_p229_in_nhwc_padded, filter_height=3, filter_width=3, "
-                "stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 22, 22, 48], "
-                "is_max_pool=False, channel_last=True)"
-            )
-            changed = True
-            continue
-        if stripped.startswith("_binary_lhs_61, _binary_rhs_61 = _align_binary_inputs_to_anchor("):
-            lines[index] = (
-                f"{indent}_binary_lhs_61, _binary_rhs_61 = "
-                "_align_binary_inputs_to_anchor(average_p229_out_nhwc_include_pad, "
-                "self.const_average_p229_x48_x22_5c41.permute(0, 2, 3, 1).contiguous(), [1, 22, 22, 48])"
-            )
-            changed = True
-            continue
-        if stripped.startswith("average_p229_out = _align_tensor_to_target_shape(torch.mul(_binary_lhs_61, _binary_rhs_61),"):
-            lines[index] = (
-                f"{indent}average_p229_out = "
-                "_align_tensor_to_target_shape(torch.mul(_binary_lhs_61, _binary_rhs_61), [1, 22, 22, 48])"
-            )
-            changed = True
-            continue
-        if stripped.startswith("_binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc,"):
-            lines[index] = (
-                f"{indent}_binary_rhs_230, _binary_lhs_230 = "
-                "_align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc, [1, 22, 22, 96])"
-            )
-            changed = True
-            continue
-        if stripped == "cv246_in = torch.cat([onnx_concat715_cf, onnx_concat721_cf, onnx_concat730_cf], dim=1)":
-            lines[index] = (
-                f"{indent}cv246_in = "
-                "_apply_concat([onnx_concat715_cf, onnx_concat721_cf, onnx_concat730_cf], "
-                "axis=3, target_shape=[1, 22, 22, 288], fused='NONE')"
-            )
-            changed = True
-            continue
-        if stripped.startswith("cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230),"):
-            lines[index] = (
-                f"{indent}cv249_in = "
-                "_align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 22, 22, 96])"
-            )
-            changed = True
-            continue
-        if stripped == "onnx_concat744_cf = self.conv_block_67(cv253_in_cf)":
-            lines[index] = (
-                f"{indent}onnx_concat744_cf = "
-                "_torch_permute(self.conv_block_67(cv253_in_cf), [0, 3, 1, 2])"
-            )
-            changed = True
-            continue
-        if stripped == "cv257_out_cf = self.conv_block_68(cv257_in_cf)":
-            lines[index] = (
-                f"{indent}cv257_out_cf = "
-                "_torch_permute(self.conv_block_68(cv257_in_cf), [0, 3, 1, 2])"
-            )
-            changed = True
-            continue
-        if stripped == "onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])":
-            lines[index] = (
-                f"{indent}onnx_tr756 = "
-                "_apply_softmax(cv260_out_nhwc, axis=3, beta=1.0, target_shape=[1, 80, 22, 22])"
-            )
-            changed = True
-            continue
-        if stripped == "t_758 = _torch_permute(t_758_public_layout_bridge, [0, 3, 1, 2])":
-            lines[index] = f"{indent}t_758 = t_758_public_layout_bridge"
-            changed = True
-    if changed:
-        model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return changed
 
 
-def _apply_fastestdet_final_model_repairs(model_path: Path) -> None:
+def _rewrite_structural_channel_last_pool_pad_pairs(
+    lines: List[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    for index in range(len(lines) - 1):
+        pad_assign = _parse_constant_pad_assign(lines[index])
+        pool_assign = _parse_apply_pool2d_assign_with_shape(lines[index + 1])
+        if (
+            pad_assign is None
+            or pool_assign is None
+            or pad_assign[1] != pool_assign[2]
+            or not pool_assign[6]
+        ):
+            continue
+        aligned_pad_input = _parse_align_tensor_target_shape_expr(pad_assign[2])
+        aligned_pad_source = (
+            aligned_pad_input[0].strip()
+            if aligned_pad_input is not None
+            else None
+        )
+        if not (
+            _fast_precanonicalize_is_nhwc_like(pad_assign[2], dynamic_nhwc_like_names, context)
+            or (
+                aligned_pad_source is not None
+                and _fast_precanonicalize_is_nhwc_like(
+                    aligned_pad_source,
+                    dynamic_nhwc_like_names,
+                    context,
+                )
+            )
+            or "_nhwc" in str(pad_assign[2])
+            or (aligned_pad_source is not None and "_nhwc" in str(aligned_pad_source))
+            or "_nhwc" in str(pool_assign[1])
+        ):
+            continue
+        if len(pad_assign[3]) == 6 and [int(v) for v in list(pad_assign[3][:2])] == [0, 0]:
+            continue
+        rewritten_pad_values = _convert_nchw_pad_to_nhwc_pad_values(pad_assign[3])
+        if rewritten_pad_values is None or rewritten_pad_values == pad_assign[3]:
+            continue
+        rewritten_pad_line = (
+            f"{pad_assign[0]}{pad_assign[1]} = "
+            f"F.pad({pad_assign[2]}, {repr(rewritten_pad_values)}, mode='constant', value={pad_assign[4]})"
+        )
+        if rewritten_pad_line != lines[index]:
+            lines[index] = rewritten_pad_line
+            changed = True
+    return changed
+
+
+def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
     if not model_path.exists():
         return
     lines = model_path.read_text(encoding="utf-8").splitlines()
+    context = _build_fast_precanonicalize_repair_context(lines)
+    dynamic_cf_like_names: Set[str] = set(context.cf_like_names)
+    dynamic_nhwc_like_names: Set[str] = set(context.nhwc_like_names)
     changed = False
+    direct_conv_assign_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\((?P<input>[A-Za-z0-9_]+)\)$"
+    )
+
+    simple_assignments_by_lhs: Dict[str, int] = {}
+    direct_conv_assignments_by_lhs: Dict[str, Tuple[int, str, str]] = {}
+    for idx, current_line in enumerate(lines):
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is not None:
+            simple_assignments_by_lhs[str(assign[1])] = idx
+        direct_conv_match = direct_conv_assign_re.match(current_line)
+        if direct_conv_match is not None:
+            direct_conv_assignments_by_lhs[str(direct_conv_match.group("lhs"))] = (
+                idx,
+                str(direct_conv_match.group("module")),
+                str(direct_conv_match.group("input")),
+            )
+
     for index, line in enumerate(lines):
-        indent = line[: len(line) - len(line.lstrip())]
-        stripped = str(line).strip()
-        if stripped.startswith("cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230),"):
-            rewritten = (
-                f"{indent}cv249_in = "
-                "_align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 22, 22, 96])"
-            )
-            if rewritten != line:
-                lines[index] = rewritten
-                changed = True
-            continue
-        if stripped.startswith("onnx_tr756 = _apply_softmax(cv260_out_nhwc,"):
-            rewritten = (
-                f"{indent}onnx_tr756 = "
-                "_apply_softmax(cv260_out_nhwc, axis=3, beta=1.0, target_shape=[1, 80, 22, 22])"
-            )
-            if rewritten != line:
-                lines[index] = rewritten
-                changed = True
-            continue
-        if stripped == "t_758 = _torch_permute(t_758_public_layout_bridge, [0, 3, 1, 2])":
-            lines[index] = f"{indent}t_758 = t_758_public_layout_bridge"
+        simple_alias = _parse_simple_assignment_line(line)
+        if (
+            simple_alias is not None
+            and index + 2 < len(lines)
+            and re.fullmatch(r"[A-Za-z0-9_]+", simple_alias[2].strip()) is not None
+            and _fast_precanonicalize_is_cf_like(simple_alias[2].strip(), dynamic_cf_like_names, context)
+        ):
+            pad_assign = _parse_constant_pad_assign(lines[index + 1])
+            pool_assign = _parse_apply_pool2d_assign_with_shape(lines[index + 2])
+            if pad_assign is not None and pool_assign is not None and pool_assign[5] and pool_assign[6]:
+                aligned_pad_input = _parse_align_tensor_target_shape_expr(pad_assign[2])
+                if (
+                    aligned_pad_input is not None
+                    and aligned_pad_input[0].strip() == simple_alias[1]
+                    and pad_assign[1] == pool_assign[2]
+                    and "_nhwc" in str(pool_assign[1])
+                ):
+                    nchw_pad = _convert_nhwc_pad_to_nchw_pad_values(pad_assign[3])
+                    preferred_channel_count = _infer_structural_rank4_channel_count(
+                        pool_assign[1],
+                        pool_assign[4],
+                        dynamic_cf_like_names,
+                        dynamic_nhwc_like_names,
+                        context,
+                    )
+                    if nchw_pad is not None and preferred_channel_count is not None:
+                        lines[index + 1] = (
+                            f"{pad_assign[0]}{pad_assign[1]} = "
+                            f"F.pad({simple_alias[2].strip()}, {repr(nchw_pad)}, mode='constant', value={pad_assign[4]})"
+                        )
+                        lines[index + 2] = (
+                            f"{pool_assign[0]}{pool_assign[1]} = _apply_pool2d("
+                            f"{pool_assign[2]}, {pool_assign[3]}, "
+                            f"target_shape={repr(_normalize_cf_rank4_shape(pool_assign[4], preferred_channel_count=preferred_channel_count))}, "
+                            f"is_max_pool={pool_assign[5]}, channel_last=False)"
+                        )
+                        dynamic_cf_like_names.add(pool_assign[1])
+                        changed = True
+                        continue
+
+        if _rewrite_structural_mixed_layout_binary_anchor_and_add(
+            lines,
+            index,
+            dynamic_cf_like_names,
+            dynamic_nhwc_like_names,
+            context,
+        ):
             changed = True
+            continue
+
+        assign = _parse_simple_assignment_line(line)
+        torch_cat_args = _parse_torch_cat_inputs_and_dim(assign[2]) if assign is not None else None
+        if (
+            assign is not None
+            and torch_cat_args is not None
+            and torch_cat_args[1] == 1
+        ):
+            cat_inputs = [name.strip() for name in torch_cat_args[0] if name.strip()]
+            if cat_inputs and all(
+                _fast_precanonicalize_is_cf_like(input_name, dynamic_cf_like_names, context)
+                for input_name in cat_inputs
+            ):
+                cat_changed = False
+                for lookahead in range(index + 1, min(len(lines), index + 5)):
+                    direct_conv_match = direct_conv_assign_re.match(lines[lookahead])
+                    if direct_conv_match is None or str(direct_conv_match.group("input")) != assign[1]:
+                        continue
+                    conv_module = str(direct_conv_match.group("module"))
+                    conv_lhs = str(direct_conv_match.group("lhs"))
+                    conv_in_channels = context.conv_block_in_channels.get(conv_module)
+                    conv_out_channels = context.conv_block_out_channels.get(conv_module)
+                    if conv_in_channels is None or conv_out_channels is None:
+                        continue
+                    for anchor_index in range(lookahead + 1, min(len(lines), lookahead + 5)):
+                        parsed_anchor = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[anchor_index])
+                        if parsed_anchor is None or conv_lhs not in {parsed_anchor[3], parsed_anchor[4]}:
+                            continue
+                        normalized_anchor_shape = _normalize_nhwc_rank4_shape(
+                            parsed_anchor[5],
+                            preferred_channel_count=int(conv_out_channels),
+                        )
+                        lines[index] = (
+                            f"{assign[0]}{assign[1]} = _apply_concat([{', '.join(cat_inputs)}], "
+                            f"axis=3, target_shape={[normalized_anchor_shape[0], normalized_anchor_shape[1], normalized_anchor_shape[2], int(conv_in_channels)]}, "
+                            "fused='NONE')"
+                        )
+                        dynamic_nhwc_like_names.add(assign[1])
+                        if _rewrite_structural_mixed_layout_binary_anchor_and_add(
+                            lines,
+                            anchor_index,
+                            dynamic_cf_like_names,
+                            dynamic_nhwc_like_names,
+                            context,
+                        ):
+                            pass
+                        cat_changed = True
+                        changed = True
+                        break
+                    if cat_changed:
+                        break
+                if cat_changed:
+                    continue
+                for lookahead in range(index + 1, min(len(lines), index + 4)):
+                    permute_assign = _parse_torch_permute_assign(lines[lookahead])
+                    if (
+                        permute_assign is None
+                        or permute_assign[3] != [0, 3, 1, 2]
+                        or str(permute_assign[2]) != assign[1]
+                    ):
+                        continue
+                    for cat_input in cat_inputs:
+                        direct_conv_assign = direct_conv_assignments_by_lhs.get(cat_input)
+                        if direct_conv_assign is not None:
+                            direct_conv_index, conv_module, conv_input = direct_conv_assign
+                            rewritten_conv = (
+                                f"{lines[direct_conv_index][: len(lines[direct_conv_index]) - len(lines[direct_conv_index].lstrip())]}"
+                                f"{cat_input} = _torch_permute(self.{conv_module}({conv_input}), [0, 3, 1, 2])"
+                            )
+                            if lines[direct_conv_index] != rewritten_conv:
+                                lines[direct_conv_index] = rewritten_conv
+                                dynamic_cf_like_names.add(cat_input)
+                                changed = True
+                        input_index = simple_assignments_by_lhs.get(cat_input)
+                        input_assign = _parse_simple_assignment_line(lines[input_index]) if input_index is not None else None
+                        softmax_args = _parse_apply_softmax_input_axis_and_shape(input_assign[2]) if input_assign is not None else None
+                        if softmax_args is not None and softmax_args[2] is not None:
+                            preferred_channel_count = _infer_structural_rank4_channel_count(
+                                cat_input,
+                                list(softmax_args[2]),
+                                dynamic_cf_like_names,
+                                dynamic_nhwc_like_names,
+                                context,
+                            )
+                            if preferred_channel_count is not None:
+                                normalized_softmax_shape = _normalize_cf_rank4_shape(
+                                    list(softmax_args[2]),
+                                    preferred_channel_count=preferred_channel_count,
+                                )
+                                rewritten_softmax = (
+                                    f"{input_assign[0]}{input_assign[1]} = _apply_softmax("
+                                    f"{softmax_args[0]}, axis=3, beta=1.0, target_shape={repr(normalized_softmax_shape)})"
+                                )
+                                if lines[input_index] != rewritten_softmax:
+                                    lines[input_index] = rewritten_softmax
+                                    dynamic_cf_like_names.add(cat_input)
+                                    changed = True
+                    rewritten_output = f"{permute_assign[0]}{permute_assign[1]} = {assign[1]}"
+                    if lines[lookahead] != rewritten_output:
+                        lines[lookahead] = rewritten_output
+                        dynamic_cf_like_names.add(str(permute_assign[1]))
+                        changed = True
+                    break
+            public_bridge_inputs_ok = bool(cat_inputs)
+            if public_bridge_inputs_ok:
+                for cat_input in cat_inputs:
+                    if _fast_precanonicalize_is_cf_like(cat_input, dynamic_cf_like_names, context):
+                        continue
+                    input_index = simple_assignments_by_lhs.get(cat_input)
+                    input_assign = _parse_simple_assignment_line(lines[input_index]) if input_index is not None else None
+                    softmax_args = _parse_apply_softmax_input_axis_and_shape(input_assign[2]) if input_assign is not None else None
+                    if softmax_args is None or softmax_args[2] is None:
+                        public_bridge_inputs_ok = False
+                        break
+            if public_bridge_inputs_ok:
+                for lookahead in range(index + 1, min(len(lines), index + 4)):
+                    permute_assign = _parse_torch_permute_assign(lines[lookahead])
+                    if (
+                        permute_assign is None
+                        or permute_assign[3] != [0, 3, 1, 2]
+                        or str(permute_assign[2]) != assign[1]
+                    ):
+                        continue
+                    for cat_input in cat_inputs:
+                        direct_conv_assign = direct_conv_assignments_by_lhs.get(cat_input)
+                        if direct_conv_assign is not None:
+                            direct_conv_index, conv_module, conv_input = direct_conv_assign
+                            rewritten_conv = (
+                                f"{lines[direct_conv_index][: len(lines[direct_conv_index]) - len(lines[direct_conv_index].lstrip())]}"
+                                f"{cat_input} = _torch_permute(self.{conv_module}({conv_input}), [0, 3, 1, 2])"
+                            )
+                            if lines[direct_conv_index] != rewritten_conv:
+                                lines[direct_conv_index] = rewritten_conv
+                                dynamic_cf_like_names.add(cat_input)
+                                changed = True
+                        input_index = simple_assignments_by_lhs.get(cat_input)
+                        input_assign = _parse_simple_assignment_line(lines[input_index]) if input_index is not None else None
+                        softmax_args = _parse_apply_softmax_input_axis_and_shape(input_assign[2]) if input_assign is not None else None
+                        if softmax_args is not None and softmax_args[2] is not None:
+                            preferred_channel_count = _infer_structural_rank4_channel_count(
+                                cat_input,
+                                list(softmax_args[2]),
+                                dynamic_cf_like_names,
+                                dynamic_nhwc_like_names,
+                                context,
+                            )
+                            if preferred_channel_count is not None:
+                                normalized_softmax_shape = _normalize_cf_rank4_shape(
+                                    list(softmax_args[2]),
+                                    preferred_channel_count=preferred_channel_count,
+                                )
+                                rewritten_softmax = (
+                                    f"{input_assign[0]}{input_assign[1]} = _apply_softmax("
+                                    f"{softmax_args[0]}, axis=3, beta=1.0, target_shape={repr(normalized_softmax_shape)})"
+                                )
+                                if lines[input_index] != rewritten_softmax:
+                                    lines[input_index] = rewritten_softmax
+                                    dynamic_cf_like_names.add(cat_input)
+                                    changed = True
+                    rewritten_output = f"{permute_assign[0]}{permute_assign[1]} = {assign[1]}"
+                    if lines[lookahead] != rewritten_output:
+                        lines[lookahead] = rewritten_output
+                        dynamic_cf_like_names.add(str(permute_assign[1]))
+                        changed = True
+                    break
+    if _rewrite_structural_channel_last_pool_pad_pairs(
+        lines,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if changed:
         model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _apply_structural_final_model_repairs(model_path: Path) -> None:
+    if not model_path.exists():
+        return
+    lines = model_path.read_text(encoding="utf-8").splitlines()
+    context = _build_fast_precanonicalize_repair_context(lines)
+    dynamic_cf_like_names: Set[str] = set(context.cf_like_names)
+    dynamic_nhwc_like_names: Set[str] = set(context.nhwc_like_names)
+    changed = False
+    for index, line in enumerate(lines):
+        if _rewrite_structural_mixed_layout_binary_anchor_and_add(
+            lines,
+            index,
+            dynamic_cf_like_names,
+            dynamic_nhwc_like_names,
+            context,
+        ):
+            changed = True
+            continue
+        assign = _parse_simple_assignment_line(line)
+        softmax_args = _parse_apply_softmax_input_axis_and_shape(assign[2]) if assign is not None else None
+        if (
+            assign is not None
+            and softmax_args is not None
+            and softmax_args[2] is not None
+            and _fast_precanonicalize_is_nhwc_like(softmax_args[0], dynamic_nhwc_like_names, context)
+        ):
+            for lookahead in range(index + 1, min(len(lines), index + 4)):
+                cat_assign = _parse_simple_assignment_line(lines[lookahead])
+                cat_args = _parse_torch_cat_inputs_and_dim(cat_assign[2]) if cat_assign is not None else None
+                if cat_args is None or cat_args[1] != 1 or assign[1] not in [name.strip() for name in cat_args[0]]:
+                    continue
+                bridge_line_assign = (
+                    _parse_simple_assignment_line(lines[lookahead + 1])
+                    if lookahead + 1 < len(lines)
+                    else None
+                )
+                bridge_permute = (
+                    _parse_torch_permute_assign(lines[lookahead + 1])
+                    if lookahead + 1 < len(lines)
+                    else None
+                )
+                bridge_lhs: str | None = None
+                if (
+                    bridge_permute is not None
+                    and bridge_permute[3] == [0, 3, 1, 2]
+                    and str(bridge_permute[2]) == str(cat_assign[1])
+                ):
+                    bridge_lhs = str(bridge_permute[1])
+                elif (
+                    bridge_line_assign is not None
+                    and str(bridge_line_assign[2]).strip() == str(cat_assign[1])
+                ):
+                    bridge_lhs = str(bridge_line_assign[1])
+                if bridge_lhs is None:
+                    continue
+                preferred_channel_count = _infer_structural_rank4_channel_count(
+                    assign[1],
+                    list(softmax_args[2]),
+                    dynamic_cf_like_names,
+                    dynamic_nhwc_like_names,
+                    context,
+                )
+                if preferred_channel_count is None:
+                    continue
+                normalized_shape = _normalize_cf_rank4_shape(
+                    list(softmax_args[2]),
+                    preferred_channel_count=preferred_channel_count,
+                )
+                rewritten_softmax = (
+                    f"{assign[0]}{assign[1]} = _apply_softmax("
+                    f"{softmax_args[0]}, axis=3, beta=1.0, target_shape={repr(normalized_shape)})"
+                )
+                if lines[index] != rewritten_softmax:
+                    lines[index] = rewritten_softmax
+                    dynamic_cf_like_names.add(assign[1])
+                    changed = True
+                rewritten_bridge = f"{bridge_line_assign[0]}{bridge_lhs} = {cat_assign[1]}"
+                if lines[lookahead + 1] != rewritten_bridge:
+                    lines[lookahead + 1] = rewritten_bridge
+                    dynamic_cf_like_names.add(str(bridge_lhs))
+                    changed = True
+                break
+    if _rewrite_structural_channel_last_pool_pad_pairs(
+        lines,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if changed:
+        model_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _reapply_post_export_final_model_repairs(package_path: Path) -> None:
+    model_path = Path(package_path) / "model.py"
+    if model_path.exists():
+        _apply_structural_final_model_repairs(model_path)
 
 
 def _apply_alike_fast_precanonicalize_repairs(model_path: Path) -> None:
@@ -37237,6 +37673,137 @@ def _parse_apply_softmax_input_axis_and_shape(
     return input_expr, axis_value, rank4_shape
 
 
+def _parse_constant_pad_assign(
+    line: str,
+) -> Tuple[str, str, str, List[int], str] | None:
+    assign = _parse_simple_assignment_line(line)
+    if assign is None:
+        return None
+    indent, lhs, rhs = assign
+    stripped = rhs.strip()
+    prefix = "F.pad("
+    if not stripped.startswith(prefix) or not stripped.endswith(")"):
+        return None
+    parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+    input_expr: str | None = None
+    pad_expr: str | None = None
+    mode_expr: str | None = None
+    value_expr: str | None = None
+    positional_index = 0
+    for part in parts:
+        keyword_match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part)
+        if keyword_match is not None:
+            key, value = part.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "input":
+                input_expr = value
+            elif key == "pad":
+                pad_expr = value
+            elif key == "mode":
+                mode_expr = value
+            elif key == "value":
+                value_expr = value
+            continue
+        if positional_index == 0:
+            input_expr = part.strip()
+        elif positional_index == 1:
+            pad_expr = part.strip()
+        elif positional_index == 2:
+            mode_expr = part.strip()
+        elif positional_index == 3:
+            value_expr = part.strip()
+        positional_index += 1
+    if input_expr is None or pad_expr is None or mode_expr != "'constant'" or value_expr is None:
+        return None
+    pad_match = re.fullmatch(r"[\[\(](?P<values>[0-9,\s-]+)[\]\)]", pad_expr.strip())
+    if pad_match is None:
+        return None
+    return indent, lhs, input_expr, _parse_int_list_literal(str(pad_match.group("values"))), value_expr
+
+
+def _parse_dynamic_binary_add_align_assign(
+    line: str,
+) -> Tuple[str, str, str, str, int] | None:
+    assign = _parse_simple_assignment_line(line)
+    if assign is None:
+        return None
+    indent, lhs, rhs = assign
+    match = re.fullmatch(
+        r"_align_tensor_to_target_shape\("
+        r"torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\), "
+        r"\[int\((?P<ref>[A-Za-z0-9_]+)\.shape\[0\]\), (?P<c>\d+), "
+        r"int\((?P=ref)\.shape\[2\]\), int\((?P=ref)\.shape\[3\]\)\]\)",
+        rhs.strip(),
+    )
+    if match is None:
+        return None
+    return (
+        indent,
+        lhs,
+        str(match.group("a")),
+        str(match.group("b")),
+        int(match.group("c")),
+    )
+
+
+def _parse_static_binary_add_align_assign(
+    line: str,
+) -> Tuple[str, str, str, str, List[int]] | None:
+    assign = _parse_simple_assignment_line(line)
+    if assign is None:
+        return None
+    indent, lhs, rhs = assign
+    align_parts = _parse_align_tensor_target_shape_expr(rhs)
+    if align_parts is None:
+        return None
+    input_expr, target_shape_expr = align_parts
+    add_match = re.fullmatch(r"torch\.add\((?P<a>[A-Za-z0-9_]+), (?P<b>[A-Za-z0-9_]+)\)", input_expr.strip())
+    target_shape = _parse_rank4_shape_literal(target_shape_expr)
+    if add_match is None or target_shape is None:
+        return None
+    return (
+        indent,
+        lhs,
+        str(add_match.group("a")),
+        str(add_match.group("b")),
+        [int(v) for v in list(target_shape)],
+    )
+
+
+def _parse_align_binary_inputs_to_anchor_assign_with_shape(
+    line: str,
+) -> Tuple[str, str, str, str, str, List[int]] | None:
+    assign_match = re.match(
+        r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)*\s*=\s*(?P<rhs>.+)$",
+        str(line),
+    )
+    if assign_match is None:
+        return None
+    rhs = str(assign_match.group("rhs")).strip()
+    prefix = "_align_binary_inputs_to_anchor("
+    if not rhs.startswith(prefix) or not rhs.endswith(")"):
+        return None
+    parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+    if len(parts) != 3:
+        return None
+    target_shape = _parse_rank4_shape_literal(parts[2].strip())
+    if (
+        target_shape is None
+        or re.fullmatch(r"[A-Za-z0-9_]+", parts[0].strip()) is None
+        or re.fullmatch(r"[A-Za-z0-9_]+", parts[1].strip()) is None
+    ):
+        return None
+    return (
+        str(assign_match.group("indent")),
+        str(assign_match.group("lhs0")),
+        str(assign_match.group("lhs1")),
+        parts[0].strip(),
+        parts[1].strip(),
+        [int(v) for v in list(target_shape)],
+    )
+
+
 def _normalize_permute_dims_expr(expr: str) -> str:
     stripped = str(expr).strip()
     if (
@@ -38906,7 +39473,7 @@ def _canonicalize_generated_model_source_for_raw_export_with_fast_path(
         model_ir=canonicalize_model_ir,
     )
     _apply_fast_precanonicalize_repairs_until_stable(package_path)
-    _apply_fastestdet_final_model_repairs(package_path / "model.py")
+    _apply_structural_final_model_repairs(package_path / "model.py")
 
 
 def _rewrite_generated_model_source_for_exported_program(
@@ -38951,7 +39518,7 @@ def _temporarily_rewrite_generated_model_source_for_exported_program(
         )
 
         _rewrite_native_generated_model_postprocesses(model_path)
-        _apply_fastestdet_final_model_repairs(model_path)
+        _apply_structural_final_model_repairs(model_path)
         yield
     finally:
         current_source = model_path.read_text(encoding="utf-8")
@@ -41461,7 +42028,7 @@ def _export_pytorch_package_from_model_ir_impl(
 
             final_model_path = Path(output_folder_path) / "model.py"
             _rewrite_native_generated_model_postprocesses(final_model_path)
-            _apply_fastestdet_final_model_repairs(final_model_path)
+            _apply_structural_final_model_repairs(final_model_path)
         if native_load_specs is not None:
             state_dict = _build_native_generated_state_dict(
                 package_path=output_folder_path,

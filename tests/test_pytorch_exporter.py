@@ -54,11 +54,11 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     ModelIRPyTorchExportError,
     NativePyTorchGenerationTimeoutError,
     _apply_alike_fast_precanonicalize_repairs,
-    _apply_fastestdet_final_model_repairs,
     _apply_fast_precanonicalize_repairs,
     _apply_fast_precanonicalize_repairs_until_stable,
     _apply_pidnet_fast_precanonicalize_repairs,
     _apply_shadowformer_fast_precanonicalize_repairs,
+    _apply_structural_final_model_repairs,
     _build_metadata_payload,
     _build_tensor_var_name_map,
     _build_torchscript_example_inputs,
@@ -84,6 +84,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _preferred_reshape_target_values,
     _propagate_pytorch_friendly_layouts,
     _repair_channel_last_gap_conv_inputs,
+    _reapply_post_export_final_model_repairs,
     _reject_residual_layout_transposes,
     _remove_redundant_layout_transposes,
     _restore_same_average_pool_exclude_pad_correction_for_native_runtime,
@@ -10946,10 +10947,10 @@ def test_apply_fast_precanonicalize_repairs_reanchors_dynamic_cf_binary_anchor_f
     )
 
 
-def test_apply_fast_precanonicalize_repairs_fix_fastestdet_stage0_maxpool_bridge(
+def test_apply_fast_precanonicalize_repairs_rewrites_structural_stem_maxpool_bridge(
     tmp_path,
 ) -> None:
-    package_dir = tmp_path / "fastestdet_stage0_pool_pkg"
+    package_dir = tmp_path / "structural_stem_pool_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
     model_path.write_text(
@@ -10976,22 +10977,62 @@ def test_apply_fast_precanonicalize_repairs_fix_fastestdet_stage0_maxpool_bridge
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert (
-        "max_p2_in_cf_padded = F.pad(max_p2_in_nhwc_cf, [1, 1, 1, 1], mode='constant', "
+        "max_p2_in_nhwc_padded = F.pad(max_p2_in_nhwc_cf, [1, 1, 1, 1], mode='constant', "
         "value=-3.4028234663852886e+38)"
         in rewritten
     )
     assert (
-        "max_p2_out_nhwc = _apply_pool2d(max_p2_in_cf_padded, filter_height=3, filter_width=3, "
+        "max_p2_out_nhwc = _apply_pool2d(max_p2_in_nhwc_padded, filter_height=3, filter_width=3, "
         "stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 24, 88, 88], "
         "is_max_pool=True, channel_last=False)"
         in rewritten
     )
 
 
-def test_apply_fast_precanonicalize_repairs_fix_fastestdet_stage6_head_layout(
+def test_apply_fast_precanonicalize_repairs_rewrites_channel_last_pool_pad_pair_for_aligned_nhwc_source_without_nhwc_output_name(
     tmp_path,
 ) -> None:
-    package_dir = tmp_path / "fastestdet_stage6_head_pkg"
+    package_dir = tmp_path / "structural_channel_last_pool_pad_pair_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, in1: torch.Tensor) -> torch.Tensor:",
+                "        max_p3_in_nhwc_cf = in1",
+                "        max_p3_in_nhwc = max_p3_in_nhwc_cf",
+                "        max_p3_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p3_in_nhwc, [1, 400, 569, 64]), [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        max_p3_out = _apply_pool2d(max_p3_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 64, 200, 285], is_max_pool=True, channel_last=True)",
+                "        return max_p3_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "max_p3_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p3_in_nhwc, [1, 400, 569, 64]), [0, 0, 1, 1, 1, 1], mode='constant', "
+        "value=-3.4028234663852886e+38)"
+        in rewritten
+    )
+    assert (
+        "max_p3_out = _apply_pool2d(max_p3_in_nhwc_padded, filter_height=3, filter_width=3, "
+        "stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 64, 200, 285], is_max_pool=True, channel_last=True)"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_structural_public_head_layout(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "structural_public_head_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
     model_path.write_text(
@@ -11000,8 +11041,23 @@ def test_apply_fast_precanonicalize_repairs_fix_fastestdet_stage6_head_layout(
                 "import torch",
                 "",
                 "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_62 = _Conv2dBlock(",
+                "            in_channels=288,",
+                "            out_channels=96,",
+                "        )",
+                "        self.conv_block_67 = _Conv2dBlock(",
+                "            in_channels=96,",
+                "            out_channels=96,",
+                "        )",
+                "        self.conv_block_68 = _Conv2dBlock(",
+                "            in_channels=96,",
+                "            out_channels=96,",
+                "        )",
                 "    def forward(self, cv233_in_nhwc: torch.Tensor, cv246_out_cf: torch.Tensor, cv253_in_cf: torch.Tensor, cv257_in_cf: torch.Tensor, cv260_out_nhwc: torch.Tensor, onnx_concat715_cf: torch.Tensor, onnx_concat721_cf: torch.Tensor, onnx_concat730_cf: torch.Tensor) -> torch.Tensor:",
                 "        cv246_in = torch.cat([onnx_concat715_cf, onnx_concat721_cf, onnx_concat730_cf], dim=1)",
+                "        cv246_out_cf = self.conv_block_62(cv246_in)",
                 "        _binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc, [1, 96, 22, 22])",
                 "        cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 96, 22, 22])",
                 "        onnx_concat744_cf = self.conv_block_67(cv253_in_cf)",
@@ -11041,10 +11097,10 @@ def test_apply_fast_precanonicalize_repairs_fix_fastestdet_stage6_head_layout(
     assert "t_758 = t_758_public_layout_bridge" in rewritten
 
 
-def test_apply_fastestdet_final_model_repairs_fix_dynamic_head_targets(
+def test_apply_structural_final_model_repairs_fix_dynamic_head_targets(
     tmp_path,
 ) -> None:
-    package_dir = tmp_path / "fastestdet_final_head_pkg"
+    package_dir = tmp_path / "structural_final_head_pkg"
     package_dir.mkdir()
     model_path = package_dir / "model.py"
     model_path.write_text(
@@ -11053,9 +11109,11 @@ def test_apply_fastestdet_final_model_repairs_fix_dynamic_head_targets(
                 "import torch",
                 "",
                 "class Model(torch.nn.Module):",
-                "    def forward(self, cv260_out_nhwc: torch.Tensor, _binary_lhs_230: torch.Tensor, _binary_rhs_230: torch.Tensor, t_758_public_layout_bridge: torch.Tensor) -> torch.Tensor:",
+                "    def forward(self, cv260_out_nhwc: torch.Tensor, cv246_out_cf: torch.Tensor, cv233_in_nhwc: torch.Tensor, _binary_lhs_230: torch.Tensor, _binary_rhs_230: torch.Tensor, t_758_public_layout_bridge: torch.Tensor) -> torch.Tensor:",
+                "        _binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc, [1, 96, 22, 22])",
                 "        cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [int(_binary_lhs_230.shape[0]), 96, int(_binary_lhs_230.shape[2]), int(_binary_lhs_230.shape[3])])",
                 "        onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=1, beta=1.0, target_shape=[1, 22, 80, 22])",
+                "        t_758_public_layout_bridge = torch.cat([cv246_out_cf, _binary_lhs_230, onnx_tr756], dim=1)",
                 "        t_758 = _torch_permute(t_758_public_layout_bridge, [0, 3, 1, 2])",
                 "        return t_758",
                 "",
@@ -11064,7 +11122,7 @@ def test_apply_fastestdet_final_model_repairs_fix_dynamic_head_targets(
         encoding="utf-8",
     )
 
-    _apply_fastestdet_final_model_repairs(model_path)
+    _apply_structural_final_model_repairs(model_path)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert (
@@ -11076,6 +11134,78 @@ def test_apply_fastestdet_final_model_repairs_fix_dynamic_head_targets(
         in rewritten
     )
     assert "t_758 = t_758_public_layout_bridge" in rewritten
+
+
+def test_reapply_post_export_final_model_repairs_restores_aligned_nhwc_pool_pad_pair(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "post_export_final_repairs_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, in1: torch.Tensor) -> torch.Tensor:",
+                "        max_p3_in_nhwc_cf = in1",
+                "        max_p3_in_nhwc = max_p3_in_nhwc_cf",
+                "        max_p3_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p3_in_nhwc, [1, 400, 569, 64]), [1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        max_p3_out = _apply_pool2d(max_p3_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 64, 200, 285], is_max_pool=True, channel_last=True)",
+                "        return max_p3_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _reapply_post_export_final_model_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "max_p3_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p3_in_nhwc, [1, 400, 569, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_until_stable_keeps_aligned_nhwc_pool_pad_pair(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "aligned_nhwc_pool_pad_pair_stable_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, in1: torch.Tensor) -> torch.Tensor:",
+                "        max_p3_in_nhwc_cf = in1",
+                "        max_p3_in_nhwc = max_p3_in_nhwc_cf",
+                "        max_p3_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p3_in_nhwc, [1, 400, 569, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)",
+                "        max_p3_out = _apply_pool2d(max_p3_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 64, 200, 285], is_max_pool=True, channel_last=True)",
+                "        return max_p3_out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs_until_stable(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "max_p3_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p3_in_nhwc, [1, 400, 569, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)"
+        in rewritten
+    )
+    assert (
+        "max_p3_out = _apply_pool2d(max_p3_in_nhwc_padded, filter_height=3, filter_width=3, stride_h=2, stride_w=2, padding='VALID', target_shape=[1, 64, 200, 285], is_max_pool=True, channel_last=True)"
+        in rewritten
+    )
 
 
 def test_apply_fast_precanonicalize_repairs_does_not_inject_humanseg_resize_aliases_without_markers(
