@@ -95,6 +95,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _rewrite_channel_last_gap_means_to_reduce_mean,
     _onnx_repair_inferred_shapes_in_place,
     _patch_generated_runtime_pool2d_channel_last_recovery,
+    _parse_copy_call_expr,
     _sanitize_dynamo_exported_onnx_metadata,
     _has_dynamic_score_sampling_stage_signature,
     _has_humanseg_fast_repair_signature,
@@ -19890,6 +19891,30 @@ def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes
     assert "[12, 48, 64, 6]" not in repaired
     assert "[12, 48, 6, 64]" not in repaired
     assert "[12, 6, 48, 64]" in repaired
+
+
+def test_parse_copy_call_expr_handles_copy_kwargs_without_regex_backtracking() -> None:
+    line = (
+        "        (self.mask_buf_a).copy_("
+        "self.attn_src_a, "
+        "non_blocking=True, "
+        "memory_format=torch.contiguous_format, "
+        "device=torch.device('cpu'))"
+    )
+
+    assert _parse_copy_call_expr(line) == (
+        "        ",
+        "(self.mask_buf_a)",
+        "mask_buf_a",
+        "self.attn_src_a",
+        ", non_blocking=True, memory_format=torch.contiguous_format, device=torch.device('cpu')",
+    )
+
+
+def test_parse_copy_call_expr_rejects_non_keyword_trailing_copy_args() -> None:
+    line = "        self.mask_buf_a.copy_(self.attn_src_a, trailing_value)"
+
+    assert _parse_copy_call_expr(line) is None
 
 
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_functional_permute_copy(

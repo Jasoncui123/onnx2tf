@@ -39959,11 +39959,14 @@ _SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN = (
     r"|\[\s*0\s*,\s*2\s*,\s*1\s*,\s*3\s*\]"
     r")"
 )
-_SHADOWFORMER_COPY_PERMUTE_RE = re.compile(
-    rf"^(?P<indent>\s*)(?P<target>\(?\s*(?:self\.)?(?P<buffer>[A-Za-z0-9_]+)\s*\)?)\.copy_\(\s*\(?(?:(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?(?P<src_fn>.+?),\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?\)?(?P<copy_kwargs>(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*)\)$"
-)
 _SHADOWFORMER_COPY_PERMUTE_SRC_RE = re.compile(
     rf"^\(?(?:.+\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)|torch\.permute\((?:input\s*=\s*)?.+?,\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\))(?:\.contiguous\([^)]*\))?\)?$"
+)
+_SHADOWFORMER_METHOD_COPY_PERMUTE_SRC_RE = re.compile(
+    rf"^\(?(?P<src>.+?)\.permute\({_SHADOWFORMER_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?\)?$"
+)
+_SHADOWFORMER_FUNCTIONAL_COPY_PERMUTE_SRC_RE = re.compile(
+    rf"^\(?torch\.permute\((?:input\s*=\s*)?(?P<src>.+?),\s*(?:dims\s*=\s*)?{_SHADOWFORMER_FUNCTIONAL_PERMUTE_0213_ARGS_PATTERN}\)(?:\.contiguous\([^)]*\))?\)?$"
 )
 _SHADOWFORMER_REGISTER_BUFFER_RE = re.compile(
     r"^\s*self\.register_buffer\((?P<name_kw>name\s*=\s*)?(?P<quote>['\"])(?P<buffer>[A-Za-z0-9_]+)(?P=quote),\s*"
@@ -40149,15 +40152,17 @@ def _apply_shadowformer_fast_precanonicalize_repairs(model_path: Path) -> None:
                 lines[index] = rewritten
                 changed = True
             continue
-        copy_match = _SHADOWFORMER_COPY_PERMUTE_RE.match(current_line)
-        if copy_match is not None:
-            copy_buffer_name = str(copy_match.group("buffer"))
+        copy_call = _parse_copy_call_expr(current_line)
+        if copy_call is not None:
+            indent, target_expr, copy_buffer_name, src_expr, copy_kwargs = copy_call
             resolved_buffer_name = buffer_aliases.get(copy_buffer_name, copy_buffer_name)
             if resolved_buffer_name not in supported_buffers:
                 continue
-            src_expr = _strip_outer_parentheses(str(copy_match.group("src") or copy_match.group("src_fn")))
-            target_expr = _strip_outer_parentheses(str(copy_match.group("target")))
-            rewritten = f"{copy_match.group('indent')}{target_expr}.copy_({src_expr}{copy_match.group('copy_kwargs')})"
+            normalized_src_expr = _extract_shadowformer_copy_permute_source_expr(src_expr)
+            if normalized_src_expr is None:
+                continue
+            normalized_target_expr = _strip_outer_parentheses(target_expr)
+            rewritten = f"{indent}{normalized_target_expr}.copy_({normalized_src_expr}{copy_kwargs})"
             if rewritten != current_line:
                 lines[index] = rewritten
                 changed = True
@@ -40246,6 +40251,49 @@ def _split_top_level_csv_exprs(expr: str) -> List[str]:
     if tail:
         parts.append(tail)
     return parts
+
+
+def _parse_copy_call_expr(
+    line: str,
+) -> Tuple[str, str, str, str, str] | None:
+    current_line = str(line)
+    indent = current_line[: len(current_line) - len(current_line.lstrip())]
+    stripped = current_line.strip()
+    copy_token = ".copy_("
+    copy_index = stripped.find(copy_token)
+    if copy_index <= 0 or not stripped.endswith(")"):
+        return None
+    target_expr = stripped[:copy_index].strip()
+    args_expr = stripped[copy_index + len(copy_token) : -1].strip()
+    normalized_target = _strip_outer_parentheses(target_expr)
+    buffer_name = normalized_target[5:] if normalized_target.startswith("self.") else normalized_target
+    if re.fullmatch(r"[A-Za-z0-9_]+", buffer_name) is None:
+        return None
+    parts = _split_top_level_csv_exprs(args_expr)
+    if not parts:
+        return None
+    src_expr = parts[0].strip()
+    copy_kwargs_parts: List[str] = []
+    for part in parts[1:]:
+        stripped_part = part.strip()
+        if not stripped_part:
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", stripped_part) is None:
+            return None
+        copy_kwargs_parts.append(stripped_part)
+    copy_kwargs = "".join(f", {part}" for part in copy_kwargs_parts)
+    return indent, target_expr, buffer_name, src_expr, copy_kwargs
+
+
+def _extract_shadowformer_copy_permute_source_expr(src_expr: str) -> str | None:
+    stripped = _strip_outer_parentheses(str(src_expr).strip())
+    method_match = _SHADOWFORMER_METHOD_COPY_PERMUTE_SRC_RE.match(stripped)
+    if method_match is not None:
+        return _strip_outer_parentheses(str(method_match.group("src")))
+    functional_match = _SHADOWFORMER_FUNCTIONAL_COPY_PERMUTE_SRC_RE.match(stripped)
+    if functional_match is not None:
+        return _strip_outer_parentheses(str(functional_match.group("src")))
+    return None
 
 
 def _is_channel_last_resize_like_expr(expr: str, known_resize_outputs: Set[str]) -> bool:
@@ -42710,9 +42758,6 @@ def _collect_shadowformer_fast_repair_facts(
     Set[str],
     Set[Tuple[int, int, int]],
 ]:
-    copy_re = re.compile(
-        r"^\s*(?:\(?\s*(?:self\.)?(?P<buffer>[A-Za-z0-9_]+)\s*\)?)\.copy_\((?P<src>.+?)(?:,\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^,()]+(?:\([^)]*\))?)*\)$"
-    )
     binary_shape_re = re.compile(
         rf"^\s*(?P<out_lhs>[A-Za-z0-9_]+),\s*(?P<out_rhs>[A-Za-z0-9_]+)\s*=\s*_align_binary_inputs(?:_to_anchor)?\(\(?\s*(?P<lhs>[A-Za-z0-9_\.]+)\s*\)?,\s*\(?\s*(?P<rhs>[A-Za-z0-9_\.]+)\s*\)?,\s*(?:\[|\()(?P<batch>{_SHADOWFORMER_TARGET_BATCH_EXPR_PATTERN})\s*,\s*(?P<d1>\d+)\s*,\s*(?P<d2>\d+)\s*,\s*(?P<d3>\d+)(?:\]|\))\)$"
     )
@@ -42736,14 +42781,13 @@ def _collect_shadowformer_fast_repair_facts(
                 int(register_match.group("d3")),
             )
             continue
-        copy_match = copy_re.match(current_line)
-        if copy_match is not None:
-            copy_buffer_name = str(copy_match.group("buffer"))
+        copy_call = _parse_copy_call_expr(current_line)
+        if copy_call is not None:
+            _, _, copy_buffer_name, src_expr, _ = copy_call
             resolved_buffer_name = buffer_aliases.get(copy_buffer_name, copy_buffer_name)
             if resolved_buffer_name not in raw_buffer_dims:
                 continue
-            src_expr = str(copy_match.group("src"))
-            if _SHADOWFORMER_COPY_PERMUTE_SRC_RE.match(src_expr) is not None:
+            if _extract_shadowformer_copy_permute_source_expr(src_expr) is not None:
                 permuted_copy_buffers.add(resolved_buffer_name)
             else:
                 plain_copy_buffers.add(resolved_buffer_name)
