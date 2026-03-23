@@ -31187,6 +31187,70 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
             input_name = str(depth_to_space_nhwc_gather_match.group("input"))
             lhs_name = str(depth_to_space_nhwc_gather_match.group("lhs"))
             next_line = str(lines[index + 1]) if index + 1 < len(lines) else ""
+            gathered_indices = [
+                int(token.strip())
+                for token in str(depth_to_space_nhwc_gather_match.group("indices")).split(",")
+                if token.strip() != ""
+            ]
+            input_is_structural_cf = (
+                input_name in cf_like_names
+                or input_name.endswith("_cf")
+                or input_name.endswith("_out_cf")
+            )
+            if not input_is_structural_cf:
+                for back in range(max(0, index - 4), index):
+                    parsed_cat = _parse_torch_cat_inputs_and_dim(
+                        _parse_simple_assignment_line(lines[back])[2]
+                    ) if _parse_simple_assignment_line(lines[back]) is not None else None
+                    assigned_lhs = (
+                        _parse_simple_assignment_line(lines[back])[1]
+                        if _parse_simple_assignment_line(lines[back]) is not None
+                        else None
+                    )
+                    if assigned_lhs != input_name or parsed_cat is None or int(parsed_cat[1]) != 1:
+                        continue
+                    cat_inputs = [name.strip() for name in parsed_cat[0] if name.strip()]
+                    if cat_inputs and all(
+                        name in cf_like_names
+                        or name.endswith("_cf")
+                        or name.endswith("_out_cf")
+                        for name in cat_inputs
+                    ):
+                        input_is_structural_cf = True
+                        break
+            input_shape = repair_context.static_shapes.get(input_name)
+            if (
+                input_is_structural_cf
+            ):
+                if input_shape is not None and len(input_shape) == 4:
+                    repair_context.static_shapes[lhs_name] = [
+                        int(input_shape[0]),
+                        int(len(gathered_indices)),
+                        int(input_shape[2]),
+                        int(input_shape[3]),
+                    ]
+                cf_like_names.add(lhs_name)
+                nhwc_like_names.discard(lhs_name)
+                next_permuted_conv_match = (
+                    permuted_conv_input_re.match(next_line)
+                    if index + 1 < len(lines)
+                    else None
+                )
+                if (
+                    next_permuted_conv_match is not None
+                    and str(next_permuted_conv_match.group("input")) == lhs_name
+                ):
+                    conv_module = str(next_permuted_conv_match.group("module"))
+                    conv_in_channels = conv_block_out_channels.get(conv_module)
+                    if conv_in_channels is None:
+                        conv_in_channels = repair_context.conv_block_in_channels.get(conv_module)
+                    if conv_in_channels is None or int(conv_in_channels) == int(len(gathered_indices)):
+                        lines[index + 1] = (
+                            f"{next_permuted_conv_match.group('indent')}{next_permuted_conv_match.group('lhs')} = "
+                            f"self.{conv_module}({lhs_name})"
+                        )
+                        cf_like_names.add(str(next_permuted_conv_match.group("lhs")))
+                        changed = True
             is_depth_to_space_reorder = (
                 input_name.endswith("_nhwc")
                 and (
@@ -34686,6 +34750,9 @@ def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\("
         r"(?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
     )
+    cf_channel_gather_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<input>[A-Za-z0-9_]+)\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
+    )
 
     def _parse_rank4_gap_mean_assign(
         line: str,
@@ -34826,12 +34893,54 @@ def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
         expected_channels: int | None,
         *,
         start_index: int,
+        visited: Set[str] | None = None,
     ) -> bool:
+        if visited is None:
+            visited = set()
+        if name in visited:
+            return False
+        visited.add(name)
         has_cf_binary_consumer = _has_cf_binary_consumer(
             name,
             expected_channels,
             start_index=start_index,
         )
+        for back in range(max(0, start_index - 32), start_index):
+            gather_assign = cf_channel_gather_re.match(lines[back])
+            if gather_assign is None or str(gather_assign.group("lhs")) != name:
+                continue
+            gathered_indices = [
+                int(token.strip())
+                for token in str(gather_assign.group("indices")).split(",")
+                if token.strip() != ""
+            ]
+            if expected_channels is not None and int(len(gathered_indices)) != int(expected_channels):
+                continue
+            if _is_structurally_cf_rank4_source(
+                str(gather_assign.group("input")),
+                None,
+                start_index=back,
+                visited=visited,
+            ):
+                return True
+        for back in range(max(0, start_index - 32), start_index):
+            assign = _parse_simple_assignment_line(lines[back])
+            if assign is None or str(assign[1]) != name:
+                continue
+            cat_args = _parse_torch_cat_inputs_and_dim(str(assign[2]))
+            if cat_args is None or int(cat_args[1]) != 1:
+                continue
+            cat_inputs = [input_name.strip() for input_name in cat_args[0] if input_name.strip()]
+            if cat_inputs and all(
+                _is_structurally_cf_rank4_source(
+                    input_name,
+                    None,
+                    start_index=back,
+                    visited=visited,
+                )
+                for input_name in cat_inputs
+            ):
+                return True
         if (
             _fast_precanonicalize_is_nhwc_like(name, dynamic_nhwc_like_names, context)
             and not has_cf_binary_consumer

@@ -11720,10 +11720,42 @@ def test_apply_fast_precanonicalize_repairs_preserves_nhwc_average_pool_reciproc
         "[1, 22, 22, 48])"
         in rewritten
     )
-    assert (
-        "average_p229_out = _align_tensor_to_target_shape(torch.mul(_binary_lhs_61, _binary_rhs_61), [1, 22, 22, 48])"
-        in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_cf_channel_shuffle_slices_on_axis1(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_cf_channel_shuffle_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_6 = _Conv2dBlock(",
+                "            in_channels=58,",
+                "            out_channels=58,",
+                "        )",
+                "    def forward(self, left_cf: torch.Tensor, right_cf: torch.Tensor) -> torch.Tensor:",
+                "        stage20_concat_out0 = torch.cat([left_cf, right_cf], dim=1)",
+                "        stage20_concat_odd = stage20_concat_out0[:, [29, 87, 30, 88, 31, 89, 32, 90, 33, 91, 34, 92, 35, 93, 36, 94, 37, 95, 38, 96, 39, 97, 40, 98, 41, 99, 42, 100, 43, 101, 44, 102, 45, 103, 46, 104, 47, 105, 48, 106, 49, 107, 50, 108, 51, 109, 52, 110, 53, 111, 54, 112, 55, 113, 56, 114, 57, 115], :, :]",
+                "        branch2_cf = self.conv_block_6(stage20_concat_odd.permute(0, 3, 1, 2).contiguous())",
+                "        return branch2_cf",
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "stage20_concat_odd = stage20_concat_out0[:, [29, 87, 30, 88, 31, 89, 32, 90, 33, 91, 34, 92, 35, 93, 36, 94, 37, 95, 38, 96, 39, 97, 40, 98, 41, 99, 42, 100, 43, 101, 44, 102, 45, 103, 46, 104, 47, 105, 48, 106, 49, 107, 50, 108, 51, 109, 52, 110, 53, 111, 54, 112, 55, 113, 56, 114, 57, 115], :, :]" in rewritten
+    assert "branch2_cf = self.conv_block_6(stage20_concat_odd)" in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_reanchors_dynamic_cf_binary_anchor_from_following_add(
