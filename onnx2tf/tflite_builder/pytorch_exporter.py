@@ -35685,17 +35685,6 @@ def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
                     ):
                         continue
                     for cat_input in cat_inputs:
-                        direct_conv_assign = direct_conv_assignments_by_lhs.get(cat_input)
-                        if direct_conv_assign is not None:
-                            direct_conv_index, conv_module, conv_input = direct_conv_assign
-                            rewritten_conv = (
-                                f"{lines[direct_conv_index][: len(lines[direct_conv_index]) - len(lines[direct_conv_index].lstrip())]}"
-                                f"{cat_input} = _torch_permute(self.{conv_module}({conv_input}), [0, 3, 1, 2])"
-                            )
-                            if lines[direct_conv_index] != rewritten_conv:
-                                lines[direct_conv_index] = rewritten_conv
-                                dynamic_cf_like_names.add(cat_input)
-                                changed = True
                         input_index = simple_assignments_by_lhs.get(cat_input)
                         input_assign = _parse_simple_assignment_line(lines[input_index]) if input_index is not None else None
                         softmax_args = _parse_apply_softmax_input_axis_and_shape(input_assign[2]) if input_assign is not None else None
@@ -35714,7 +35703,7 @@ def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
                                 )
                                 rewritten_softmax = (
                                     f"{input_assign[0]}{input_assign[1]} = _apply_softmax("
-                                    f"{softmax_args[0]}, axis=3, beta=1.0, target_shape={repr(normalized_softmax_shape)})"
+                                    f"{softmax_args[0]}, axis=1, beta=1.0, target_shape={repr(normalized_softmax_shape)})"
                                 )
                                 if lines[input_index] != rewritten_softmax:
                                     lines[input_index] = rewritten_softmax
@@ -35747,17 +35736,6 @@ def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
                     ):
                         continue
                     for cat_input in cat_inputs:
-                        direct_conv_assign = direct_conv_assignments_by_lhs.get(cat_input)
-                        if direct_conv_assign is not None:
-                            direct_conv_index, conv_module, conv_input = direct_conv_assign
-                            rewritten_conv = (
-                                f"{lines[direct_conv_index][: len(lines[direct_conv_index]) - len(lines[direct_conv_index].lstrip())]}"
-                                f"{cat_input} = _torch_permute(self.{conv_module}({conv_input}), [0, 3, 1, 2])"
-                            )
-                            if lines[direct_conv_index] != rewritten_conv:
-                                lines[direct_conv_index] = rewritten_conv
-                                dynamic_cf_like_names.add(cat_input)
-                                changed = True
                         input_index = simple_assignments_by_lhs.get(cat_input)
                         input_assign = _parse_simple_assignment_line(lines[input_index]) if input_index is not None else None
                         softmax_args = _parse_apply_softmax_input_axis_and_shape(input_assign[2]) if input_assign is not None else None
@@ -35776,7 +35754,7 @@ def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
                                 )
                                 rewritten_softmax = (
                                     f"{input_assign[0]}{input_assign[1]} = _apply_softmax("
-                                    f"{softmax_args[0]}, axis=3, beta=1.0, target_shape={repr(normalized_softmax_shape)})"
+                                    f"{softmax_args[0]}, axis=1, beta=1.0, target_shape={repr(normalized_softmax_shape)})"
                                 )
                                 if lines[input_index] != rewritten_softmax:
                                     lines[input_index] = rewritten_softmax
@@ -35916,7 +35894,7 @@ def _apply_structural_final_model_repairs(model_path: Path) -> None:
                 )
                 rewritten_softmax = (
                     f"{assign[0]}{assign[1]} = _apply_softmax("
-                    f"{softmax_args[0]}, axis=3, beta=1.0, target_shape={repr(normalized_shape)})"
+                    f"{softmax_args[0]}, axis=1, beta=1.0, target_shape={repr(normalized_shape)})"
                 )
                 if lines[index] != rewritten_softmax:
                     lines[index] = rewritten_softmax

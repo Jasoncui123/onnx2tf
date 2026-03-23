@@ -11894,17 +11894,17 @@ def test_apply_fast_precanonicalize_repairs_rewrites_structural_public_head_layo
         in rewritten
     )
     assert (
-        "_binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc, [1, 22, 22, 96])"
+        "_binary_rhs_230, _binary_lhs_230 = _align_binary_inputs_to_anchor(cv246_out_cf, cv233_in_nhwc, [int(cv246_out_cf.shape[0]), 96, int(cv246_out_cf.shape[2]), int(cv246_out_cf.shape[3])])"
         in rewritten
     )
     assert (
-        "cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [1, 22, 22, 96])"
+        "cv249_in = _align_tensor_to_target_shape(torch.add(_binary_lhs_230, _binary_rhs_230), [int(cv246_out_cf.shape[0]), 96, int(cv246_out_cf.shape[2]), int(cv246_out_cf.shape[3])])"
         in rewritten
     )
-    assert "onnx_concat744_cf = _torch_permute(self.conv_block_67(cv253_in_cf), [0, 3, 1, 2])" in rewritten
-    assert "cv257_out_cf = _torch_permute(self.conv_block_68(cv257_in_cf), [0, 3, 1, 2])" in rewritten
+    assert "onnx_concat744_cf = self.conv_block_67(cv253_in_cf)" in rewritten
+    assert "cv257_out_cf = self.conv_block_68(cv257_in_cf)" in rewritten
     assert (
-        "onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=3, beta=1.0, target_shape=[1, 80, 22, 22])"
+        "onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])"
         in rewritten
     )
     assert "t_758 = t_758_public_layout_bridge" in rewritten
@@ -11943,7 +11943,7 @@ def test_apply_structural_final_model_repairs_fix_dynamic_head_targets(
         in rewritten
     )
     assert (
-        "onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=3, beta=1.0, target_shape=[1, 80, 22, 22])"
+        "onnx_tr756 = _apply_softmax(cv260_out_nhwc, axis=1, beta=1.0, target_shape=[1, 80, 22, 22])"
         in rewritten
     )
     assert "t_758 = t_758_public_layout_bridge" in rewritten
