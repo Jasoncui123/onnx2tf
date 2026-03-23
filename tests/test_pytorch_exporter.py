@@ -3630,12 +3630,135 @@ def test_apply_fast_precanonicalize_repairs_fix_stage1_and_gather_chain(
         encoding="utf-8",
     )
 
-    _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
+    _apply_fast_precanonicalize_repairs(package_dir)
 
     rewritten = model_path.read_text(encoding="utf-8")
     assert "t_471 = torch.reshape(t_469, [1, 64, 1, 1])" in rewritten
     assert "cv73_out_cf = self.conv_block_16(cv73_in)" in rewritten
     assert "cv79_in = cv73_out_cf[:, [0, 24, 1, 25], :, :]" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_redundant_prelu_cf_conv_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_prelu_cf_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int, groups: int = 1):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 1, groups=groups)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.prelu_0 = torch.nn.PReLU(num_parameters=1)",
+                "        self.conv_block_0 = _Conv2dBlock(in_channels=48, out_channels=48, groups=2)",
+                "",
+                "    def forward(self, feat_cf: torch.Tensor) -> torch.Tensor:",
+                "        act = self.prelu_0(feat_cf)",
+                "        out = self.conv_block_0(act.permute(0, 3, 1, 2).contiguous())",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "out = self.conv_block_0(act)" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_keeps_prelu_nhwc_conv_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_prelu_nhwc_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 1)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.prelu_0 = torch.nn.PReLU(num_parameters=1)",
+                "        self.conv_block_0 = _Conv2dBlock(in_channels=48, out_channels=48)",
+                "",
+                "    def forward(self, feat_cf: torch.Tensor) -> torch.Tensor:",
+                "        feat_nhwc = _align_tensor_to_target_shape(feat_cf.permute(0, 2, 3, 1).contiguous(), [1, 40, 40, 48])",
+                "        act = self.prelu_0(feat_nhwc)",
+                "        out = self.conv_block_0(act.permute(0, 3, 1, 2).contiguous())",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "out = self.conv_block_0(act.permute(0, 3, 1, 2).contiguous())" in rewritten
+
+
+def test_apply_fast_precanonicalize_repairs_rewrites_channel_first_pool_binary_conv_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_pool_binary_cf_bridge_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class _Conv2dBlock(torch.nn.Module):",
+                "    def __init__(self, in_channels: int, out_channels: int):",
+                "        super().__init__()",
+                "        self.conv = torch.nn.Conv2d(in_channels, out_channels, 1)",
+                "    def forward(self, x: torch.Tensor) -> torch.Tensor:",
+                "        return self.conv(x)",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def __init__(self):",
+                "        super().__init__()",
+                "        self.conv_block_0 = _Conv2dBlock(in_channels=48, out_channels=48)",
+                "        self.register_buffer('const_scale', torch.ones([1, 20, 20, 48], dtype=torch.float32), persistent=True)",
+                "",
+                "    def forward(self, feat_cf: torch.Tensor) -> torch.Tensor:",
+                "        pooled = _apply_pool2d(feat_cf, filter_height=2, filter_width=2, stride_h=2, stride_w=2, padding='SAME', target_shape=[1, 20, 20, 48], is_max_pool=False, channel_last=False)",
+                "        lhs, rhs = _align_binary_inputs_to_anchor(pooled, self.const_scale, [1, 20, 20, 48])",
+                "        scaled = _align_tensor_to_target_shape(torch.mul(lhs, rhs), [1, 20, 20, 48])",
+                "        out = self.conv_block_0(scaled.permute(0, 3, 1, 2).contiguous())",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "out = self.conv_block_0(scaled)" in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_rewrites_direct_conv_aligned_add_target_to_cf(

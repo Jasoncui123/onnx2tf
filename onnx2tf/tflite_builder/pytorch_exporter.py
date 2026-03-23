@@ -35192,6 +35192,66 @@ def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
             return None
         return parts[0].strip(), parts[1].strip(), [int(v) for v in list(target_shape)]
 
+    def _parse_relaxed_align_binary_inputs_to_anchor_assign_with_shape(
+        line: str,
+    ) -> Tuple[str, str, str, str, str, List[int]] | None:
+        assign_match = re.match(
+            r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        rhs = str(assign_match.group("rhs")).strip()
+        prefix = "_align_binary_inputs_to_anchor("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        if len(parts) != 3:
+            return None
+        target_shape = _parse_rank4_shape_literal(parts[2].strip())
+        if target_shape is None:
+            return None
+        return (
+            str(assign_match.group("indent")),
+            str(assign_match.group("lhs0")),
+            str(assign_match.group("lhs1")),
+            parts[0].strip(),
+            parts[1].strip(),
+            [int(v) for v in list(target_shape)],
+        )
+
+    def _parse_binary_input_pair(expr: str) -> Tuple[str, str, str] | None:
+        stripped = str(expr).strip()
+        for op_prefix in ("torch.mul", "torch.add"):
+            prefix = f"{op_prefix}("
+            if not stripped.startswith(prefix) or not stripped.endswith(")"):
+                continue
+            parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+            input_expr: str | None = None
+            other_expr: str | None = None
+            positional_index = 0
+            for part in parts:
+                keyword_match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part)
+                if keyword_match is not None:
+                    key, value = part.split("=", 1)
+                    if key.strip() == "input":
+                        input_expr = value.strip()
+                    elif key.strip() == "other":
+                        other_expr = value.strip()
+                    continue
+                if positional_index == 0:
+                    input_expr = part.strip()
+                elif positional_index == 1:
+                    other_expr = part.strip()
+                positional_index += 1
+            if input_expr is None or other_expr is None:
+                return None
+            return op_prefix, input_expr, other_expr
+        return None
+
+    def _is_simple_tensor_name(expr: str) -> bool:
+        return re.fullmatch(r"[A-Za-z0-9_]+", str(expr).strip()) is not None
+
     def _resolve_local_response_norm_source(name: str) -> str | None:
         for candidate_line in lines:
             assign = _parse_simple_assignment_line(candidate_line)
@@ -35201,6 +35261,166 @@ def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
             if resolved_input is not None:
                 return str(resolved_input)
         return None
+
+    def _resolve_layout_preserving_unary_source(name: str, upper_bound: int) -> str | None:
+        unary_patterns = [
+            re.compile(r"^self\.prelu_[0-9]+\((?P<input>[A-Za-z0-9_]+)\)$"),
+            re.compile(r"^torch\.relu\((?P<input>[A-Za-z0-9_]+)\)$"),
+            re.compile(r"^torch\.sigmoid\((?P<input>[A-Za-z0-9_]+)\)$"),
+            re.compile(r"^torch\.tanh\((?P<input>[A-Za-z0-9_]+)\)$"),
+        ]
+        for back in range(max(0, upper_bound - 16), upper_bound):
+            assign = _parse_simple_assignment_line(lines[back])
+            if assign is None or str(assign[1]) != name:
+                continue
+            rhs_expr = str(assign[2]).strip()
+            for unary_pattern in unary_patterns:
+                unary_match = unary_pattern.fullmatch(rhs_expr)
+                if unary_match is not None:
+                    return str(unary_match.group("input"))
+        return None
+
+    def _resolve_channel_first_pool_source(name: str, upper_bound: int) -> str | None:
+        for back in range(max(0, upper_bound - 16), upper_bound):
+            pool_assign = _parse_apply_pool2d_assign_with_shape(lines[back])
+            if pool_assign is None or str(pool_assign[1]) != name or bool(pool_assign[6]):
+                continue
+            return str(pool_assign[2])
+        return None
+
+    def _resolve_binary_anchor_source(name: str, upper_bound: int) -> str | None:
+        for back in range(max(0, upper_bound - 16), upper_bound):
+            anchor_assign = _parse_relaxed_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if anchor_assign is None or name not in {str(anchor_assign[1]), str(anchor_assign[2])}:
+                continue
+            for candidate_expr in (str(anchor_assign[3]), str(anchor_assign[4])):
+                if _is_simple_tensor_name(candidate_expr):
+                    return candidate_expr
+        return None
+
+    def _resolve_layout_preserving_binary_sources(
+        name: str,
+        upper_bound: int,
+    ) -> Tuple[str, str] | None:
+        for back in range(max(0, upper_bound - 16), upper_bound):
+            assign = _parse_simple_assignment_line(lines[back])
+            if assign is None or str(assign[1]) != name:
+                continue
+            rhs_expr = str(assign[2]).strip()
+            aligned_expr = _parse_align_tensor_target_shape_expr(rhs_expr)
+            if aligned_expr is not None:
+                rhs_expr = str(aligned_expr[0]).strip()
+            parsed_binary_pair = _parse_binary_input_pair(rhs_expr)
+            if parsed_binary_pair is None:
+                continue
+            return str(parsed_binary_pair[1]), str(parsed_binary_pair[2])
+        return None
+
+    def _rewrite_channel_first_pool_binary_chain_targets(
+        name: str,
+        expected_channels: int | None,
+        *,
+        start_index: int,
+    ) -> bool:
+        if expected_channels is None:
+            return False
+        assign_index: int | None = None
+        assign_expr: str | None = None
+        output_shape: List[int] | None = None
+        for back in range(max(0, start_index - 16), start_index):
+            assign = _parse_simple_assignment_line(lines[back])
+            if assign is None or str(assign[1]) != name:
+                continue
+            aligned_expr = _parse_align_tensor_target_shape_expr(str(assign[2]).strip())
+            if aligned_expr is None:
+                continue
+            parsed_shape = _parse_rank4_shape_literal(str(aligned_expr[1]).strip())
+            if parsed_shape is None:
+                continue
+            assign_index = back
+            assign_expr = str(aligned_expr[0]).strip()
+            output_shape = [int(v) for v in list(parsed_shape)]
+            break
+        if assign_index is None or assign_expr is None or output_shape is None:
+            return False
+        parsed_binary_pair = _parse_binary_input_pair(assign_expr)
+        if parsed_binary_pair is None:
+            return False
+        _, binary_input0, binary_input1 = parsed_binary_pair
+        if int(output_shape[3]) != int(expected_channels):
+            return False
+        anchor_index: int | None = None
+        anchor_assign: Tuple[str, str, str, str, str, List[int]] | None = None
+        binary_inputs = {str(binary_input0), str(binary_input1)}
+        for back in range(max(0, assign_index - 8), assign_index):
+            parsed_anchor = _parse_relaxed_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if parsed_anchor is None:
+                continue
+            if {str(parsed_anchor[1]), str(parsed_anchor[2])} != binary_inputs:
+                continue
+            anchor_index = back
+            anchor_assign = parsed_anchor
+            break
+        if anchor_index is None or anchor_assign is None:
+            return False
+        pool_index: int | None = None
+        pool_assign: Tuple[str, str, str, str, List[int], bool, bool] | None = None
+        for candidate_name in (str(anchor_assign[3]), str(anchor_assign[4])):
+            if not _is_simple_tensor_name(candidate_name):
+                continue
+            for back in range(max(0, anchor_index - 8), anchor_index):
+                parsed_pool = _parse_apply_pool2d_assign_with_shape(lines[back])
+                if (
+                    parsed_pool is None
+                    or str(parsed_pool[1]) != candidate_name
+                    or bool(parsed_pool[6])
+                ):
+                    continue
+                if not _is_structurally_cf_rank4_source(
+                    str(parsed_pool[2]),
+                    expected_channels,
+                    start_index=back,
+                    visited={name},
+                ):
+                    continue
+                pool_index = back
+                pool_assign = parsed_pool
+                break
+            if pool_index is not None:
+                break
+        if pool_index is None or pool_assign is None:
+            return False
+        cf_shape = [int(output_shape[0]), int(expected_channels), int(output_shape[1]), int(output_shape[2])]
+        lines[pool_index] = (
+            f"{pool_assign[0]}{pool_assign[1]} = _apply_pool2d("
+            f"{pool_assign[2]}, {pool_assign[3]}, target_shape={repr(cf_shape)}, "
+            f"is_max_pool={repr(bool(pool_assign[5]))}, channel_last=False)"
+        )
+        lines[anchor_index] = (
+            f"{anchor_assign[0]}{anchor_assign[1]}, {anchor_assign[2]} = "
+            f"_align_binary_inputs_to_anchor({anchor_assign[3]}, {anchor_assign[4]}, {repr(cf_shape)})"
+        )
+        lines[assign_index] = (
+            f"{_parse_simple_assignment_line(lines[assign_index])[0]}{name} = "
+            f"_align_tensor_to_target_shape({assign_expr}, {repr(cf_shape)})"
+        )
+        context.static_shapes[str(pool_assign[1])] = list(cf_shape)
+        context.static_shapes[str(anchor_assign[1])] = list(cf_shape)
+        context.static_shapes[str(anchor_assign[2])] = list(cf_shape)
+        context.static_shapes[str(name)] = list(cf_shape)
+        dynamic_cf_like_names.update(
+            {
+                str(pool_assign[1]),
+                str(anchor_assign[1]),
+                str(anchor_assign[2]),
+                str(name),
+            }
+        )
+        dynamic_nhwc_like_names.discard(str(pool_assign[1]))
+        dynamic_nhwc_like_names.discard(str(anchor_assign[1]))
+        dynamic_nhwc_like_names.discard(str(anchor_assign[2]))
+        dynamic_nhwc_like_names.discard(str(name))
+        return True
 
     def _has_cf_binary_consumer(
         name: str,
@@ -35274,6 +35494,45 @@ def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
                 for input_name in cat_inputs
             ):
                 return True
+        pool_source = _resolve_channel_first_pool_source(name, start_index)
+        if pool_source is not None and pool_source != name:
+            return _is_structurally_cf_rank4_source(
+                pool_source,
+                expected_channels,
+                start_index=start_index,
+                visited=visited,
+            )
+        anchor_source = _resolve_binary_anchor_source(name, start_index)
+        if anchor_source is not None and anchor_source != name:
+            return _is_structurally_cf_rank4_source(
+                anchor_source,
+                expected_channels,
+                start_index=start_index,
+                visited=visited,
+            )
+        binary_sources = _resolve_layout_preserving_binary_sources(name, start_index)
+        if binary_sources is not None:
+            lhs_source, rhs_source = binary_sources
+            lhs_cf = (
+                _is_simple_tensor_name(lhs_source)
+                and _is_structurally_cf_rank4_source(
+                    lhs_source,
+                    expected_channels,
+                    start_index=start_index,
+                    visited=set(visited),
+                )
+            )
+            rhs_cf = (
+                _is_simple_tensor_name(rhs_source)
+                and _is_structurally_cf_rank4_source(
+                    rhs_source,
+                    expected_channels,
+                    start_index=start_index,
+                    visited=set(visited),
+                )
+            )
+            if lhs_cf and rhs_cf:
+                return True
         if (
             _fast_precanonicalize_is_nhwc_like(name, dynamic_nhwc_like_names, context)
             and not has_cf_binary_consumer
@@ -35290,6 +35549,14 @@ def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
         lrn_source = _resolve_local_response_norm_source(name)
         if lrn_source is not None and lrn_source != name:
             return _has_cf_rank4_target_shape(lrn_source, expected_channels)
+        unary_source = _resolve_layout_preserving_unary_source(name, start_index)
+        if unary_source is not None and unary_source != name:
+            return _is_structurally_cf_rank4_source(
+                unary_source,
+                expected_channels,
+                start_index=start_index,
+                visited=visited,
+            )
         if not _fast_precanonicalize_is_cf_like(name, dynamic_cf_like_names, context):
             return has_cf_binary_consumer
         preferred_channels = _fast_precanonicalize_preferred_channel_count(
@@ -35336,6 +35603,11 @@ def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
         conv_in_channels = context.conv_block_in_channels.get(conv_module, None)
         mean_assign_index: int | None = None
         parsed_gap_mean: Tuple[str, str, str, List[int]] | None = None
+        _rewrite_channel_first_pool_binary_chain_targets(
+            input_name,
+            conv_in_channels,
+            start_index=index,
+        )
         for back in range(max(0, index - 4), index):
             candidate_gap_mean = _parse_rank4_gap_mean_assign(lines[back])
             if candidate_gap_mean is None or str(candidate_gap_mean[1]) != input_name:
@@ -35391,6 +35663,7 @@ def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
             f"{permuted_conv_match.group('indent')}{permuted_conv_match.group('lhs')} = "
             f"self.{conv_module}({input_name})"
         )
+        dynamic_cf_like_names.add(str(input_name))
         dynamic_cf_like_names.add(str(permuted_conv_match.group("lhs")))
         changed = True
     return changed
