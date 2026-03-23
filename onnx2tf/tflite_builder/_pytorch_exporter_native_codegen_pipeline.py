@@ -736,6 +736,7 @@ def _rewrite_native_generated_model_postprocesses(model_file: Path) -> None:
     _rewrite_invalid_constant_reshape_targets(model_file)
     _rewrite_channel_first_const_binary_target_shapes(model_file)
     _rewrite_channel_first_rank4_flatten_to_nwc(model_file)
+    _rewrite_rank3_feature_tail_split_axes(model_file)
 
 
 def _resolve_static_split_axis(
@@ -903,6 +904,77 @@ def _rewrite_split_axes_from_static_shapes(
         model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _rewrite_rank3_feature_tail_split_axes(model_file: Path) -> None:
+    if not model_file.exists():
+        return
+    lines = model_file.read_text(encoding="utf-8").splitlines()
+    split_pattern = re.compile(
+        r"^(?P<indent>\s*)(?P<outputs>[A-Za-z0-9_, ]+)\s*=\s*list\(torch\.tensor_split\("
+        r"(?P<input>[A-Za-z0-9_]+),\s*(?P<sections>\d+),\s*dim=_normalize_dim\((?P<axis>-?\d+),\s*"
+        r"(?P=input)\.ndim\)\)\)\s*$"
+    )
+    concat_pattern = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*_apply_concat\("
+        r".*target_shape=\[(?P<shape>[0-9,\s]+)\].*\)\s*$"
+    )
+    align_pattern = re.compile(
+        r"\[(?P<shape>[0-9,\s]+)\]"
+    )
+
+    def _parse_shape_literal(shape_literal: str) -> list[int]:
+        return [int(token.strip()) for token in str(shape_literal).split(",") if token.strip()]
+
+    rewritten = False
+    for index, line in enumerate(lines):
+        match = split_pattern.match(str(line))
+        if match is None:
+            continue
+        output_vars = [token.strip() for token in str(match.group("outputs")).split(",") if token.strip()]
+        if len(output_vars) == 0:
+            continue
+        sections = int(match.group("sections"))
+        if sections <= 1:
+            continue
+        producer_shape: list[int] | None = None
+        for back in range(max(0, index - 4), index):
+            concat_match = concat_pattern.match(str(lines[back]))
+            if concat_match is None or str(concat_match.group("lhs")) != str(match.group("input")):
+                continue
+            candidate_shape = _parse_shape_literal(str(concat_match.group("shape")))
+            if len(candidate_shape) == 3:
+                producer_shape = candidate_shape
+                break
+        if producer_shape is None:
+            continue
+        if int(match.group("axis")) == len(producer_shape) - 1:
+            continue
+        if producer_shape[-1] % sections != 0:
+            continue
+        expected_output_shape = [int(producer_shape[0]), int(producer_shape[1]), int(producer_shape[2] // sections)]
+        aligned_outputs: set[str] = set()
+        for lookahead in range(index + 1, min(len(lines), index + 12)):
+            current_line = str(lines[lookahead])
+            shape_match = align_pattern.search(current_line)
+            if shape_match is None:
+                continue
+            candidate_shape = _parse_shape_literal(str(shape_match.group("shape")))
+            if candidate_shape != expected_output_shape:
+                continue
+            for output_var in output_vars:
+                if re.search(rf"\b{re.escape(output_var)}\b", current_line) is not None:
+                    aligned_outputs.add(output_var)
+        if len(aligned_outputs) != len(output_vars):
+            continue
+        lines[index] = (
+            f"{match.group('indent')}{', '.join(output_vars)} = list(torch.tensor_split("
+            f"{match.group('input')}, {sections}, "
+            f"dim=_normalize_dim({len(producer_shape) - 1}, {match.group('input')}.ndim)))"
+        )
+        rewritten = True
+    if rewritten:
+        model_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _load_native_codegen_impl(bindings: _NativeCodegenBindings) -> Callable[..., Any]:
     global _NATIVE_CODEGEN_IMPL
     if bindings.compiled_impl is not None:
@@ -985,6 +1057,9 @@ def assemble_and_write_model_phase(
         state.context.package_dir / "model.py",
         model_ir=state.context.model_ir,
         tensor_var_names=state.context.tensor_var_names,
+    )
+    _rewrite_rank3_feature_tail_split_axes(
+        state.context.package_dir / "model.py"
     )
     state.load_specs_result = [
         (str(attr_path), str(tensor_name))

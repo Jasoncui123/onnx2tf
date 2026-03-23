@@ -39,6 +39,7 @@ from onnx2tf.tflite_builder._pytorch_exporter_native_codegen_pipeline import (
     _rewrite_channel_first_rank4_flatten_to_nwc,
     _rewrite_channel_first_pool_target_shapes,
     _rewrite_invalid_constant_reshape_targets,
+    _rewrite_rank3_feature_tail_split_axes,
 )
 from onnx2tf.tflite_builder.pytorch_package_runtime import (
     _align_tensor_to_target_shape,
@@ -3149,6 +3150,69 @@ def test_rewrite_channel_first_rank4_flatten_to_nwc(
     assert (
         "in324 = torch.reshape(onnx_shape601.permute(0, 2, 3, 1).contiguous(), "
         "_resolve_reshape_shape([1, -1, 448], onnx_shape601, allow_zero=False))"
+        in rewritten
+    )
+
+
+def test_apply_fast_precanonicalize_repairs_normalizes_direct_cf_resize_target_shape_for_cat_consumer(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "yolox_like_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, resize165_in_cf: torch.Tensor, cv132_in: torch.Tensor):",
+                "        resize165_out_cf = _apply_resize(resize165_in_cf, [40, 40], method='nearest', target_shape=[1, 40, 40, 256], channel_last=False)",
+                "        cv167_in = torch.cat([resize165_out_cf, cv132_in], dim=1)",
+                "        return cv167_in",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "resize165_out_cf = _apply_resize(resize165_in_cf, [40, 40], method='nearest', "
+        "target_shape=[1, 256, 40, 40], channel_last=False)"
+        in rewritten
+    )
+
+
+def test_rewrite_rank3_feature_tail_split_to_feature_axis(
+    tmp_path,
+) -> None:
+    model_path = tmp_path / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, t_328: torch.Tensor, t_374: torch.Tensor, t_414: torch.Tensor, t_446: torch.Tensor):",
+                "        t_460 = _apply_concat([t_328, t_374, t_414, t_446], axis=1, target_shape=[1, 17640, 4], fused='NONE')",
+                "        t_462, t_469 = list(torch.tensor_split(t_460, 2, dim=_normalize_dim(1, t_460.ndim)))",
+                "        t_480 = _align_tensor_to_target_shape(torch.add(t_462, self.const_0), [1, 17640, 2])",
+                "        t_485 = _align_tensor_to_target_shape(torch.add(t_469, self.const_1), [1, 17640, 2])",
+                "        return t_480, t_485",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _rewrite_rank3_feature_tail_split_axes(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "t_462, t_469 = list(torch.tensor_split(t_460, 2, dim=_normalize_dim(2, t_460.ndim)))"
         in rewritten
     )
 
@@ -13992,6 +14056,60 @@ def test_should_avoid_model_ir_in_raw_canonicalize_for_version_rfb_with_compact_
                 "        detector_conv=self.conv_block_17(detector_add.permute(0, 3, 1, 2).contiguous())",
                 "        scores=_apply_concat(inputs=(cls0, cls1), axis=1, target_shape=(1, 12800, 2), fused='NONE')",
                 "        boxes=_apply_concat(inputs=(box0, box1), axis=2, target_shape=(1, 12800, 4), fused='NONE')",
+                "        return detector_conv, scores, boxes",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_avoid_model_ir_in_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_skip_expensive_raw_canonicalize_for_multiscale_detection_tail_with_direct_cf_conv(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "multiscale_detection_tail_skip_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add_lhs, add_rhs, cls0, cls1, box0, box1):",
+                "        detector_add = _align_tensor_to_target_shape(torch.add(add_lhs, add_rhs), [1, 64, 60, 80])",
+                "        detector_conv = self.conv_block_17(detector_add)",
+                "        cls_tail = _apply_concat([cls0, cls1], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
+                "        scores = _apply_softmax(cls_tail, axis=2, beta=1.0, target_shape=[1, 17640, 2])",
+                "        boxes = _apply_concat([box0, box1], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
+                "        return detector_conv, scores, boxes",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert _should_skip_expensive_raw_canonicalize_for_native_package(package_dir) is True
+
+
+def test_should_avoid_model_ir_in_raw_canonicalize_for_multiscale_detection_tail_with_direct_cf_conv(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "multiscale_detection_tail_avoid_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, add_lhs, add_rhs, cls0, cls1, box0, box1):",
+                "        detector_add = _align_tensor_to_target_shape(torch.add(add_lhs, add_rhs), [1, 64, 60, 80])",
+                "        detector_conv = self.conv_block_17(detector_add)",
+                "        cls_tail = _apply_concat([cls0, cls1], axis=1, target_shape=[1, 17640, 2], fused='NONE')",
+                "        scores = _apply_softmax(cls_tail, axis=2, beta=1.0, target_shape=[1, 17640, 2])",
+                "        boxes = _apply_concat([box0, box1], axis=2, target_shape=[1, 17640, 4], fused='NONE')",
                 "        return detector_conv, scores, boxes",
                 "",
             ]
@@ -34126,6 +34244,8 @@ def test_export_pytorch_package_generates_native_yolox_package_when_model_is_ava
     assert "target_shape=_tensor_shape_list(max_p138_in_cf)" in model_source
     assert "cv167_in = torch.cat([resize165_out_cf, cv132_in], dim=1)" in model_source
     assert "cv189_in = torch.cat([resize187_out_cf, cv98_in], dim=1)" in model_source
+    assert "resize165_out_cf = _apply_resize(resize165_in_cf, [40, 40], method='nearest', target_shape=[1, 256, 40, 40], channel_last=False)" in model_source
+    assert "resize187_out_cf = _apply_resize(resize187_in_cf, [80, 80], method='nearest', target_shape=[1, 128, 80, 80], channel_last=False)" in model_source
     assert "cv229_in = torch.cat([t750_cf, resize165_in_cf], dim=1)" in model_source
     assert "t798_cf = torch.cat([cv261_out_cf, t796_cf, t797_cf], dim=1)" in model_source
     assert "t824_cf = torch.cat([cv282_out_cf, t822_cf, t823_cf], dim=1)" in model_source
@@ -34412,9 +34532,10 @@ def test_export_pytorch_package_preserves_fast_raw_codegen_shape_for_version_rfb
     metadata = json.loads((package_dir / "metadata.json").read_text())
     model_source = (package_dir / "model.py").read_text()
     assert metadata["execution_backend"] == "native"
-    assert "sng_cv45_in = _align_tensor_to_target_shape(torch.add(sng_cv42_out_cf, sng_cv29_out_cf), [1, 60, 80, 64])" in model_source
-    assert "sng_cv51_in_cf = self.conv_block_25(sng_cv45_in.permute(0, 3, 1, 2).contiguous())" in model_source
+    assert "sng_cv45_in = _align_tensor_to_target_shape(torch.add(sng_cv42_out_cf, sng_cv29_out_cf), [1, 64, 60, 80])" in model_source
+    assert "sng_cv51_in_cf = self.conv_block_25(sng_cv45_in)" in model_source
     assert "t_459 = _apply_concat([t_328, t_374, t_414, t_446], axis=1, target_shape=[1, 17640, 2], fused='NONE')" in model_source
+    assert "t_462, t_469 = list(torch.tensor_split(t_460, 2, dim=_normalize_dim(2, t_460.ndim)))" in model_source
     assert "boxes = _apply_concat([t_480, t_485], axis=2, target_shape=[1, 17640, 4], fused='NONE')" in model_source
 
 

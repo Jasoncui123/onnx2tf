@@ -36419,6 +36419,192 @@ def _rewrite_structural_concat_resize_input_cf_add_targets(
     return changed
 
 
+def _rewrite_structural_direct_cf_resize_target_shapes_for_cat_consumers(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    assignments_by_lhs: Dict[str, List[int]] = {}
+    for idx, current_line in enumerate(lines):
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is not None:
+            assignments_by_lhs.setdefault(str(assign[1]), []).append(idx)
+
+    def _find_assignment_before(name: str, upper_bound: int) -> int | None:
+        for candidate_index in reversed(assignments_by_lhs.get(str(name), [])):
+            if candidate_index < upper_bound:
+                return candidate_index
+        return None
+
+    def _parse_resize_assign(
+        line: str,
+    ) -> Tuple[str, str, str, Tuple[int, int], List[int], str, str | None, str | None, bool] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        parsed = _parse_apply_resize_input_size_shape_and_channel_last(rhs)
+        if parsed is None:
+            return None
+        input_name, size_value, shape_value, channel_last = parsed
+        if size_value is None or shape_value is None:
+            return None
+        stripped = rhs.strip()
+        if not stripped.startswith("_apply_resize(") or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len("_apply_resize(") : -1])
+        method_expr: str | None = None
+        align_expr: str | None = None
+        hpc_expr: str | None = None
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                continue
+            key, value = part.split("=", 1)
+            if key.strip() == "method":
+                method_expr = value.strip()
+            elif key.strip() == "align_corners":
+                align_expr = value.strip()
+            elif key.strip() == "half_pixel_centers":
+                hpc_expr = value.strip()
+        if method_expr is None or not (method_expr.startswith("'") and method_expr.endswith("'")):
+            return None
+        return (
+            indent,
+            lhs,
+            input_name,
+            (int(size_value[0]), int(size_value[1])),
+            [int(v) for v in list(shape_value)],
+            method_expr[1:-1],
+            align_expr,
+            hpc_expr,
+            channel_last,
+        )
+
+    for index, line in enumerate(lines):
+        resize_assign = _parse_resize_assign(line)
+        if resize_assign is None:
+            continue
+        indent, lhs, input_name, resize_size, target_shape, method, align_corners_expr, half_pixel_centers_expr, channel_last = resize_assign
+        if channel_last or len(target_shape) != 4:
+            continue
+        if int(target_shape[1]) != int(resize_size[0]) or int(target_shape[2]) != int(resize_size[1]):
+            continue
+        if int(target_shape[3]) in {int(resize_size[0]), int(resize_size[1])}:
+            continue
+        cat_consumer_found = False
+        for lookahead in range(index + 1, min(len(lines), index + 5)):
+            consumer_assign = _parse_simple_assignment_line(lines[lookahead])
+            consumer_cat = _parse_torch_cat_inputs_and_dim(consumer_assign[2]) if consumer_assign is not None else None
+            if (
+                consumer_assign is None
+                or consumer_cat is None
+                or consumer_cat[1] != 1
+                or lhs not in [name.strip() for name in consumer_cat[0] if name.strip()]
+            ):
+                continue
+            cat_consumer_found = True
+            break
+        if not cat_consumer_found:
+            continue
+        preferred_channel_count = _infer_structural_rank4_channel_count(
+            lhs,
+            target_shape,
+            dynamic_cf_like_names,
+            dynamic_nhwc_like_names,
+            context,
+        )
+        if preferred_channel_count is None:
+            preferred_channel_count = int(target_shape[3])
+        normalized_shape = _normalize_cf_rank4_shape(
+            target_shape,
+            preferred_channel_count=int(preferred_channel_count),
+            out_hw=resize_size,
+        )
+        if normalized_shape == target_shape:
+            continue
+        lines[index] = (
+            f"{indent}{lhs} = _apply_resize("
+            f"{input_name}, [{resize_size[0]}, {resize_size[1]}], "
+            f"method='{method}', target_shape={repr(normalized_shape)}"
+            f"{', align_corners=' + align_corners_expr if align_corners_expr is not None else ''}"
+            f"{', half_pixel_centers=' + half_pixel_centers_expr if half_pixel_centers_expr is not None else ''}, "
+            f"channel_last=False)"
+        )
+        dynamic_cf_like_names.add(lhs)
+        dynamic_nhwc_like_names.discard(lhs)
+        context.static_shapes[str(lhs)] = list(normalized_shape)
+        assign_index = _find_assignment_before(input_name, index)
+        if assign_index is not None and _fast_precanonicalize_is_cf_like(input_name, dynamic_cf_like_names, context):
+            dynamic_cf_like_names.add(input_name)
+        changed = True
+    return changed
+
+
+def _rewrite_structural_rank3_feature_tail_split_axes(
+    lines: List[str],
+) -> bool:
+    changed = False
+    assignments_by_lhs: Dict[str, List[int]] = {}
+    for idx, current_line in enumerate(lines):
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is not None:
+            assignments_by_lhs.setdefault(str(assign[1]), []).append(idx)
+
+    def _find_assignment_before(name: str, upper_bound: int) -> int | None:
+        for candidate_index in reversed(assignments_by_lhs.get(str(name), [])):
+            if candidate_index < upper_bound:
+                return candidate_index
+        return None
+
+    def _parse_rank3_concat_assign(line: str) -> Tuple[str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        concat_args = _parse_apply_concat_inputs_axis_and_shape(assign[2]) if assign is not None else None
+        if assign is None or concat_args is None or concat_args[2] is None:
+            return None
+        target_shape = list(concat_args[2])
+        if len(target_shape) != 3:
+            return None
+        return str(assign[1]), target_shape
+
+    for index, line in enumerate(lines):
+        split_assign = _parse_tensor_split_assign(line)
+        if split_assign is None:
+            continue
+        indent, outputs, input_name, sections, axis = split_assign
+        if sections <= 1 or axis == 2:
+            continue
+        concat_shape: List[int] | None = None
+        concat_index = _find_assignment_before(input_name, index + 1)
+        if concat_index is not None:
+            parsed_concat = _parse_rank3_concat_assign(lines[concat_index])
+            if parsed_concat is not None and parsed_concat[0] == input_name:
+                concat_shape = list(parsed_concat[1])
+        if concat_shape is None or concat_shape[2] % sections != 0:
+            continue
+        expected_shape = [int(concat_shape[0]), int(concat_shape[1]), int(concat_shape[2] // sections)]
+        matched_outputs: Set[str] = set()
+        for lookahead in range(index + 1, min(len(lines), index + 12)):
+            shape_match = re.search(r"\[(?P<shape>[0-9,\s]+)\]", str(lines[lookahead]))
+            if shape_match is None:
+                continue
+            candidate_shape = _parse_int_list_literal(str(shape_match.group("shape")))
+            if candidate_shape != expected_shape:
+                continue
+            for output_name in outputs:
+                if re.search(rf"\b{re.escape(output_name)}\b", str(lines[lookahead])) is not None:
+                    matched_outputs.add(str(output_name))
+        if len(matched_outputs) != len(outputs):
+            continue
+        lines[index] = (
+            f"{indent}{', '.join(outputs)} = list(torch.tensor_split("
+            f"{input_name}, {sections}, dim=_normalize_dim(2, {input_name}.ndim)))"
+        )
+        changed = True
+    return changed
+
+
 def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
     if not model_path.exists():
         return
@@ -36659,12 +36845,21 @@ def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
         context,
     ):
         changed = True
+    if _rewrite_structural_direct_cf_resize_target_shapes_for_cat_consumers(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if _rewrite_structural_channel_first_rank4_flatten_to_nwc(
         lines,
         dynamic_cf_like_names,
         dynamic_nhwc_like_names,
         context,
     ):
+        changed = True
+    if _rewrite_structural_rank3_feature_tail_split_axes(lines):
         changed = True
     if _rewrite_structural_nhwc_image_tail_bridges(
         lines,
@@ -36806,6 +37001,13 @@ def _apply_structural_final_model_repairs(model_path: Path) -> None:
         context,
     ):
         changed = True
+    if _rewrite_structural_direct_cf_resize_target_shapes_for_cat_consumers(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if _rewrite_structural_channel_first_rank4_flatten_to_nwc(
         lines,
         dynamic_cf_like_names,
@@ -36825,6 +37027,8 @@ def _apply_structural_final_model_repairs(model_path: Path) -> None:
         dynamic_nhwc_like_names,
         context,
     ):
+        changed = True
+    if _rewrite_structural_rank3_feature_tail_split_axes(lines):
         changed = True
     if _rewrite_structural_concat_resize_input_cf_add_targets(
         lines,
@@ -41529,9 +41733,12 @@ def _has_humanseg_skip_signature(lines: Sequence[str]) -> bool:
     return False
 
 
-def _has_version_rfb_skip_signature(lines: Sequence[str]) -> bool:
+def _has_multiscale_detection_reshape_concat_tail_signature(lines: Sequence[str]) -> bool:
     permuted_conv_re = re.compile(
         r"^\s*[A-Za-z0-9_]+\s*=\s*self\.conv_block_\d+\((?P<src_expr>.+)\)$"
+    )
+    direct_conv_re = re.compile(
+        r"^\s*[A-Za-z0-9_]+\s*=\s*self\.conv_block_\d+\((?P<input>[A-Za-z0-9_]+)\)\s*$"
     )
     align_add_lhs: Set[str] = set()
     for line in lines:
@@ -41547,18 +41754,28 @@ def _has_version_rfb_skip_signature(lines: Sequence[str]) -> bool:
         shape = _parse_rank4_shape_literal(shape_expr)
         if shape is None:
             continue
-        if shape[3] == 64 and "=" in str(line):
+        if len(shape) == 4 and max(int(shape[1]), int(shape[3])) >= 16 and "=" in str(line):
             align_add_lhs.add(str(line).split("=", 1)[0].strip())
     if not align_add_lhs:
         return False
     has_axis1_concat = False
     has_axis2_boxes_concat = False
+    has_rank3_scores_softmax = False
     for line in lines:
         current_line = str(line)
         assignment = _parse_simple_assignment_line(current_line)
         if assignment is None:
             continue
         _, _, rhs = assignment
+        softmax_args = _parse_apply_softmax_input_axis_and_shape(rhs)
+        if (
+            softmax_args is not None
+            and softmax_args[2] is not None
+            and len(softmax_args[2]) == 3
+            and int(softmax_args[1]) == 2
+            and int(softmax_args[2][2]) == 2
+        ):
+            has_rank3_scores_softmax = True
         apply_concat_args = _parse_apply_concat_inputs_axis_and_shape(rhs)
         if apply_concat_args is not None:
             concat_inputs, concat_axis, concat_shape = apply_concat_args
@@ -41573,18 +41790,28 @@ def _has_version_rfb_skip_signature(lines: Sequence[str]) -> bool:
                 has_axis1_concat = True
             elif torch_cat_args[1] == 2:
                 has_axis2_boxes_concat = True
-    if not has_axis1_concat:
+    if not has_axis1_concat and not has_rank3_scores_softmax:
         return False
     if not has_axis2_boxes_concat:
         return False
     for line in lines:
         match = permuted_conv_re.match(str(line))
         if match is None:
+            direct_match = direct_conv_re.match(str(line))
+            if direct_match is not None and str(direct_match.group("input")) in align_add_lhs:
+                return True
             continue
-        source_name = _resolve_nhwc_to_nchw_bridge_source(str(match.group("src_expr")))
+        src_expr = str(match.group("src_expr")).strip()
+        source_name = _resolve_nhwc_to_nchw_bridge_source(src_expr)
         if source_name in align_add_lhs:
             return True
+        if re.fullmatch(r"[A-Za-z0-9_]+", src_expr) is not None and src_expr in align_add_lhs:
+            return True
     return False
+
+
+def _has_version_rfb_skip_signature(lines: Sequence[str]) -> bool:
+    return _has_multiscale_detection_reshape_concat_tail_signature(lines)
 
 
 def _has_iat_llie_skip_signature(lines: Sequence[str]) -> bool:
