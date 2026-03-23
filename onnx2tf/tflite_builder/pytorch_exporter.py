@@ -31192,10 +31192,10 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 for token in str(depth_to_space_nhwc_gather_match.group("indices")).split(",")
                 if token.strip() != ""
             ]
-            input_is_structural_cf = (
-                input_name in cf_like_names
-                or input_name.endswith("_cf")
-                or input_name.endswith("_out_cf")
+            input_is_structural_cf = _fast_precanonicalize_is_cf_like(
+                input_name,
+                cf_like_names,
+                repair_context,
             )
             if not input_is_structural_cf:
                 for back in range(max(0, index - 4), index):
@@ -31218,7 +31218,13 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                     ):
                         input_is_structural_cf = True
                         break
+            resolved_input_name = _fast_precanonicalize_resolve_alias(
+                input_name,
+                repair_context.aliases,
+            )
             input_shape = repair_context.static_shapes.get(input_name)
+            if input_shape is None:
+                input_shape = repair_context.static_shapes.get(resolved_input_name)
             if (
                 input_is_structural_cf
             ):
@@ -31252,7 +31258,12 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                         cf_like_names.add(str(next_permuted_conv_match.group("lhs")))
                         changed = True
             is_depth_to_space_reorder = (
-                input_name.endswith("_nhwc")
+                _fast_precanonicalize_is_nhwc_like(
+                    input_name,
+                    nhwc_like_names,
+                    repair_context,
+                )
+                and not input_is_structural_cf
                 and (
                     "depth_to" in lhs_name.lower()
                     or "depthtospace" in lhs_name.lower()
@@ -34142,6 +34153,250 @@ def _rewrite_structural_nhwc_image_tail_bridges(
     return changed
 
 
+def _rewrite_structural_channel_first_depth_to_space_public_bridges(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    assignments_by_lhs: Dict[str, List[int]] = {}
+    for idx, current_line in enumerate(lines):
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is not None:
+            assignments_by_lhs.setdefault(str(assign[1]), []).append(idx)
+    channel_first_gather_slice_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<input>[A-Za-z0-9_]+)\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
+    )
+    channel_last_gather_slice_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<input>[A-Za-z0-9_]+)\[:, :, :, \[(?P<indices>[0-9,\s-]+)\]\]$"
+    )
+    manual_depth_to_space_bridge_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*"
+        r"(?P<input>[A-Za-z0-9_]+)\.reshape\("
+        r"(?P<n>[A-Za-z0-9_]+), (?P<h>[A-Za-z0-9_]+), (?P<w>[A-Za-z0-9_]+), "
+        r"(?P<block_h>\d+), (?P<block_w>\d+), (?P<c>[A-Za-z0-9_]+) // (?P<div>\d+)\)"
+        r"\.permute\(0, 1, 3, 2, 4, 5\)\.reshape\("
+        r"(?P=n), (?P=h) \* (?P=block_h), (?P=w) \* (?P=block_w), (?P=c) // (?P=div)\)$"
+    )
+
+    def _find_assignment_before(name: str, upper_bound: int) -> int | None:
+        for candidate_index in reversed(assignments_by_lhs.get(str(name), [])):
+            if candidate_index < upper_bound:
+                return candidate_index
+        return None
+
+    def _is_channel_first_depth_to_space_source(name: str, upper_bound: int) -> bool:
+        current_name = str(name)
+        current_upper_bound = int(upper_bound)
+        visited: Set[str] = set()
+        for _ in range(12):
+            if current_name in visited:
+                return False
+            visited.add(current_name)
+            if _fast_precanonicalize_is_cf_like(
+                current_name,
+                dynamic_cf_like_names,
+                context,
+            ):
+                return True
+            assign_index = _find_assignment_before(current_name, current_upper_bound)
+            if assign_index is None:
+                return False
+            src_line = str(lines[assign_index])
+            cf_gather_match = channel_first_gather_slice_re.match(src_line)
+            if (
+                cf_gather_match is not None
+                and str(cf_gather_match.group("lhs")) == current_name
+            ):
+                current_name = str(cf_gather_match.group("input"))
+                current_upper_bound = assign_index
+                continue
+            cl_gather_match = channel_last_gather_slice_re.match(src_line)
+            if (
+                cl_gather_match is not None
+                and str(cl_gather_match.group("lhs")) == current_name
+            ):
+                return False
+            assign = _parse_simple_assignment_line(src_line)
+            rhs_expr = str(assign[2]).strip() if assign is not None else None
+            if (
+                assign is not None
+                and str(assign[1]) == current_name
+                and re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr or "") is not None
+                and rhs_expr != current_name
+            ):
+                current_name = str(rhs_expr)
+                current_upper_bound = assign_index
+                continue
+            return False
+        return False
+
+    def _find_upstream_channel_first_depth_to_space_reorder(
+        name: str,
+        upper_bound: int,
+    ) -> Tuple[int, str, str, List[int], List[str]] | None:
+        current_name = str(name)
+        current_upper_bound = int(upper_bound)
+        alias_chain: List[str] = []
+        visited: Set[str] = set()
+        for _ in range(12):
+            if current_name in visited:
+                return None
+            visited.add(current_name)
+            assign_index = _find_assignment_before(current_name, current_upper_bound)
+            if assign_index is None:
+                return None
+            assign_line = str(lines[assign_index])
+            cf_gather_match = channel_first_gather_slice_re.match(assign_line)
+            if (
+                cf_gather_match is not None
+                and str(cf_gather_match.group("lhs")) == current_name
+            ):
+                indices = [
+                    int(token.strip())
+                    for token in str(cf_gather_match.group("indices")).split(",")
+                    if token.strip() != ""
+                ]
+                return (
+                    assign_index,
+                    current_name,
+                    str(cf_gather_match.group("input")),
+                    indices,
+                    alias_chain,
+                )
+            cl_gather_match = channel_last_gather_slice_re.match(assign_line)
+            if (
+                cl_gather_match is not None
+                and str(cl_gather_match.group("lhs")) == current_name
+            ):
+                return None
+            assign = _parse_simple_assignment_line(assign_line)
+            rhs_expr = str(assign[2]).strip() if assign is not None else None
+            if (
+                assign is not None
+                and str(assign[1]) == current_name
+                and re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr or "") is not None
+                and rhs_expr != current_name
+            ):
+                alias_chain.append(current_name)
+                current_name = str(rhs_expr)
+                current_upper_bound = assign_index
+                continue
+            return None
+        return None
+
+    def _try_elide_channel_first_depth_to_space_reorder(
+        name: str,
+        upper_bound: int,
+        divisor: int,
+    ) -> str | None:
+        reorder = _find_upstream_channel_first_depth_to_space_reorder(
+            name,
+            upper_bound,
+        )
+        if reorder is None:
+            return None
+        assign_index, reordered_name, source_name, indices, alias_chain = reorder
+        if not _is_channel_first_depth_to_space_source(source_name, assign_index):
+            return None
+        source_shape = (
+            context.static_shapes.get(source_name)
+            or context.static_shapes.get(
+                _fast_precanonicalize_resolve_alias(source_name, context.aliases)
+            )
+        )
+        if len(indices) == 0:
+            return None
+        total_channels = int(len(indices))
+        if total_channels % int(divisor) != 0:
+            return None
+        if sorted(indices) != list(range(total_channels)):
+            return None
+        base_channels = total_channels // int(divisor)
+        expected_indices = [
+            int(channel_index) * int(divisor) + int(offset_index)
+            for offset_index in range(int(divisor))
+            for channel_index in range(int(base_channels))
+        ]
+        if indices != expected_indices:
+            return None
+        normalized_source_shape: List[int] | None = None
+        if source_shape is not None and len(source_shape) == 4:
+            if int(source_shape[1]) == total_channels:
+                normalized_source_shape = [int(v) for v in list(source_shape)]
+            elif int(source_shape[3]) == total_channels:
+                normalized_source_shape = [
+                    int(source_shape[0]),
+                    int(source_shape[3]),
+                    int(source_shape[1]),
+                    int(source_shape[2]),
+                ]
+        indent = re.match(r"^\s*", str(lines[assign_index])).group(0)
+        lines[assign_index] = (
+            f"{indent}{reordered_name} = {source_name}"
+        )
+        all_alias_names = [str(reordered_name), *[str(alias) for alias in alias_chain]]
+        for alias_name in all_alias_names:
+            context.aliases[str(alias_name)] = str(source_name)
+            if normalized_source_shape is not None:
+                context.static_shapes[str(alias_name)] = [
+                    int(v) for v in list(normalized_source_shape)
+                ]
+            dynamic_cf_like_names.add(str(alias_name))
+        return str(source_name)
+
+    for index, line in enumerate(lines):
+        bridge_match = manual_depth_to_space_bridge_re.match(str(line))
+        if bridge_match is None:
+            continue
+        input_name = str(bridge_match.group("input"))
+        if not _is_channel_first_depth_to_space_source(input_name, index):
+            continue
+        block_h = int(bridge_match.group("block_h"))
+        block_w = int(bridge_match.group("block_w"))
+        divisor = int(bridge_match.group("div"))
+        if block_h <= 1 or block_h != block_w or divisor != block_h * block_w:
+            continue
+        elided_input_name = _try_elide_channel_first_depth_to_space_reorder(
+            input_name,
+            index,
+            divisor,
+        )
+        if elided_input_name is not None:
+            input_name = str(elided_input_name)
+        else:
+            input_name = str(
+                context.aliases.get(
+                    input_name,
+                    _fast_precanonicalize_resolve_alias(input_name, context.aliases),
+                )
+            )
+        lines[index] = (
+            f"{bridge_match.group('indent')}{bridge_match.group('lhs')} = "
+            f"_torch_permute(F.pixel_shuffle({input_name}, {block_h}), [0, 2, 3, 1])"
+        )
+        dynamic_nhwc_like_names.add(str(bridge_match.group("lhs")))
+        resolved_input_name = _fast_precanonicalize_resolve_alias(
+            input_name,
+            context.aliases,
+        )
+        input_shape = (
+            context.static_shapes.get(input_name)
+            or context.static_shapes.get(resolved_input_name)
+        )
+        if input_shape is not None and len(input_shape) == 4:
+            output_shape = [
+                int(input_shape[0]),
+                int(input_shape[2]) * block_h,
+                int(input_shape[3]) * block_w,
+                int(input_shape[1]) // divisor,
+            ]
+            context.static_shapes[str(bridge_match.group("lhs"))] = output_shape
+        changed = True
+    return changed
+
+
 def _rewrite_structural_cf_anchor_binary_add_targets(
     lines: List[str],
     dynamic_cf_like_names: Set[str],
@@ -36120,6 +36375,13 @@ def _apply_structural_final_model_repairs(model_path: Path) -> None:
         context,
     ):
         changed = True
+    if _rewrite_structural_channel_first_depth_to_space_public_bridges(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if _rewrite_structural_concat_resize_input_cf_add_targets(
         lines,
         dynamic_cf_like_names,
@@ -36152,6 +36414,33 @@ def _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path: Path
         r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*(?P<input>[A-Za-z0-9_]+)\[:, \[(?P<indices>[0-9,\s-]+)\], :, :\]$"
     )
     changed = False
+
+    local_alias_sources: Dict[str, str] = {}
+    for line in lines:
+        assign = _parse_simple_assignment_line(str(line))
+        if assign is None:
+            continue
+        rhs_expr = str(assign[2]).strip()
+        if re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr) is None:
+            continue
+        local_alias_sources[str(assign[1])] = rhs_expr
+
+    def _resolve_local_alias(name: str) -> str:
+        resolved = str(name)
+        seen: Set[str] = set()
+        while resolved not in seen and resolved in local_alias_sources:
+            seen.add(resolved)
+            resolved = str(local_alias_sources[resolved])
+        return resolved
+
+    def _is_structural_cf_name(name: str) -> bool:
+        resolved = _resolve_local_alias(str(name))
+        return resolved.endswith("_cf") or resolved.endswith("_out_cf")
+
+    def _is_structural_nhwc_name(name: str) -> bool:
+        resolved = _resolve_local_alias(str(name))
+        return "_nhwc" in resolved
+
     index = 0
     while index < len(lines):
         current_line = str(lines[index])
@@ -36166,7 +36455,8 @@ def _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path: Path
                 and "_depth_to_space_" in next_line
             )
             if (
-                input_name.endswith("_nhwc")
+                _is_structural_nhwc_name(input_name)
+                and not _is_structural_cf_name(input_name)
                 and (
                     "depth_to" in lhs_name.lower()
                     or "depthtospace" in lhs_name.lower()
@@ -36468,7 +36758,8 @@ def _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path: Path
                 and "_depth_to_space_" in next_line
             )
             if (
-                input_name.endswith("_nhwc")
+                _is_structural_nhwc_name(input_name)
+                and not _is_structural_cf_name(input_name)
                 and (
                     "depth_to" in lhs_name.lower()
                     or "depthtospace" in lhs_name.lower()

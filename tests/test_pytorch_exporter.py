@@ -4417,6 +4417,39 @@ def test_apply_fast_precanonicalize_repairs_fix_depth_to_space_nhwc_gather_axis_
     assert "upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]" not in rewritten
 
 
+def test_apply_fast_precanonicalize_repairs_keeps_depth_to_space_gather_on_channel_first_alias(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "fast_precanon_depth_to_space_cf_alias_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, upsampler_out_nhwc_cf: torch.Tensor) -> torch.Tensor:",
+                "        upsampler_out_nhwc = upsampler_out_nhwc_cf",
+                "        depth_to_in_reordered = upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]",
+                "        _depth_to_space_x_0 = depth_to_in_reordered",
+                "        return _depth_to_space_x_0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "depth_to_in_reordered = upsampler_out_nhwc[:, [0, 16, 32, 1, 17, 33], :, :]"
+        in rewritten
+    )
+    assert "upsampler_out_nhwc[:, :, :, [0, 16, 32, 1, 17, 33]]" not in rewritten
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_cf_hardsigmoid_gate_and_se_bridge(
     tmp_path,
 ) -> None:
@@ -12013,6 +12046,44 @@ def test_reapply_post_export_final_model_repairs_restores_aligned_nhwc_pool_pad_
         "max_p3_in_nhwc_padded = F.pad(_align_tensor_to_target_shape(max_p3_in_nhwc, [1, 400, 569, 64]), [0, 0, 1, 1, 1, 1], mode='constant', value=-3.4028234663852886e+38)"
         in rewritten
     )
+
+
+def test_apply_structural_final_model_repairs_rewrites_channel_first_depth_to_space_public_bridge(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "structural_final_depth_to_space_cf_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, tail_out_nhwc_cf: torch.Tensor) -> torch.Tensor:",
+                "        tail_out_nhwc = tail_out_nhwc_cf",
+                "        depth_to_in_reordered = tail_out_nhwc[:, [0, 16, 32, 1, 17, 33, 2, 18, 34, 3, 19, 35, 4, 20, 36, 5, 21, 37, 6, 22, 38, 7, 23, 39, 8, 24, 40, 9, 25, 41, 10, 26, 42, 11, 27, 43, 12, 28, 44, 13, 29, 45, 14, 30, 46, 15, 31, 47], :, :]",
+                "        _depth_to_space_x_0 = depth_to_in_reordered",
+                "        _depth_to_space_n_0, _depth_to_space_h_0, _depth_to_space_w_0, _depth_to_space_c_0 = _depth_to_space_x_0.shape",
+                "        out_public_layout_bridge = _depth_to_space_x_0.reshape(_depth_to_space_n_0, _depth_to_space_h_0, _depth_to_space_w_0, 4, 4, _depth_to_space_c_0 // 16).permute(0, 1, 3, 2, 4, 5).reshape(_depth_to_space_n_0, _depth_to_space_h_0 * 4, _depth_to_space_w_0 * 4, _depth_to_space_c_0 // 16)",
+                "        out = _torch_permute(out_public_layout_bridge, [0, 3, 1, 2])",
+                "        return out",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_structural_final_model_repairs(model_path)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "depth_to_in_reordered = tail_out_nhwc" in rewritten
+    assert (
+        "out_public_layout_bridge = _torch_permute(F.pixel_shuffle("
+        in rewritten
+    )
+    assert ", 4), [0, 2, 3, 1])" in rewritten
 
 
 def test_apply_fast_precanonicalize_repairs_until_stable_keeps_aligned_nhwc_pool_pad_pair(
