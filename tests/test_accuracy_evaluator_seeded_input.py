@@ -2,6 +2,8 @@ import numpy as np
 from onnx import TensorProto, helper
 
 from onnx2tf.tflite_builder.accuracy_evaluator import (
+    _FLOAT_METRIC_THRESHOLDS,
+    _QUANT_METRIC_THRESHOLDS,
     _build_seeded_input_distribution_overrides,
     _build_eval_inputs_for_sample,
     _collect_onnx_input_specs,
@@ -10,6 +12,17 @@ from onnx2tf.tflite_builder.accuracy_evaluator import (
     _max_abs_error,
     _MetricAccumulator,
 )
+
+
+def test_default_accuracy_thresholds_match_pytorch_style() -> None:
+    expected = {
+        "max_abs": 5.0e-2,
+        "mean_abs": 5.0e-3,
+        "rmse": 6.0e-3,
+        "cosine_similarity": 0.9990,
+    }
+    assert _FLOAT_METRIC_THRESHOLDS == expected
+    assert _QUANT_METRIC_THRESHOLDS == expected
 
 
 def test_generate_seeded_input_float_nchw_image_shape_defaults_normal(
@@ -281,3 +294,49 @@ def test_judge_metrics_relaxes_thresholds_for_large_dynamic_range_outputs() -> N
     assert result["effective_thresholds"]["max_abs"] >= 0.49
     assert result["effective_thresholds"]["mean_abs"] >= 0.0055
     assert result["effective_thresholds"]["rmse"] >= 0.0154
+
+
+def test_judge_metrics_bypasses_cosine_for_low_energy_outputs() -> None:
+    result = _judge_metrics(
+        metrics={
+            "max_abs": 2.2e-4,
+            "ref_max_abs": 1.7e-4,
+            "ref_rms": 2.7e-5,
+            "mean_abs": 3.1e-5,
+            "rmse": 4.0e-5,
+            "cosine_similarity": 0.02,
+        },
+        thresholds={
+            "max_abs": 0.05,
+            "mean_abs": 0.005,
+            "rmse": 0.006,
+            "cosine_similarity": 0.999,
+        },
+        rtol=1.0e-4,
+    )
+    assert result["pass"] is True
+    assert result["checks"]["cosine_similarity"] is True
+    assert result["cosine_similarity_bypassed_for_low_energy"] is True
+
+
+def test_judge_metrics_keeps_cosine_for_nontrivial_energy_outputs() -> None:
+    result = _judge_metrics(
+        metrics={
+            "max_abs": 2.2e-4,
+            "ref_max_abs": 0.2,
+            "ref_rms": 0.05,
+            "mean_abs": 3.1e-5,
+            "rmse": 4.0e-5,
+            "cosine_similarity": 0.02,
+        },
+        thresholds={
+            "max_abs": 0.05,
+            "mean_abs": 0.005,
+            "rmse": 0.006,
+            "cosine_similarity": 0.999,
+        },
+        rtol=1.0e-4,
+    )
+    assert result["pass"] is False
+    assert result["checks"]["cosine_similarity"] is False
+    assert result["cosine_similarity_bypassed_for_low_energy"] is False

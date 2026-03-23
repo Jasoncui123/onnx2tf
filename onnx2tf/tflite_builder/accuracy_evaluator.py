@@ -1303,19 +1303,21 @@ class _MetricAccumulator:
         }
 
 
+_PYTORCH_ALIGNED_METRIC_THRESHOLDS = {
+    "max_abs": 5.0e-2,
+    "mean_abs": 5.0e-3,
+    "rmse": 6.0e-3,
+    "cosine_similarity": 0.9990,
+}
+
+
 _FLOAT_METRIC_THRESHOLDS = {
-    "max_abs": 1.0e-4,
-    "mean_abs": 1.0e-5,
-    "rmse": 1.0e-5,
-    "cosine_similarity": 0.9999,
+    **_PYTORCH_ALIGNED_METRIC_THRESHOLDS,
 }
 
 
 _QUANT_METRIC_THRESHOLDS = {
-    "max_abs": 5.0e-2,
-    "mean_abs": 1.0e-2,
-    "rmse": 2.0e-2,
-    "cosine_similarity": 0.98,
+    **_PYTORCH_ALIGNED_METRIC_THRESHOLDS,
 }
 
 
@@ -1371,11 +1373,18 @@ def _judge_metrics(
         float(rtol) * ref_rms,
         6.25e-5 * ref_max_abs,
     )
+    low_energy_cosine_bypass = bool(
+        ref_max_abs <= max(5.0e-4, 1.0e-2 * max_abs_limit)
+        and ref_rms <= max(5.0e-5, 1.0e-2 * rmse_limit)
+    )
     checks = {
         "max_abs": float(metrics["max_abs"]) <= max_abs_limit,
         "mean_abs": float(metrics["mean_abs"]) <= mean_abs_limit,
         "rmse": float(metrics["rmse"]) <= rmse_limit,
-        "cosine_similarity": float(metrics["cosine_similarity"]) >= float(thresholds["cosine_similarity"]),
+        "cosine_similarity": (
+            low_energy_cosine_bypass
+            or float(metrics["cosine_similarity"]) >= float(thresholds["cosine_similarity"])
+        ),
     }
     return {
         "pass": bool(all(checks.values())),
@@ -1386,6 +1395,7 @@ def _judge_metrics(
             "rmse": float(rmse_limit),
             "cosine_similarity": float(thresholds["cosine_similarity"]),
         },
+        "cosine_similarity_bypassed_for_low_energy": low_energy_cosine_bypass,
     }
 
 

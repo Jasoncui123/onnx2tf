@@ -14,6 +14,7 @@ import onnx
 import torch
 
 from onnx2tf.tflite_builder.accuracy_evaluator import (
+    _FLOAT_METRIC_THRESHOLDS,
     _align_output_layout_for_compare,
     _build_eval_inputs_for_sample,
     _build_seeded_input_distribution_overrides,
@@ -30,13 +31,6 @@ from onnx2tf.tflite_builder.accuracy_evaluator import (
     _resize_tflite_inputs_if_needed,
     _resolve_metric_thresholds,
 )
-
-_PYTORCH_FLOAT_METRIC_THRESHOLDS = {
-    "max_abs": 5.0e-2,
-    "mean_abs": 5.0e-3,
-    "rmse": 6.0e-3,
-    "cosine_similarity": 0.9990,
-}
 
 
 def _import_generated_package(package_path: str) -> Any:
@@ -556,7 +550,7 @@ def evaluate_pytorch_package_outputs(
 
     thresholds = _resolve_metric_thresholds(
         metric_thresholds=(
-            dict(_PYTORCH_FLOAT_METRIC_THRESHOLDS)
+            dict(_FLOAT_METRIC_THRESHOLDS)
             if metric_thresholds is None
             else metric_thresholds
         ),
@@ -809,7 +803,7 @@ def evaluate_tflite_pytorch_package_outputs(
 
     thresholds = _resolve_metric_thresholds(
         metric_thresholds=(
-            dict(_PYTORCH_FLOAT_METRIC_THRESHOLDS)
+            dict(_FLOAT_METRIC_THRESHOLDS)
             if metric_thresholds is None
             else metric_thresholds
         ),

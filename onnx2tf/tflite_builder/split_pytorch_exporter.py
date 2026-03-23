@@ -29,6 +29,7 @@ def export_split_pytorch_packages(
     custom_input_op_name_np_data_path: Optional[List[Any]] = None,
     shape_hints: Optional[List[str]] = None,
     test_data_nhwc_path: Optional[str] = None,
+    native_package_generation_timeout_sec: int = 0,
 ) -> Dict[str, Any]:
     if not os.path.exists(split_manifest_path):
         raise FileNotFoundError(
@@ -66,6 +67,7 @@ def export_split_pytorch_packages(
         package_dir_path = export_pytorch_package_from_model_ir(
             model_ir=part_model_ir,
             output_folder_path=os.path.join(output_folder_path, package_dir_name),
+            native_package_generation_timeout_sec=native_package_generation_timeout_sec,
         )
         package_input_names = [str(v) for v in list(getattr(part_model_ir, "inputs", []))]
         filtered_custom_inputs = None
@@ -83,6 +85,7 @@ def export_split_pytorch_packages(
                 custom_input_op_name_np_data_path=filtered_custom_inputs,
                 shape_hints=shape_hints,
                 test_data_nhwc_path=test_data_nhwc_path,
+                native_package_generation_timeout_sec=native_package_generation_timeout_sec,
                 raise_on_failure=False,
             )
             if torchscript_path is not None:
@@ -94,6 +97,7 @@ def export_split_pytorch_packages(
                 custom_input_op_name_np_data_path=filtered_custom_inputs,
                 shape_hints=shape_hints,
                 test_data_nhwc_path=test_data_nhwc_path,
+                native_package_generation_timeout_sec=native_package_generation_timeout_sec,
                 raise_on_failure=False,
             )
             if dynamo_onnx_path is not None:
@@ -105,6 +109,7 @@ def export_split_pytorch_packages(
                 custom_input_op_name_np_data_path=filtered_custom_inputs,
                 shape_hints=shape_hints,
                 test_data_nhwc_path=test_data_nhwc_path,
+                native_package_generation_timeout_sec=native_package_generation_timeout_sec,
                 raise_on_failure=False,
             )
             if exported_program_path is not None:
