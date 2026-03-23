@@ -35736,6 +35736,163 @@ def _rewrite_structural_concat_conv_cf_branch_targets(
     return changed
 
 
+def _rewrite_structural_channel_last_slice_concat_targets(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    assignments_by_lhs: Dict[str, List[int]] = {}
+    for idx, current_line in enumerate(lines):
+        assign = _parse_simple_assignment_line(current_line)
+        if assign is not None:
+            assignments_by_lhs.setdefault(str(assign[1]), []).append(idx)
+
+    def _find_assignment_before(name: str, upper_bound: int) -> int | None:
+        for candidate_index in reversed(assignments_by_lhs.get(str(name), [])):
+            if candidate_index < upper_bound:
+                return candidate_index
+        return None
+
+    def _parse_rank4_direct_slice_assign(
+        line: str,
+    ) -> Tuple[str, str, List[str]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
+        slice_match = re.fullmatch(
+            r"(?P<input>[A-Za-z0-9_]+)\[(?P<dims>.+)\]",
+            str(rhs).strip(),
+        )
+        if slice_match is None:
+            return None
+        dims = _split_top_level_csv_exprs(str(slice_match.group("dims")))
+        if len(dims) != 4:
+            return None
+        return str(lhs), str(slice_match.group("input")), [str(dim).strip() for dim in dims]
+
+    def _parse_slice_numeric_upper_bound(
+        dim_expr: str,
+    ) -> int | None:
+        stripped = str(dim_expr).strip()
+        if stripped == ":":
+            return None
+        for pattern in [
+            r"^:(?P<end>\d+)$",
+            r"^0:(?P<end>\d+)$",
+            r"^:(?P<end>\d+):1$",
+            r"^0:(?P<end>\d+):1$",
+        ]:
+            match = re.fullmatch(pattern, stripped)
+            if match is not None:
+                return int(match.group("end"))
+        return None
+
+    def _resolve_direct_slice_source(
+        name: str,
+        upper_bound: int,
+    ) -> Tuple[str, List[str]] | None:
+        current_name = str(name)
+        current_upper_bound = int(upper_bound)
+        visited: Set[str] = set()
+        for _ in range(12):
+            if current_name in visited:
+                return None
+            visited.add(current_name)
+            assign_index = _find_assignment_before(current_name, current_upper_bound)
+            if assign_index is None:
+                return None
+            parsed_slice = _parse_rank4_direct_slice_assign(str(lines[assign_index]))
+            if parsed_slice is not None and parsed_slice[0] == current_name:
+                return str(parsed_slice[1]), list(parsed_slice[2])
+            simple_assign = _parse_simple_assignment_line(str(lines[assign_index]))
+            rhs_expr = str(simple_assign[2]).strip() if simple_assign is not None else None
+            if (
+                simple_assign is not None
+                and str(simple_assign[1]) == current_name
+                and re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr or "") is not None
+                and rhs_expr != current_name
+            ):
+                current_name = str(rhs_expr)
+                current_upper_bound = assign_index
+                continue
+            return None
+        return None
+
+    for index, line in enumerate(lines):
+        assign = _parse_simple_assignment_line(line)
+        concat_args = _parse_apply_concat_inputs_axis_and_shape(assign[2]) if assign is not None else None
+        if assign is None or concat_args is None:
+            continue
+        concat_inputs, concat_axis, target_shape = concat_args
+        if target_shape is None or len(target_shape) != 4 or concat_axis not in {1, 2}:
+            continue
+        preferred_channel_count = _infer_unique_channel_count_from_rank4_shape(target_shape)
+        if preferred_channel_count is None or int(preferred_channel_count) != int(target_shape[1]):
+            continue
+        if int(target_shape[3]) == int(preferred_channel_count):
+            continue
+        slice_sources: List[str] = []
+        valid = True
+        for concat_input in concat_inputs:
+            resolved_slice = _resolve_direct_slice_source(str(concat_input).strip(), index + 1)
+            if resolved_slice is None:
+                valid = False
+                break
+            slice_source, slice_dims = resolved_slice
+            last_dim_upper = _parse_slice_numeric_upper_bound(slice_dims[3])
+            if last_dim_upper is None:
+                source_shape = (
+                    context.static_shapes.get(slice_source)
+                    or context.static_shapes.get(
+                        _fast_precanonicalize_resolve_alias(slice_source, context.aliases)
+                    )
+                )
+                if source_shape is None or len(source_shape) != 4 or int(source_shape[3]) != int(preferred_channel_count):
+                    valid = False
+                    break
+            elif int(last_dim_upper) != int(preferred_channel_count):
+                valid = False
+                break
+            source_assign_index = _find_assignment_before(slice_source, index + 1)
+            if not (
+                _fast_precanonicalize_is_nhwc_like(
+                    slice_source,
+                    dynamic_nhwc_like_names,
+                    context,
+                )
+                or _fast_precanonicalize_has_channel_last_spatial_consumer(
+                    slice_source,
+                    source_assign_index if source_assign_index is not None else -1,
+                    lines,
+                    context,
+                )
+            ):
+                valid = False
+                break
+            slice_sources.append(str(slice_source))
+        if not valid or len(set(slice_sources)) != 1:
+            continue
+        normalized_shape = _normalize_nhwc_rank4_shape(
+            list(target_shape),
+            preferred_channel_count=int(preferred_channel_count),
+        )
+        rewritten = (
+            f"{assign[0]}{assign[1]} = _apply_concat([{', '.join(str(name).strip() for name in concat_inputs)}], "
+            f"axis={concat_axis}, target_shape={repr(normalized_shape)}, fused='NONE')"
+        )
+        if rewritten == lines[index]:
+            continue
+        lines[index] = rewritten
+        dynamic_nhwc_like_names.add(str(assign[1]))
+        dynamic_cf_like_names.discard(str(assign[1]))
+        context.static_shapes[str(assign[1])] = list(normalized_shape)
+        changed = True
+    return changed
+
+
 def _rewrite_structural_concat_resize_input_cf_add_targets(
     lines: List[str],
     dynamic_cf_like_names: Set[str],
@@ -36208,6 +36365,13 @@ def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
                         dynamic_cf_like_names.add(str(permute_assign[1]))
                         changed = True
                     break
+    if _rewrite_structural_channel_last_slice_concat_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if _rewrite_structural_concat_conv_cf_branch_targets(
         lines,
         dynamic_cf_like_names,
@@ -36348,6 +36512,13 @@ def _apply_structural_final_model_repairs(model_path: Path) -> None:
                     dynamic_cf_like_names.add(str(bridge_lhs))
                     changed = True
                 break
+    if _rewrite_structural_channel_last_slice_concat_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if _rewrite_structural_concat_conv_cf_branch_targets(
         lines,
         dynamic_cf_like_names,
