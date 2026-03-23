@@ -29541,10 +29541,20 @@ def _repair_binary_alignment_layout(
         or re.fullmatch(r"[A-Za-z0-9_]+", arg_b) is None
     ):
         return None, None
-    operands_are_cf_like = (
-        _fast_precanonicalize_is_cf_like(arg_a, dynamic_cf_like_names, context)
-        and _fast_precanonicalize_is_cf_like(arg_b, dynamic_cf_like_names, context)
-    )
+    for lookback in range(max(0, index - 4), index):
+        binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[lookback])
+        if (
+            binary_anchor_assign is not None
+            and {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])} == {arg_a, arg_b}
+        ):
+            return None, None
+    arg_a_is_cf = _fast_precanonicalize_is_cf_like(arg_a, dynamic_cf_like_names, context)
+    arg_b_is_cf = _fast_precanonicalize_is_cf_like(arg_b, dynamic_cf_like_names, context)
+    arg_a_is_nhwc = _fast_precanonicalize_is_nhwc_like(arg_a, dynamic_nhwc_like_names, context)
+    arg_b_is_nhwc = _fast_precanonicalize_is_nhwc_like(arg_b, dynamic_nhwc_like_names, context)
+    if arg_a_is_nhwc or arg_b_is_nhwc:
+        return None, None
+    operands_are_cf_like = arg_a_is_cf and arg_b_is_cf
     consumer_layout = _fast_precanonicalize_infer_consumer_layout(
         lhs_name,
         index,
@@ -31059,7 +31069,12 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
                 or input_name.endswith("_cf")
                 or input_name.endswith("_out_cf")
             ):
-                cf_like_names.add(str(local_response_norm_assign[1]))
+                lhs_name = str(local_response_norm_assign[1])
+                cf_like_names.add(lhs_name)
+                static_input_shape = repair_context.static_shapes.get(input_name, None)
+                if static_input_shape is not None and len(static_input_shape) == 4:
+                    repair_context.static_shapes[lhs_name] = [int(v) for v in list(static_input_shape)]
+                nhwc_like_names.discard(lhs_name)
         softmax_match = apply_softmax_re.match(line)
         softmax_assign = _parse_apply_softmax_assign(line)
         if softmax_match is not None or softmax_assign is not None:
@@ -31167,19 +31182,6 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
             ):
                 cf_like_names.add(str(prelu_match.group("lhs")))
         permuted_conv_input_match = permuted_conv_input_re.match(line)
-        if permuted_conv_input_match is not None:
-            input_name = str(permuted_conv_input_match.group("input"))
-            if (
-                input_name in cf_like_names
-                or input_name.endswith("_cf")
-                or input_name.endswith("_out_cf")
-            ):
-                lines[index] = (
-                    f"{permuted_conv_input_match.group('indent')}{permuted_conv_input_match.group('lhs')} = "
-                    f"self.{permuted_conv_input_match.group('module')}({input_name})"
-                )
-                cf_like_names.add(str(permuted_conv_input_match.group("lhs")))
-                changed = True
         depth_to_space_nhwc_gather_match = depth_to_space_nhwc_gather_re.match(line)
         if depth_to_space_nhwc_gather_match is not None:
             input_name = str(depth_to_space_nhwc_gather_match.group("input"))
@@ -31292,6 +31294,7 @@ def _apply_fast_precanonicalize_repairs(package_path: Path) -> None:
     _apply_dynamic_score_sampling_stage_precanonicalize_repairs(model_path)
     _apply_shadowformer_fast_precanonicalize_repairs(model_path)
     _restore_channel_last_spatial_pool_chains(model_path)
+    _apply_structural_fast_precanonicalize_repairs(model_path)
 
 
 def _apply_fast_precanonicalize_repairs_until_stable(
@@ -31315,6 +31318,8 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
     if not model_path.exists():
         return
     lines = model_path.read_text(encoding="utf-8").splitlines()
+    if not _has_pidnet_skip_signature(lines):
+        return
     changed = False
     pidnet_cf_add_sources: Set[str] = set()
     pidnet_cf_alias_sources: Set[str] = set()
@@ -33736,6 +33741,584 @@ def _rewrite_structural_channel_last_pool_pad_pairs(
     return changed
 
 
+def _rewrite_structural_nhwc_image_tail_bridges(
+    lines: List[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    image_tail_reshape_re = re.compile(
+        r"^\s*(?P<lhs>[A-Za-z0-9_]+)\s*=\s*torch\.reshape\((?P<input>[A-Za-z0-9_]+), "
+        r"(?:\[int\(v\) for v in \[(?P<h0>\d+), (?P<w0>\d+), (?P<c0>\d+)\]\]|\[(?P<h1>\d+), (?P<w1>\d+), (?P<c1>\d+)\])\)$"
+    )
+
+    def _split_binary_args(expr: str) -> Tuple[str, str] | None:
+        depth = 0
+        current: List[str] = []
+        parts: List[str] = []
+        for char in expr:
+            if char == "," and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+                continue
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth = max(0, depth - 1)
+            current.append(char)
+        if current:
+            parts.append("".join(current).strip())
+        if len(parts) != 2:
+            return None
+        return (parts[0], parts[1])
+
+    def _split_call_args(expr: str) -> List[str]:
+        depth = 0
+        current: List[str] = []
+        parts: List[str] = []
+        for char in expr:
+            if char == "," and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+                continue
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth = max(0, depth - 1)
+            current.append(char)
+        if current:
+            parts.append("".join(current).strip())
+        return parts
+
+    def _parse_static_rank4_binary_align_assign(
+        src_line: str,
+    ) -> Tuple[str, str, str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(src_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        aligned_expr = _parse_align_tensor_target_shape_expr(rhs)
+        if aligned_expr is None:
+            return None
+        input_expr, shape_expr = aligned_expr
+        target_shape = _parse_rank4_shape_literal(shape_expr)
+        if target_shape is None:
+            return None
+        binary_match = re.fullmatch(
+            r"torch\.(?P<op>add|sub|mul|div|maximum|minimum)\((?P<args>.+)\)",
+            input_expr.strip(),
+        )
+        if binary_match is None:
+            return None
+        binary_args = _split_binary_args(str(binary_match.group("args")))
+        if binary_args is None:
+            return None
+        return (
+            indent,
+            lhs,
+            str(binary_match.group("op")),
+            str(binary_args[0]).strip(),
+            str(binary_args[1]).strip(),
+            list(target_shape),
+        )
+
+    def _parse_image_tail_binary_add_assign(
+        src_line: str,
+    ) -> Tuple[str, str, str, str, List[int]] | None:
+        parsed_add = _parse_static_binary_add_align_assign(src_line)
+        if parsed_add is not None:
+            indent, lhs, input_a, input_b, current_shape = parsed_add
+            return (indent, lhs, input_a, input_b, current_shape)
+        assign = _parse_simple_assignment_line(src_line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        aligned_expr = _parse_align_tensor_target_shape_expr(rhs)
+        if aligned_expr is None:
+            return None
+        input_expr, shape_expr = aligned_expr
+        current_shape = _parse_rank4_shape_literal(shape_expr)
+        if current_shape is None:
+            return None
+        binary_match = re.fullmatch(
+            r"torch\.add\(\*_align_binary_inputs_to_anchor\((?P<args>.+)\)\)",
+            input_expr.strip(),
+        )
+        if binary_match is None:
+            return None
+        call_args = _split_call_args(str(binary_match.group("args")))
+        if len(call_args) != 3:
+            return None
+        return (
+            indent,
+            lhs,
+            str(call_args[0]).strip(),
+            str(call_args[1]).strip(),
+            list(current_shape),
+        )
+
+    def _rewrite_upstream_binary_producer(
+        source_name: str,
+        max_index: int,
+        output_hwc_shape: List[int],
+    ) -> bool:
+        local_changed = False
+        producer_index: int | None = None
+        producer_binary_assign = None
+        for producer_back in range(max(0, max_index - 6), max_index):
+            candidate_assign = _parse_static_rank4_binary_align_assign(lines[producer_back])
+            if candidate_assign is not None and str(candidate_assign[1]) == source_name:
+                producer_index = producer_back
+                producer_binary_assign = candidate_assign
+                break
+        if producer_index is None or producer_binary_assign is None:
+            return False
+        (
+            producer_indent,
+            producer_lhs,
+            producer_op,
+            producer_input_a,
+            producer_input_b,
+            producer_shape,
+        ) = producer_binary_assign
+        if len(producer_shape) != 4:
+            return False
+        rewritten_producer_binary = (
+            f"{producer_indent}{producer_lhs} = _align_tensor_to_target_shape("
+            f"torch.{producer_op}({producer_input_a}, {producer_input_b}), {repr(output_hwc_shape)})"
+        )
+        if lines[producer_index] != rewritten_producer_binary:
+            lines[producer_index] = rewritten_producer_binary
+            dynamic_nhwc_like_names.add(producer_lhs)
+            context.static_shapes[producer_lhs] = list(output_hwc_shape)
+            local_changed = True
+        for producer_anchor_back in range(max(0, producer_index - 6), producer_index):
+            producer_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(
+                lines[producer_anchor_back]
+            )
+            if (
+                producer_anchor_assign is None
+                or {str(producer_anchor_assign[1]), str(producer_anchor_assign[2])}
+                != {producer_input_a, producer_input_b}
+            ):
+                continue
+            rewritten_producer_anchor = (
+                f"{producer_anchor_assign[0]}{producer_anchor_assign[1]}, {producer_anchor_assign[2]} = "
+                f"_align_binary_inputs_to_anchor({producer_anchor_assign[3]}, {producer_anchor_assign[4]}, "
+                f"{repr(output_hwc_shape)})"
+            )
+            if lines[producer_anchor_back] != rewritten_producer_anchor:
+                lines[producer_anchor_back] = rewritten_producer_anchor
+                context.static_shapes[str(producer_anchor_assign[1])] = list(output_hwc_shape)
+                context.static_shapes[str(producer_anchor_assign[2])] = list(output_hwc_shape)
+                local_changed = True
+            break
+        return local_changed
+    for index, line in enumerate(lines):
+        parsed_add = _parse_image_tail_binary_add_assign(line)
+        if parsed_add is None:
+            continue
+        indent, lhs, input_a, input_b, current_shape = parsed_add
+        if len(current_shape) != 4 or int(current_shape[0]) != 1:
+            continue
+        gathered_name: str | None = None
+        channel_count: int | None = None
+        output_hwc_shape: List[int] | None = None
+        for lookahead in range(index + 1, min(len(lines), index + 12)):
+            gather_assign = _parse_simple_assignment_line(lines[lookahead])
+            if (
+                gather_assign is not None
+                and str(gather_assign[2]).strip() == f"{lhs}[[0], :, :, :]"
+            ):
+                gathered_name = str(gather_assign[1])
+                continue
+            if gathered_name is None:
+                continue
+            reshape_assign = _parse_simple_assignment_line(lines[lookahead])
+            if reshape_assign is not None:
+                reshape_rhs = str(reshape_assign[2]).strip()
+                reshape_match = re.match(
+                    rf"^torch\.reshape\({re.escape(gathered_name)}, _resolve_reshape_shape\(\[-1, (?P<c>\d+)\], {re.escape(gathered_name)}, allow_zero=False\)\)$",
+                    reshape_rhs,
+                )
+                if reshape_match is not None:
+                    channel_count = int(reshape_match.group("c"))
+                    continue
+            image_tail_match = image_tail_reshape_re.match(lines[lookahead])
+            if image_tail_match is not None and channel_count is not None:
+                h = image_tail_match.group("h0") or image_tail_match.group("h1")
+                w = image_tail_match.group("w0") or image_tail_match.group("w1")
+                c = image_tail_match.group("c0") or image_tail_match.group("c1")
+                if int(c) != int(channel_count):
+                    continue
+                output_hwc_shape = [1, int(h), int(w), int(c)]
+                break
+        if output_hwc_shape is None:
+            continue
+        rewritten_add = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape("
+            f"torch.add(*_align_binary_inputs_to_anchor({input_a}, {input_b}, {repr(output_hwc_shape)})), "
+            f"{repr(output_hwc_shape)})"
+        )
+        if lines[index] != rewritten_add:
+            lines[index] = rewritten_add
+            dynamic_nhwc_like_names.add(lhs)
+            context.static_shapes[lhs] = list(output_hwc_shape)
+            changed = True
+        for source_name in [input_a, input_b]:
+            if _rewrite_upstream_binary_producer(
+                source_name=source_name,
+                max_index=index,
+                output_hwc_shape=output_hwc_shape,
+            ):
+                changed = True
+        tracked_names = {input_a, input_b}
+        for back in range(max(0, index - 4), index):
+            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if (
+                binary_anchor_assign is not None
+                and {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])} == tracked_names
+            ):
+                rewritten_anchor = (
+                    f"{binary_anchor_assign[0]}{binary_anchor_assign[1]}, {binary_anchor_assign[2]} = "
+                    f"_align_binary_inputs_to_anchor({binary_anchor_assign[3]}, {binary_anchor_assign[4]}, "
+                    f"{repr(output_hwc_shape)})"
+                )
+                if lines[back] != rewritten_anchor:
+                    lines[back] = rewritten_anchor
+                    context.static_shapes[str(binary_anchor_assign[1])] = list(output_hwc_shape)
+                    context.static_shapes[str(binary_anchor_assign[2])] = list(output_hwc_shape)
+                    changed = True
+                for source_name in [str(binary_anchor_assign[3]), str(binary_anchor_assign[4])]:
+                    if _rewrite_upstream_binary_producer(
+                        source_name=source_name,
+                        max_index=back,
+                        output_hwc_shape=output_hwc_shape,
+                    ):
+                        changed = True
+                break
+    return changed
+
+
+def _rewrite_structural_cf_anchor_binary_add_targets(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+
+    def _resolve_preferred_cf_anchor_input(
+        anchor_input_a: str,
+        anchor_input_b: str,
+        shape_hint: Sequence[int],
+    ) -> Tuple[str, int] | None:
+        candidates: List[Tuple[str, int]] = []
+        for candidate_name in [anchor_input_a, anchor_input_b]:
+            candidate_is_cf = _fast_precanonicalize_is_cf_like(
+                candidate_name,
+                dynamic_cf_like_names,
+                context,
+            )
+            candidate_is_nhwc = _fast_precanonicalize_is_nhwc_like(
+                candidate_name,
+                dynamic_nhwc_like_names,
+                context,
+            )
+            if not candidate_is_cf or candidate_is_nhwc:
+                continue
+            candidate_channel_count = _fast_precanonicalize_preferred_channel_count(
+                candidate_name,
+                dynamic_cf_like_names,
+                dynamic_nhwc_like_names,
+                context,
+                shape_hint=shape_hint,
+            )
+            if candidate_channel_count is None:
+                candidate_shape = context.static_shapes.get(candidate_name)
+                if candidate_shape is not None and len(candidate_shape) == 4:
+                    candidate_channel_count = int(candidate_shape[1])
+            if candidate_channel_count is None:
+                continue
+            candidates.append((str(candidate_name), int(candidate_channel_count)))
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            for candidate_name, candidate_channel_count in candidates:
+                if candidate_name.endswith("_cf") or candidate_name.endswith("_out_cf"):
+                    return (candidate_name, int(candidate_channel_count))
+            return candidates[0]
+        return None
+
+    def _cf_dynamic_target_shape_expr(cf_anchor_input: str, preferred_channel_count: int) -> str:
+        return (
+            "["
+            f"int({cf_anchor_input}.shape[0]), "
+            f"{int(preferred_channel_count)}, "
+            f"int({cf_anchor_input}.shape[2]), "
+            f"int({cf_anchor_input}.shape[3])"
+            "]"
+        )
+
+    for index, line in enumerate(lines):
+        parsed_add = _parse_static_binary_add_align_assign(line)
+        if parsed_add is None:
+            continue
+        indent, lhs, input_a, input_b, current_shape = parsed_add
+        if len(current_shape) != 4:
+            continue
+        matching_binary_anchor = None
+        for back in range(max(0, index - 4), index):
+            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if (
+                binary_anchor_assign is None
+                or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+                != {input_a, input_b}
+            ):
+                continue
+            matching_binary_anchor = (back, binary_anchor_assign)
+            break
+        if matching_binary_anchor is None:
+            continue
+        anchor_index, binary_anchor_assign = matching_binary_anchor
+        cf_anchor = _resolve_preferred_cf_anchor_input(
+            str(binary_anchor_assign[3]),
+            str(binary_anchor_assign[4]),
+            current_shape,
+        )
+        if cf_anchor is None:
+            continue
+        cf_anchor_input, preferred_channel_count = cf_anchor
+        if int(current_shape[1]) == int(preferred_channel_count):
+            continue
+        dynamic_target_shape = _cf_dynamic_target_shape_expr(
+            cf_anchor_input,
+            int(preferred_channel_count),
+        )
+        rewritten_anchor = (
+            f"{binary_anchor_assign[0]}{binary_anchor_assign[1]}, {binary_anchor_assign[2]} = "
+            f"_align_binary_inputs_to_anchor({binary_anchor_assign[3]}, {binary_anchor_assign[4]}, "
+            f"{dynamic_target_shape})"
+        )
+        if lines[anchor_index] != rewritten_anchor:
+            lines[anchor_index] = rewritten_anchor
+            changed = True
+        rewritten_add = (
+            f"{indent}{lhs} = _align_tensor_to_target_shape("
+            f"torch.add({input_a}, {input_b}), {dynamic_target_shape})"
+        )
+        if lines[index] != rewritten_add:
+            lines[index] = rewritten_add
+            changed = True
+        dynamic_cf_like_names.update(
+            {
+                lhs,
+                str(binary_anchor_assign[1]),
+                str(binary_anchor_assign[2]),
+            }
+        )
+        dynamic_nhwc_like_names.difference_update(
+            {
+                lhs,
+                str(binary_anchor_assign[1]),
+                str(binary_anchor_assign[2]),
+            }
+        )
+        cf_anchor_shape = context.static_shapes.get(cf_anchor_input)
+        if cf_anchor_shape is not None and len(cf_anchor_shape) == 4:
+            normalized_cf_shape = [int(v) for v in list(cf_anchor_shape)]
+            context.static_shapes[lhs] = list(normalized_cf_shape)
+            context.static_shapes[str(binary_anchor_assign[1])] = list(normalized_cf_shape)
+            context.static_shapes[str(binary_anchor_assign[2])] = list(normalized_cf_shape)
+    return changed
+
+
+def _rewrite_structural_channel_first_rank4_flatten_to_nwc(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    dynamic_cf_shape_re = re.compile(
+        r"[\[\(]\s*int\((?P<ref>[A-Za-z0-9_]+)\.shape\[0\]\)\s*,\s*(?P<c>\d+)\s*,\s*"
+        r"int\((?P=ref)\.shape\[2\]\)\s*,\s*int\((?P=ref)\.shape\[3\]\)\s*[\]\)]"
+    )
+
+    def _parse_rank4_flatten_assign(
+        line: str,
+    ) -> Tuple[str, str, str, str, int, str, str] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "torch.reshape("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        if len(parts) != 2:
+            return None
+        input_expr = parts[0].strip()
+        shape_expr = parts[1].strip()
+        if re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None:
+            return None
+        resolved_match = re.fullmatch(
+            r"_resolve_reshape_shape\(\[(?P<n>-?\d+), -1, (?P<c>\d+)\], (?P<input>[A-Za-z0-9_]+), allow_zero=False\)",
+            shape_expr,
+        )
+        if resolved_match is not None and str(resolved_match.group("input")) == input_expr:
+            return (
+                indent,
+                lhs,
+                input_expr,
+                str(resolved_match.group("n")),
+                int(resolved_match.group("c")),
+                shape_expr,
+                "nwc",
+            )
+        try:
+            literal_shape_value = ast.literal_eval(shape_expr)
+        except Exception:
+            return None
+        if not isinstance(literal_shape_value, (list, tuple)) or len(literal_shape_value) != 3:
+            return None
+        literal_shape = [int(v) for v in list(literal_shape_value)]
+        if int(literal_shape[1]) <= 0 or int(literal_shape[2]) <= 0:
+            return None
+        return (
+            indent,
+            lhs,
+            input_expr,
+            str(int(literal_shape[0])),
+            int(literal_shape[1]),
+            shape_expr,
+            "nchw_flatten",
+        )
+
+    def _resolve_static_rank4_shape(
+        name: str,
+        seen: Set[str] | None = None,
+    ) -> Tuple[List[int], bool] | None:
+        if seen is None:
+            seen = set()
+        if name in seen:
+            return None
+        seen.add(name)
+        cached = context.static_shapes.get(name)
+        if cached is not None and len(cached) == 4:
+            return [int(v) for v in list(cached)], True
+        producer_module = context.module_output_producers.get(name, None)
+        if producer_module is not None:
+            out_channels = context.conv_block_out_channels.get(producer_module, None)
+            if out_channels is not None:
+                return [1, int(out_channels), -1, -1], False
+        for src_line in lines:
+            assign = _parse_simple_assignment_line(src_line)
+            if assign is None or str(assign[1]) != name:
+                continue
+            rhs_expr = str(assign[2]).strip()
+            if re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr) is not None:
+                aliased_shape = _resolve_static_rank4_shape(rhs_expr, seen=seen)
+                if aliased_shape is not None:
+                    return aliased_shape
+            aligned_expr = _parse_align_tensor_target_shape_expr(str(assign[2]))
+            if aligned_expr is None:
+                continue
+            shape_expr = str(aligned_expr[1]).strip()
+            shape = _parse_rank4_shape_literal(shape_expr)
+            if shape is not None:
+                return [int(v) for v in list(shape)], True
+            dynamic_cf_match = dynamic_cf_shape_re.fullmatch(shape_expr)
+            if dynamic_cf_match is not None:
+                ref_name = str(dynamic_cf_match.group("ref"))
+                ref_shape = context.static_shapes.get(ref_name)
+                if ref_shape is not None and len(ref_shape) == 4:
+                    return (
+                        [
+                            int(ref_shape[0]),
+                            int(dynamic_cf_match.group("c")),
+                            int(ref_shape[2]),
+                            int(ref_shape[3]),
+                        ],
+                        True,
+                    )
+                return [1, int(dynamic_cf_match.group("c")), -1, -1], False
+        return None
+
+    def _resolve_alias_source(name: str, seen: Set[str] | None = None) -> str:
+        if seen is None:
+            seen = set()
+        if name in seen:
+            return name
+        seen.add(name)
+        for src_line in lines:
+            assign = _parse_simple_assignment_line(src_line)
+            if assign is None or str(assign[1]) != name:
+                continue
+            rhs_expr = str(assign[2]).strip()
+            if re.fullmatch(r"[A-Za-z0-9_]+", rhs_expr) is not None:
+                return _resolve_alias_source(rhs_expr, seen=seen)
+        return name
+
+    for index, line in enumerate(lines):
+        parsed_flatten = _parse_rank4_flatten_assign(line)
+        if parsed_flatten is None:
+            continue
+        indent, lhs_name, input_name, batch_dim_expr, channel_count, shape_expr, flatten_kind = parsed_flatten
+        resolved_input_shape = _resolve_static_rank4_shape(input_name)
+        if resolved_input_shape is None:
+            continue
+        input_shape, has_exact_spatial_shape = resolved_input_shape
+        if int(input_shape[1]) != int(channel_count):
+            continue
+        input_is_cf = bool(int(input_shape[1]) == int(channel_count) and int(input_shape[3]) != int(channel_count))
+        input_is_nhwc = bool(int(input_shape[3]) == int(channel_count))
+        rewritten: str | None = None
+        if flatten_kind == "nwc":
+            if not input_is_cf or input_is_nhwc:
+                continue
+            rewritten = (
+                f"{indent}{lhs_name} = torch.reshape("
+                f"{input_name}.permute(0, 2, 3, 1).contiguous(), "
+                f"{shape_expr})"
+            )
+        else:
+            resolved_source_name = _resolve_alias_source(input_name)
+            source_is_nhwc_like = (
+                _fast_precanonicalize_is_nhwc_like(input_name, dynamic_nhwc_like_names, context)
+                or _fast_precanonicalize_is_nhwc_like(resolved_source_name, dynamic_nhwc_like_names, context)
+                or "_nhwc" in resolved_source_name
+            )
+            if not source_is_nhwc_like:
+                continue
+            rewritten = (
+                f"{indent}{lhs_name} = torch.reshape("
+                f"{input_name}.permute(0, 3, 1, 2).contiguous(), "
+                f"{shape_expr})"
+            )
+        if lines[index] != rewritten:
+            lines[index] = rewritten
+            changed = True
+        if (
+            flatten_kind == "nwc"
+            and has_exact_spatial_shape
+            and int(input_shape[2]) > 0
+            and int(input_shape[3]) > 0
+        ):
+            batch_dim = int(input_shape[0]) if len(input_shape) > 0 else 1
+            height = int(input_shape[2])
+            width = int(input_shape[3])
+            context.static_shapes[str(lhs_name)] = [batch_dim, height * width, channel_count]
+        if flatten_kind == "nwc":
+            dynamic_nhwc_like_names.add(str(lhs_name))
+            dynamic_cf_like_names.discard(str(lhs_name))
+        else:
+            dynamic_cf_like_names.add(str(lhs_name))
+            dynamic_nhwc_like_names.discard(str(lhs_name))
+    return changed
+
+
 def _rewrite_structural_direct_conv_cf_add_targets(
     lines: List[str],
     dynamic_cf_like_names: Set[str],
@@ -33888,17 +34471,84 @@ def _rewrite_structural_direct_conv_cf_add_targets(
                         return str(candidate_module)
         return None
 
+    def _find_matching_binary_anchor(
+        add_index: int,
+        input_a: str,
+        input_b: str,
+    ) -> Tuple[str, str, str, str, List[int]] | None:
+        for back in range(max(0, add_index - 4), add_index):
+            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if (
+                binary_anchor_assign is None
+                or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+                != {input_a, input_b}
+            ):
+                continue
+            return (
+                str(binary_anchor_assign[0]),
+                str(binary_anchor_assign[3]),
+                str(binary_anchor_assign[4]),
+                str(back),
+                [int(v) for v in list(binary_anchor_assign[5])],
+            )
+        return None
+
+    def _resolve_preferred_cf_anchor_input(
+        anchor_input_a: str,
+        anchor_input_b: str,
+        preferred_channel_count: int,
+    ) -> str | None:
+        candidates: List[str] = []
+        for candidate_name in [anchor_input_a, anchor_input_b]:
+            candidate_is_cf = _fast_precanonicalize_is_cf_like(
+                candidate_name,
+                dynamic_cf_like_names,
+                context,
+            )
+            candidate_is_nhwc = _fast_precanonicalize_is_nhwc_like(
+                candidate_name,
+                dynamic_nhwc_like_names,
+                context,
+            )
+            if not candidate_is_cf or candidate_is_nhwc:
+                continue
+            candidate_channel_count = _fast_precanonicalize_preferred_channel_count(
+                candidate_name,
+                dynamic_cf_like_names,
+                dynamic_nhwc_like_names,
+                context,
+            )
+            if (
+                candidate_channel_count is not None
+                and int(candidate_channel_count) != int(preferred_channel_count)
+            ):
+                continue
+            candidates.append(str(candidate_name))
+        if len(candidates) == 1:
+            return str(candidates[0])
+        if len(candidates) > 1:
+            for candidate_name in candidates:
+                if candidate_name.endswith("_cf") or candidate_name.endswith("_out_cf"):
+                    return str(candidate_name)
+            return str(candidates[0])
+        return None
+
+    def _cf_dynamic_target_shape_expr(cf_anchor_input: str, preferred_channel_count: int) -> str:
+        return (
+            "["
+            f"int({cf_anchor_input}.shape[0]), "
+            f"{int(preferred_channel_count)}, "
+            f"int({cf_anchor_input}.shape[2]), "
+            f"int({cf_anchor_input}.shape[3])"
+            "]"
+        )
+
     for index, line in enumerate(lines):
         parsed_add = _parse_static_binary_add_align_assign(line)
         if parsed_add is None:
             continue
         indent, lhs, input_a, input_b, current_shape = parsed_add
         if len(current_shape) != 4:
-            continue
-        unique_channel_count = _infer_unique_channel_count_from_rank4_shape(current_shape)
-        if unique_channel_count is not None and int(unique_channel_count) == int(current_shape[1]):
-            continue
-        if not _has_mixed_layout_add_evidence(index, input_a, input_b):
             continue
         preferred_channel_count = _infer_structural_rank4_channel_count(
             lhs,
@@ -33908,6 +34558,8 @@ def _rewrite_structural_direct_conv_cf_add_targets(
             context,
         )
         if preferred_channel_count is None:
+            continue
+        if int(current_shape[1]) == int(preferred_channel_count):
             continue
         normalized_shape = _normalize_cf_rank4_shape(
             current_shape,
@@ -33962,31 +34614,343 @@ def _rewrite_structural_direct_conv_cf_add_targets(
         consumer_channels = context.conv_block_in_channels.get(consumer_module, None)
         if consumer_channels is None or int(consumer_channels) != int(preferred_channel_count):
             continue
+        matching_binary_anchor = _find_matching_binary_anchor(index, input_a, input_b)
+        cf_anchor_input: str | None = None
+        if matching_binary_anchor is not None:
+            cf_anchor_input = _resolve_preferred_cf_anchor_input(
+                matching_binary_anchor[1],
+                matching_binary_anchor[2],
+                int(preferred_channel_count),
+            )
+        has_mixed_layout_evidence = _has_mixed_layout_add_evidence(index, input_a, input_b)
+        if not has_mixed_layout_evidence and cf_anchor_input is None:
+            continue
+        rewritten_target_shape = repr(normalized_shape)
+        if cf_anchor_input is not None:
+            rewritten_target_shape = _cf_dynamic_target_shape_expr(
+                cf_anchor_input,
+                int(preferred_channel_count),
+            )
         lines[index] = (
             f"{indent}{lhs} = _align_tensor_to_target_shape("
-            f"torch.add({input_a}, {input_b}), {repr(normalized_shape)})"
+            f"torch.add({input_a}, {input_b}), {rewritten_target_shape})"
         )
         dynamic_cf_like_names.update(alias_names)
         dynamic_nhwc_like_names.discard(lhs)
-        context.static_shapes[lhs] = list(normalized_shape)
+        if cf_anchor_input is not None:
+            cf_anchor_shape = context.static_shapes.get(cf_anchor_input)
+            if cf_anchor_shape is not None and len(cf_anchor_shape) == 4:
+                context.static_shapes[lhs] = [int(v) for v in list(cf_anchor_shape)]
+        else:
+            context.static_shapes[lhs] = list(normalized_shape)
         changed = True
-        for back in range(max(0, index - 4), index):
-            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
-            if (
-                binary_anchor_assign is None
-                or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
-                != {input_a, input_b}
-            ):
+        if matching_binary_anchor is not None:
+            anchor_indent, anchor_input_a, anchor_input_b, anchor_back, _ = matching_binary_anchor
+            anchor_back_index = int(anchor_back)
+            anchor_lhs0 = input_a
+            anchor_lhs1 = input_b
+            if cf_anchor_input is not None:
+                lines[anchor_back_index] = (
+                    f"{anchor_indent}{anchor_lhs0}, {anchor_lhs1} = "
+                    f"_align_binary_inputs_to_anchor({anchor_input_a}, {anchor_input_b}, "
+                    f"{_cf_dynamic_target_shape_expr(cf_anchor_input, int(preferred_channel_count))})"
+                )
+                cf_anchor_shape = context.static_shapes.get(cf_anchor_input)
+                if cf_anchor_shape is not None and len(cf_anchor_shape) == 4:
+                    context.static_shapes[str(anchor_lhs0)] = [int(v) for v in list(cf_anchor_shape)]
+                    context.static_shapes[str(anchor_lhs1)] = [int(v) for v in list(cf_anchor_shape)]
+            else:
+                lines[anchor_back_index] = (
+                    f"{anchor_indent}{anchor_lhs0}, {anchor_lhs1} = "
+                    f"_align_binary_inputs_to_anchor({anchor_input_a}, {anchor_input_b}, "
+                    f"{repr(normalized_shape)})"
+                )
+                context.static_shapes[str(anchor_lhs0)] = list(normalized_shape)
+                context.static_shapes[str(anchor_lhs1)] = list(normalized_shape)
+            dynamic_cf_like_names.update({str(anchor_lhs0), str(anchor_lhs1)})
+    return changed
+
+
+def _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
+    lines: List[str],
+    dynamic_cf_like_names: Set[str],
+    dynamic_nhwc_like_names: Set[str],
+    context: _FastPrecanonicalizeRepairContext,
+) -> bool:
+    changed = False
+    dynamic_cf_shape_re = re.compile(
+        r"[\[\(]\s*int\((?P<ref>[A-Za-z0-9_]+)\.shape\[0\]\)\s*,\s*(?P<c>\d+)\s*,\s*"
+        r"int\((?P=ref)\.shape\[2\]\)\s*,\s*int\((?P=ref)\.shape\[3\]\)\s*[\]\)]"
+    )
+    permuted_conv_input_re = re.compile(
+        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)\s*=\s*self\.(?P<module>conv_block_[0-9]+)\("
+        r"(?P<input>[A-Za-z0-9_]+)\.permute\(0, 3, 1, 2\)\.contiguous\(\)\)$"
+    )
+
+    def _parse_rank4_gap_mean_assign(
+        line: str,
+    ) -> Tuple[str, str, str, List[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        stripped = rhs.strip()
+        prefix = "torch.mean("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        dim_expr: str | None = None
+        keepdim_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if "=" in part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "dim":
+                    dim_expr = value
+                elif key == "keepdim":
+                    keepdim_expr = value
                 continue
-            lines[back] = (
-                f"{binary_anchor_assign[0]}{binary_anchor_assign[1]}, {binary_anchor_assign[2]} = "
-                f"_align_binary_inputs_to_anchor({binary_anchor_assign[3]}, {binary_anchor_assign[4]}, "
-                f"{repr(normalized_shape)})"
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                dim_expr = part.strip()
+            elif positional_index == 2:
+                keepdim_expr = part.strip()
+            positional_index += 1
+        if (
+            input_expr is None
+            or dim_expr is None
+            or keepdim_expr not in {None, "True"}
+            or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None
+        ):
+            return None
+        try:
+            dim_value = ast.literal_eval(dim_expr)
+        except Exception:
+            return None
+        if not isinstance(dim_value, (list, tuple)):
+            return None
+        dim_list = [int(v) for v in list(dim_value)]
+        if dim_list not in ([1, 2], [2, 3]):
+            return None
+        return indent, lhs, input_expr, dim_list
+
+    def _has_cf_rank4_target_shape(name: str, expected_channels: int | None) -> bool:
+        cached_shape = context.static_shapes.get(name, None)
+        if cached_shape is not None and len(cached_shape) == 4:
+            return expected_channels is None or int(cached_shape[1]) == int(expected_channels)
+        for candidate_line in lines:
+            assign = _parse_simple_assignment_line(candidate_line)
+            if assign is None or str(assign[1]) != name:
+                continue
+            aligned_expr = _parse_align_tensor_target_shape_expr(str(assign[2]))
+            if aligned_expr is None:
+                continue
+            shape_expr = str(aligned_expr[1]).strip()
+            static_shape = _parse_rank4_shape_literal(shape_expr)
+            if static_shape is not None:
+                return expected_channels is None or int(static_shape[1]) == int(expected_channels)
+            dynamic_cf_match = dynamic_cf_shape_re.fullmatch(shape_expr)
+            if dynamic_cf_match is not None:
+                return (
+                    expected_channels is None
+                    or int(dynamic_cf_match.group("c")) == int(expected_channels)
+                )
+        return False
+
+    def _parse_binary_align_with_shape(
+        line: str,
+    ) -> Tuple[str, str, List[int]] | None:
+        parsed_anchor = _parse_align_binary_inputs_to_anchor_assign_with_shape(line)
+        if parsed_anchor is not None:
+            return str(parsed_anchor[3]), str(parsed_anchor[4]), [int(v) for v in list(parsed_anchor[5])]
+        assign_match = re.match(
+            r"^(?P<indent>\s*)\(*\s*(?P<lhs0>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*,\s*(?P<lhs1>[A-Za-z0-9_]+)(?::\s*torch\.Tensor)?\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        stripped = str(assign_match.group("rhs")).strip()
+        prefix = "_align_binary_inputs("
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        if len(parts) != 3:
+            return None
+        if (
+            re.fullmatch(r"[A-Za-z0-9_]+", parts[0].strip()) is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", parts[1].strip()) is None
+        ):
+            return None
+        target_shape = _parse_rank4_shape_literal(parts[2].strip())
+        if target_shape is None:
+            return None
+        return parts[0].strip(), parts[1].strip(), [int(v) for v in list(target_shape)]
+
+    def _resolve_local_response_norm_source(name: str) -> str | None:
+        for candidate_line in lines:
+            assign = _parse_simple_assignment_line(candidate_line)
+            if assign is None or str(assign[1]) != name:
+                continue
+            resolved_input = _parse_local_response_norm_input_expr(str(assign[2]).strip())
+            if resolved_input is not None:
+                return str(resolved_input)
+        return None
+
+    def _has_cf_binary_consumer(
+        name: str,
+        expected_channels: int | None,
+        *,
+        start_index: int,
+    ) -> bool:
+        if expected_channels is None:
+            return False
+        for lookahead in range(start_index + 1, min(len(lines), start_index + 8)):
+            parsed_binary_align = _parse_binary_align_with_shape(lines[lookahead])
+            if parsed_binary_align is None:
+                continue
+            input_a, input_b, target_shape = parsed_binary_align
+            if name not in {input_a, input_b}:
+                continue
+            if len(target_shape) == 4 and int(target_shape[1]) == int(expected_channels):
+                return True
+        return False
+
+    def _is_structurally_cf_rank4_source(
+        name: str,
+        expected_channels: int | None,
+        *,
+        start_index: int,
+    ) -> bool:
+        has_cf_binary_consumer = _has_cf_binary_consumer(
+            name,
+            expected_channels,
+            start_index=start_index,
+        )
+        if (
+            _fast_precanonicalize_is_nhwc_like(name, dynamic_nhwc_like_names, context)
+            and not has_cf_binary_consumer
+        ):
+            return False
+        static_shape = context.static_shapes.get(name, None)
+        if static_shape is not None and len(static_shape) == 4:
+            if expected_channels is not None and int(static_shape[1]) != int(expected_channels):
+                return False
+            if expected_channels is None or int(static_shape[1]) == int(expected_channels):
+                return True
+        if _has_cf_rank4_target_shape(name, expected_channels):
+            return True
+        lrn_source = _resolve_local_response_norm_source(name)
+        if lrn_source is not None and lrn_source != name:
+            return _has_cf_rank4_target_shape(lrn_source, expected_channels)
+        if not _fast_precanonicalize_is_cf_like(name, dynamic_cf_like_names, context):
+            return has_cf_binary_consumer
+        preferred_channels = _fast_precanonicalize_preferred_channel_count(
+            name,
+            dynamic_cf_like_names,
+            dynamic_nhwc_like_names,
+            context,
+        )
+        if expected_channels is None or preferred_channels == int(expected_channels):
+            return True
+        return has_cf_binary_consumer
+
+    def _has_explicit_cf_rank4_evidence(
+        name: str,
+        expected_channels: int | None,
+        *,
+        start_index: int,
+    ) -> bool:
+        static_shape = context.static_shapes.get(name, None)
+        if static_shape is not None and len(static_shape) == 4:
+            if expected_channels is None or int(static_shape[1]) == int(expected_channels):
+                return True
+        if _has_cf_rank4_target_shape(name, expected_channels):
+            return True
+        lrn_source = _resolve_local_response_norm_source(name)
+        if lrn_source is not None and lrn_source != name:
+            return _has_explicit_cf_rank4_evidence(
+                lrn_source,
+                expected_channels,
+                start_index=start_index,
             )
-            context.static_shapes[str(binary_anchor_assign[1])] = list(normalized_shape)
-            context.static_shapes[str(binary_anchor_assign[2])] = list(normalized_shape)
-            dynamic_cf_like_names.update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
+        return _is_structurally_cf_rank4_source(
+            name,
+            expected_channels,
+            start_index=start_index,
+        )
+
+    for index, line in enumerate(lines):
+        permuted_conv_match = permuted_conv_input_re.match(line)
+        if permuted_conv_match is None:
+            continue
+        input_name = str(permuted_conv_match.group("input"))
+        conv_module = str(permuted_conv_match.group("module"))
+        conv_in_channels = context.conv_block_in_channels.get(conv_module, None)
+        mean_assign_index: int | None = None
+        parsed_gap_mean: Tuple[str, str, str, List[int]] | None = None
+        for back in range(max(0, index - 4), index):
+            candidate_gap_mean = _parse_rank4_gap_mean_assign(lines[back])
+            if candidate_gap_mean is None or str(candidate_gap_mean[1]) != input_name:
+                continue
+            mean_assign_index = back
+            parsed_gap_mean = candidate_gap_mean
             break
+        if (
+            parsed_gap_mean is not None
+            and parsed_gap_mean[3] == [1, 2]
+            and _is_structurally_cf_rank4_source(
+                str(parsed_gap_mean[2]),
+                conv_in_channels,
+                start_index=index,
+            )
+        ):
+            lines[mean_assign_index] = (
+                f"{parsed_gap_mean[0]}{parsed_gap_mean[1]} = "
+                f"torch.mean({parsed_gap_mean[2]}, dim=[2, 3], keepdim=True)"
+            )
+            lines[index] = (
+                f"{permuted_conv_match.group('indent')}{permuted_conv_match.group('lhs')} = "
+                f"self.{conv_module}({input_name})"
+            )
+            if conv_in_channels is not None:
+                context.static_shapes[input_name] = [1, int(conv_in_channels), 1, 1]
+            dynamic_cf_like_names.add(str(input_name))
+            dynamic_cf_like_names.add(str(permuted_conv_match.group("lhs")))
+            dynamic_nhwc_like_names.discard(str(input_name))
+            changed = True
+            continue
+        input_has_explicit_cf_evidence = _has_explicit_cf_rank4_evidence(
+            input_name,
+            conv_in_channels,
+            start_index=index,
+        )
+        if not input_has_explicit_cf_evidence:
+            continue
+        if (
+            _fast_precanonicalize_is_nhwc_like(input_name, dynamic_nhwc_like_names, context)
+            and not input_has_explicit_cf_evidence
+        ):
+            continue
+        input_shape = context.static_shapes.get(input_name, None)
+        if (
+            conv_in_channels is not None
+            and input_shape is not None
+            and len(input_shape) == 4
+            and int(input_shape[1]) != int(conv_in_channels)
+        ):
+            continue
+        lines[index] = (
+            f"{permuted_conv_match.group('indent')}{permuted_conv_match.group('lhs')} = "
+            f"self.{conv_module}({input_name})"
+        )
+        dynamic_cf_like_names.add(str(permuted_conv_match.group("lhs")))
+        changed = True
     return changed
 
 
@@ -34446,6 +35410,50 @@ def _rewrite_structural_concat_resize_input_cf_add_targets(
             return None
         return None
 
+    def _rewrite_add_target_to_cf(
+        add_index: int,
+        parsed_add: Tuple[str, str, str, str, List[int]],
+        *,
+        preferred_channel_count: int,
+    ) -> bool:
+        nonlocal changed
+        current_shape = list(parsed_add[4])
+        unique_channel_count = _infer_unique_channel_count_from_rank4_shape(current_shape)
+        if unique_channel_count is not None and int(unique_channel_count) == int(current_shape[1]):
+            return False
+        normalized_shape = _normalize_cf_rank4_shape(
+            current_shape,
+            preferred_channel_count=int(preferred_channel_count),
+        )
+        if normalized_shape == current_shape:
+            return False
+        lines[add_index] = (
+            f"{parsed_add[0]}{parsed_add[1]} = _align_tensor_to_target_shape("
+            f"torch.add({parsed_add[2]}, {parsed_add[3]}), {repr(normalized_shape)})"
+        )
+        context.static_shapes[str(parsed_add[1])] = list(normalized_shape)
+        dynamic_cf_like_names.add(str(parsed_add[1]))
+        dynamic_nhwc_like_names.discard(str(parsed_add[1]))
+        changed = True
+        for back in range(max(0, add_index - 4), add_index):
+            binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
+            if (
+                binary_anchor_assign is None
+                or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
+                != {str(parsed_add[2]), str(parsed_add[3])}
+            ):
+                continue
+            lines[back] = (
+                f"{binary_anchor_assign[0]}{binary_anchor_assign[1]}, {binary_anchor_assign[2]} = "
+                f"_align_binary_inputs_to_anchor({binary_anchor_assign[3]}, {binary_anchor_assign[4]}, {repr(normalized_shape)})"
+            )
+            context.static_shapes[str(binary_anchor_assign[1])] = list(normalized_shape)
+            context.static_shapes[str(binary_anchor_assign[2])] = list(normalized_shape)
+            dynamic_cf_like_names.update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
+            dynamic_nhwc_like_names.difference_update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
+            break
+        return True
+
     for index, line in enumerate(lines):
         assign = _parse_simple_assignment_line(line)
         torch_cat_args = _parse_torch_cat_inputs_and_dim(assign[2]) if assign is not None else None
@@ -34465,11 +35473,10 @@ def _rewrite_structural_concat_resize_input_cf_add_targets(
         if consumer_module is None:
             continue
         conv_in_channels = context.conv_block_in_channels.get(consumer_module)
-        if conv_in_channels is None:
-            continue
         cat_inputs = [name.strip() for name in torch_cat_args[0] if name.strip()]
         inferred_branch_channels: List[int] = []
-        valid = True
+        inferred_branch_channels_by_input: Dict[str, int] = {}
+        valid_for_direct_add_branches = conv_in_channels is not None
         for cat_input in cat_inputs:
             resolved_resize = _resolve_resize_assign(cat_input, index + 1)
             if resolved_resize is not None:
@@ -34480,10 +35487,13 @@ def _rewrite_structural_concat_resize_input_cf_add_targets(
                     else int(resize_shape[1])
                 )
                 inferred_branch_channels.append(preferred_channel_count)
+                inferred_branch_channels_by_input[cat_input] = int(preferred_channel_count)
+                continue
+            if conv_in_channels is None:
                 continue
             resolved_add = _resolve_add_assign(cat_input, index + 1)
             if resolved_add is None:
-                valid = False
+                valid_for_direct_add_branches = False
                 break
             add_shape = list(resolved_add[1][4])
             preferred_channel_count = _infer_structural_rank4_channel_count(
@@ -34494,11 +35504,10 @@ def _rewrite_structural_concat_resize_input_cf_add_targets(
                 context,
             )
             if preferred_channel_count is None:
-                valid = False
+                valid_for_direct_add_branches = False
                 break
             inferred_branch_channels.append(int(preferred_channel_count))
-        if not valid or sum(inferred_branch_channels) != int(conv_in_channels):
-            continue
+            inferred_branch_channels_by_input[cat_input] = int(preferred_channel_count)
         for cat_input in cat_inputs:
             resolved_resize = _resolve_resize_assign(cat_input, index + 1)
             if resolved_resize is None:
@@ -34506,46 +35515,35 @@ def _rewrite_structural_concat_resize_input_cf_add_targets(
             resize_index, resize_assign = resolved_resize
             if resize_assign[8]:
                 continue
-            preferred_channel_count = int(resize_assign[4][1])
             resolved_add = _resolve_add_assign(str(resize_assign[2]), resize_index + 1)
             if resolved_add is None:
                 continue
-            add_index, parsed_add = resolved_add
-            current_shape = list(parsed_add[4])
-            unique_channel_count = _infer_unique_channel_count_from_rank4_shape(current_shape)
-            if unique_channel_count is not None and int(unique_channel_count) == int(current_shape[1]):
+            _rewrite_add_target_to_cf(
+                resolved_add[0],
+                resolved_add[1],
+                preferred_channel_count=int(resize_assign[4][1]),
+            )
+        if (
+            conv_in_channels is None
+            or not valid_for_direct_add_branches
+            or sum(inferred_branch_channels) != int(conv_in_channels)
+        ):
+            continue
+        for cat_input in cat_inputs:
+            resolved_resize = _resolve_resize_assign(cat_input, index + 1)
+            if resolved_resize is not None:
                 continue
-            normalized_shape = _normalize_cf_rank4_shape(
-                current_shape,
+            preferred_channel_count = inferred_branch_channels_by_input.get(cat_input)
+            if preferred_channel_count is None:
+                continue
+            resolved_add = _resolve_add_assign(cat_input, index + 1)
+            if resolved_add is None:
+                continue
+            _rewrite_add_target_to_cf(
+                resolved_add[0],
+                resolved_add[1],
                 preferred_channel_count=preferred_channel_count,
             )
-            if normalized_shape == current_shape:
-                continue
-            lines[add_index] = (
-                f"{parsed_add[0]}{parsed_add[1]} = _align_tensor_to_target_shape("
-                f"torch.add({parsed_add[2]}, {parsed_add[3]}), {repr(normalized_shape)})"
-            )
-            context.static_shapes[str(parsed_add[1])] = list(normalized_shape)
-            dynamic_cf_like_names.add(str(parsed_add[1]))
-            dynamic_nhwc_like_names.discard(str(parsed_add[1]))
-            changed = True
-            for back in range(max(0, add_index - 4), add_index):
-                binary_anchor_assign = _parse_align_binary_inputs_to_anchor_assign_with_shape(lines[back])
-                if (
-                    binary_anchor_assign is None
-                    or {str(binary_anchor_assign[1]), str(binary_anchor_assign[2])}
-                    != {str(parsed_add[2]), str(parsed_add[3])}
-                ):
-                    continue
-                lines[back] = (
-                    f"{binary_anchor_assign[0]}{binary_anchor_assign[1]}, {binary_anchor_assign[2]} = "
-                    f"_align_binary_inputs_to_anchor({binary_anchor_assign[3]}, {binary_anchor_assign[4]}, {repr(normalized_shape)})"
-                )
-                context.static_shapes[str(binary_anchor_assign[1])] = list(normalized_shape)
-                context.static_shapes[str(binary_anchor_assign[2])] = list(normalized_shape)
-                dynamic_cf_like_names.update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
-                dynamic_nhwc_like_names.difference_update({str(binary_anchor_assign[1]), str(binary_anchor_assign[2])})
-                break
     return changed
 
 
@@ -34804,7 +35802,34 @@ def _apply_structural_fast_precanonicalize_repairs(model_path: Path) -> None:
         context,
     ):
         changed = True
+    if _rewrite_structural_channel_first_rank4_flatten_to_nwc(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_nhwc_image_tail_bridges(
+        lines,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_cf_anchor_binary_add_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
     if _rewrite_structural_direct_conv_cf_add_targets(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_redundant_nhwc_to_cf_conv_bridges(
         lines,
         dynamic_cf_like_names,
         dynamic_nhwc_like_names,
@@ -34913,6 +35938,19 @@ def _apply_structural_final_model_repairs(model_path: Path) -> None:
     if _rewrite_structural_concat_resize_input_cf_add_targets(
         lines,
         dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_channel_first_rank4_flatten_to_nwc(
+        lines,
+        dynamic_cf_like_names,
+        dynamic_nhwc_like_names,
+        context,
+    ):
+        changed = True
+    if _rewrite_structural_nhwc_image_tail_bridges(
+        lines,
         dynamic_nhwc_like_names,
         context,
     ):
