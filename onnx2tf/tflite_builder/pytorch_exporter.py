@@ -31464,6 +31464,15 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         r"(?P<lhs1>[A-Za-z0-9_]+)(?::\s*[A-Za-z0-9_\.\[\], ]+)?\s*\)*\s*=\s*\(*\s*\(*(?P<input>[A-Za-z0-9_]+)\)*\s*\)*$"
     )
 
+    def _strip_pidnet_outer_parentheses(expr: str) -> str:
+        stripped = str(expr).strip()
+        while stripped.startswith("(") and stripped.endswith(")"):
+            inner = stripped[1:-1].strip()
+            if inner == "":
+                break
+            stripped = inner
+        return stripped
+
     def _parse_pidnet_cf_add_assign(line: str) -> tuple[str, str, str, str, list[int]] | None:
         assign = _parse_simple_assignment_line(line)
         if assign is None:
@@ -31630,8 +31639,8 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         return (
             str(match.group("indent")),
             str(match.group("lhs")),
-            str(mul_args[0]),
-            str(mul_args[1]),
+            _strip_pidnet_outer_parentheses(str(mul_args[0])),
+            _strip_pidnet_outer_parentheses(str(mul_args[1])),
             [
                 int(match.group("n")),
                 int(match.group("d1")),
@@ -31647,7 +31656,8 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
         mul_args = _parse_binary_mul_args(str(match.group("args")))
         if mul_args is None:
             return None
-        input_a, input_b = str(mul_args[0]), str(mul_args[1])
+        input_a = _strip_pidnet_outer_parentheses(str(mul_args[0]))
+        input_b = _strip_pidnet_outer_parentheses(str(mul_args[1]))
         if _pidnet_is_const_like_expr(input_a) and not _pidnet_is_const_like_expr(input_b):
             input_a, input_b = input_b, input_a
         if _pidnet_is_const_like_expr(input_a) or not _pidnet_is_const_like_expr(input_b):
@@ -31991,6 +32001,65 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
             ],
         )
 
+    def _parse_pidnet_plain_cf_pad_assign(
+        line: str,
+    ) -> tuple[str, str, str, list[int]] | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        indent, lhs, rhs = assign
+        prefix = "F.pad("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        input_expr: str | None = None
+        pad_expr: str | None = None
+        mode_expr: str | None = None
+        value_expr: str | None = None
+        positional_index = 0
+        for part in parts:
+            if "=" in part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "input":
+                    input_expr = value
+                elif key == "pad":
+                    pad_expr = value
+                elif key == "mode":
+                    mode_expr = value
+                elif key == "value":
+                    value_expr = value
+                continue
+            if positional_index == 0:
+                input_expr = part.strip()
+            elif positional_index == 1:
+                pad_expr = part.strip()
+            elif positional_index == 2:
+                mode_expr = part.strip()
+            elif positional_index == 3:
+                value_expr = part.strip()
+            positional_index += 1
+        if (
+            input_expr is None
+            or re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None
+            or pad_expr is None
+            or mode_expr != "'constant'"
+            or value_expr != "0.0"
+        ):
+            return None
+        pad_match = re.fullmatch(
+            r"[\[\(]\s*(?P<p0>\d+)\s*,\s*(?P<p1>\d+)\s*,\s*(?P<p2>\d+)\s*,\s*(?P<p3>\d+)\s*[\]\)]",
+            pad_expr,
+        )
+        if pad_match is None:
+            return None
+        pad_values = [int(pad_match.group(f"p{i}")) for i in range(4)]
+        if len(set(pad_values)) != 1 or int(pad_values[0]) <= 0:
+            return None
+        return indent, lhs, input_expr, pad_values
+
     def _pidnet_is_cf_like_name(name: str) -> bool:
         if name.endswith("_cf") or name.endswith("_out_cf"):
             return True
@@ -32273,6 +32342,15 @@ def _apply_pidnet_fast_precanonicalize_repairs(model_path: Path) -> None:
                     f"mode='constant', value=0.0)"
                 )
                 changed = True
+                pidnet_cf_pad_sources.add(lhs_name)
+                continue
+        parsed_pidnet_plain_cf_pad = _parse_pidnet_plain_cf_pad_assign(line)
+        if parsed_pidnet_plain_cf_pad is not None:
+            _, lhs_name, input_name, _ = parsed_pidnet_plain_cf_pad
+            if (
+                _pidnet_is_cf_like_name(input_name)
+                or _pidnet_has_cf_layout_consumer(lhs_name, start_index=index)
+            ):
                 pidnet_cf_pad_sources.add(lhs_name)
                 continue
         pidnet_binary_anchor_match = pidnet_binary_anchor_re.match(line)
@@ -40872,8 +40950,12 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
     padded_inputs: Set[str] = set()
     mean_inputs: Set[str] = set()
     scale4_mul_inputs: Set[str] = set()
+    scale4_mul_outputs: Set[str] = set()
     scale4_add_inputs: Set[str] = set()
-    pag_mul_root_pairs: Set[Tuple[str, str]] = set()
+    scale3_pool_outputs: Set[str] = set()
+    scale3_anchor_inputs: Set[str] = set()
+    pag_mul_outputs: Set[str] = set()
+    pag_reduce_sum_inputs: Set[str] = set()
     local_alias_sources: Dict[str, str] = {}
     const_alias_sources: Dict[str, str] = {}
     const_pair_alias_sources: Dict[str, Tuple[str, str]] = {}
@@ -41106,19 +41188,60 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
             elif positional_index == 2:
                 keepdim_expr = part.strip()
             positional_index += 1
-        if input_expr is None or keepdim_expr != "True":
+        if input_expr is None or dim_expr is None or keepdim_expr != "True":
             return None
-        dim_match = re.fullmatch(r"[\[\(]\s*2\s*,\s*3\s*[\]\)]", str(dim_expr).strip())
-        if dim_match is None:
+        try:
+            dim_value = ast.literal_eval(str(dim_expr).strip())
+        except Exception:
+            return None
+        if not isinstance(dim_value, (list, tuple)):
+            return None
+        normalized_axes = [int(axis) for axis in list(dim_value)]
+        if normalized_axes not in ([1, 2], [2, 3]):
             return None
         return _resolve_local_alias(input_expr)
 
-    def _parse_pidnet_skip_scale4_mul_input(line: str) -> str | None:
+    def _parse_pidnet_skip_scale4_mul_input(line: str) -> tuple[str, str] | None:
         assign = _parse_simple_assignment_line(line)
         if assign is None:
             return None
-        _, _, rhs = assign
-        mul_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", rhs.strip())
+        _, lhs, rhs = assign
+        stripped = rhs.strip()
+        target_shape: list[int] | None = None
+        align_parts = _parse_align_tensor_target_shape_expr(stripped)
+        if align_parts is not None:
+            stripped = str(align_parts[0]).strip()
+            target_shape = _parse_rank4_shape_literal(str(align_parts[1]))
+        else:
+            reshape_prefix = "torch.reshape("
+            if stripped.startswith(reshape_prefix) and stripped.endswith(")"):
+                reshape_parts = _split_top_level_csv_exprs(stripped[len(reshape_prefix) : -1])
+                reshape_input_expr: str | None = None
+                reshape_shape_expr: str | None = None
+                positional_index = 0
+                for part in reshape_parts:
+                    if "=" in part and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is not None:
+                        key, value = part.split("=", 1)
+                        key = key.strip()
+                        value = value.strip()
+                        if key == "input":
+                            reshape_input_expr = value
+                        elif key == "shape":
+                            reshape_shape_expr = value
+                        continue
+                    if positional_index == 0:
+                        reshape_input_expr = part.strip()
+                    elif positional_index == 1:
+                        reshape_shape_expr = part.strip()
+                    positional_index += 1
+                if reshape_input_expr is not None and reshape_shape_expr is not None:
+                    stripped = str(reshape_input_expr).strip()
+                    target_shape = _parse_rank4_shape_literal(str(reshape_shape_expr))
+        if target_shape is not None:
+            non_singleton_dims = [int(value) for value in target_shape if int(value) > 1]
+            if int(target_shape[0]) != 1 or len(non_singleton_dims) != 1:
+                return None
+        mul_match = re.fullmatch(r"torch\.mul\((?P<args>.+)\)", stripped)
         if mul_match is None:
             return None
         mul_args = _parse_binary_mul_args(str(mul_match.group("args")))
@@ -41126,10 +41249,16 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
             return None
         input_a = str(mul_args[0]).strip()
         input_b = str(mul_args[1]).strip()
-        if _parse_pidnet_skip_scale4_const_reshape(input_a) is not None:
-            return _resolve_local_alias(input_b)
-        if _parse_pidnet_skip_scale4_const_reshape(input_b) is not None:
-            return _resolve_local_alias(input_a)
+        const_attr_a = _parse_pidnet_skip_scale4_const_reshape(input_a)
+        if const_attr_a is None:
+            const_attr_a = _resolve_const_expr(input_a)
+        const_attr_b = _parse_pidnet_skip_scale4_const_reshape(input_b)
+        if const_attr_b is None:
+            const_attr_b = _resolve_const_expr(input_b)
+        if const_attr_a is not None and const_attr_b is None:
+            return lhs, _resolve_local_alias(input_b)
+        if const_attr_b is not None and const_attr_a is None:
+            return lhs, _resolve_local_alias(input_a)
         return None
 
     def _parse_pidnet_skip_scale4_add_input(line: str) -> str | None:
@@ -41162,17 +41291,119 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
             input_b = kwargs.get("other", kwargs.get("b"))
         if input_a is None or input_b is None:
             return None
-        if _parse_pidnet_skip_scale4_const_reshape(input_a) is not None:
+        target_shape: list[int] | None = None
+        if len(parts) == 3 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            target_shape = _parse_rank4_shape_literal(parts[2].strip())
+        else:
+            target_shape_expr = kwargs.get("target_shape", kwargs.get("shape"))
+            if target_shape_expr is not None:
+                target_shape = _parse_rank4_shape_literal(target_shape_expr)
+        if target_shape is not None:
+            non_singleton_dims = [int(value) for value in target_shape if int(value) > 1]
+            if int(target_shape[0]) != 1 or len(non_singleton_dims) != 1:
+                return None
+        const_attr_a = _parse_pidnet_skip_scale4_const_reshape(input_a)
+        if const_attr_a is None:
+            const_attr_a = _resolve_const_expr(input_a)
+        const_attr_b = _parse_pidnet_skip_scale4_const_reshape(input_b)
+        if const_attr_b is None:
+            const_attr_b = _resolve_const_expr(input_b)
+        if const_attr_a is not None and const_attr_b is None:
             return _resolve_local_alias(input_b)
-        if _parse_pidnet_skip_scale4_const_reshape(input_b) is not None:
+        if const_attr_b is not None and const_attr_a is None:
             return _resolve_local_alias(input_a)
         return None
 
-    def _parse_pidnet_skip_pag_mul_pair(line: str) -> tuple[str, str] | None:
+    def _parse_pidnet_skip_scale3_pool_output(line: str) -> str | None:
         assign = _parse_simple_assignment_line(line)
         if assign is None:
             return None
-        _, _, rhs = assign
+        lhs, rhs = str(assign[1]), str(assign[2]).strip()
+        prefix = "_apply_pool2d("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        kwargs: Dict[str, str] = {}
+        if parts and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", parts[0]) is None:
+            kwargs["input"] = parts[0].strip()
+        for part in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                continue
+            key, value = part.split("=", 1)
+            kwargs[key.strip()] = value.strip()
+        target_shape = _parse_rank4_shape_literal(kwargs.get("target_shape", ""))
+        if (
+            target_shape is None
+            or kwargs.get("channel_last") != "True"
+            or int(target_shape[0]) != 1
+            or int(target_shape[2]) != 1
+            or int(target_shape[1]) <= 1
+            or int(target_shape[3]) <= 0
+        ):
+            return None
+        return lhs
+
+    def _parse_pidnet_skip_scale3_anchor_input(line: str) -> str | None:
+        assign_match = re.match(
+            r"^\s*\(*\s*[A-Za-z0-9_]+\s*,\s*[A-Za-z0-9_]+\s*\)*\s*=\s*(?P<rhs>.+)$",
+            str(line),
+        )
+        if assign_match is None:
+            return None
+        rhs = str(assign_match.group("rhs")).strip()
+        prefix = "_align_binary_inputs_to_anchor("
+        if not rhs.startswith(prefix) or not rhs.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(rhs[len(prefix) : -1])
+        input_a: str | None = None
+        input_b: str | None = None
+        shape_expr: str | None = None
+        if len(parts) == 3 and all(
+            re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None for part in parts
+        ):
+            input_a = parts[0].strip()
+            input_b = parts[1].strip()
+            shape_expr = parts[2].strip()
+        else:
+            kwargs: Dict[str, str] = {}
+            for part in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", part) is None:
+                    continue
+                key, value = part.split("=", 1)
+                kwargs[key.strip()] = value.strip()
+            input_a = kwargs.get("input", kwargs.get("a"))
+            input_b = kwargs.get("other", kwargs.get("b"))
+            shape_expr = kwargs.get("target_shape", kwargs.get("shape"))
+        target_shape = _parse_rank4_shape_literal(shape_expr or "")
+        if (
+            input_a is None
+            or input_b is None
+            or target_shape is None
+            or int(target_shape[0]) != 1
+            or int(target_shape[2]) != 1
+            or int(target_shape[1]) <= 1
+            or int(target_shape[3]) <= 1
+        ):
+            return None
+        const_attr_a = _parse_pidnet_skip_scale4_const_reshape(input_a)
+        if const_attr_a is None:
+            const_attr_a = _resolve_const_expr(input_a)
+        const_attr_b = _parse_pidnet_skip_scale4_const_reshape(input_b)
+        if const_attr_b is None:
+            const_attr_b = _resolve_const_expr(input_b)
+        if const_attr_a is not None and const_attr_b is None:
+            return _resolve_local_alias(input_b)
+        if const_attr_b is not None and const_attr_a is None:
+            return _resolve_local_alias(input_a)
+        return None
+
+    def _parse_pidnet_skip_pag_mul_output(line: str) -> str | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, lhs, rhs = assign
         align_parts = _parse_align_tensor_target_shape_expr(rhs)
         if align_parts is None:
             return None
@@ -41187,7 +41418,30 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
         rhs_root = _resolve_local_alias(str(mul_args[1]))
         if lhs_root == rhs_root:
             return None
-        return tuple(sorted((lhs_root, rhs_root)))
+        return lhs
+
+    def _parse_pidnet_skip_pag_reduce_sum_input(line: str) -> str | None:
+        assign = _parse_simple_assignment_line(line)
+        if assign is None:
+            return None
+        _, _, rhs = assign
+        prefix = "_reduce_sum("
+        stripped = rhs.strip()
+        if not stripped.startswith(prefix) or not stripped.endswith(")"):
+            return None
+        parts = _split_top_level_csv_exprs(stripped[len(prefix) : -1])
+        if len(parts) < 3:
+            return None
+        input_expr = parts[0].strip()
+        axes_expr = parts[1].strip()
+        keepdims_expr = parts[2].strip()
+        if (
+            re.fullmatch(r"[A-Za-z0-9_]+", input_expr) is None
+            or re.fullmatch(r"_normalize_axes\(\[3\],\s*[A-Za-z0-9_]+\.ndim\)", axes_expr) is None
+            or keepdims_expr != "True"
+        ):
+            return None
+        return input_expr
 
     for line in lines:
         current_line = str(line)
@@ -41246,20 +41500,38 @@ def _has_pidnet_skip_signature(lines: Sequence[str]) -> bool:
             continue
         parsed_scale4_mul_input = _parse_pidnet_skip_scale4_mul_input(current_line)
         if parsed_scale4_mul_input is not None:
-            scale4_mul_inputs.add(str(parsed_scale4_mul_input))
+            scale4_mul_outputs.add(str(parsed_scale4_mul_input[0]))
+            scale4_mul_inputs.add(str(parsed_scale4_mul_input[1]))
             continue
         parsed_scale4_add_input = _parse_pidnet_skip_scale4_add_input(current_line)
         if parsed_scale4_add_input is not None:
             scale4_add_inputs.add(str(parsed_scale4_add_input))
             continue
-        parsed_pag_mul_pair = _parse_pidnet_skip_pag_mul_pair(current_line)
-        if parsed_pag_mul_pair is not None:
-            pag_mul_root_pairs.add(parsed_pag_mul_pair)
+        parsed_scale3_pool_output = _parse_pidnet_skip_scale3_pool_output(current_line)
+        if parsed_scale3_pool_output is not None:
+            scale3_pool_outputs.add(str(parsed_scale3_pool_output))
             continue
-    return (
-        bool(padded_inputs & mean_inputs)
-        and bool(scale4_mul_inputs & scale4_add_inputs)
-        and bool(pag_mul_root_pairs)
+        parsed_scale3_anchor_input = _parse_pidnet_skip_scale3_anchor_input(current_line)
+        if parsed_scale3_anchor_input is not None:
+            scale3_anchor_inputs.add(str(parsed_scale3_anchor_input))
+            continue
+        parsed_pag_mul_output = _parse_pidnet_skip_pag_mul_output(current_line)
+        if parsed_pag_mul_output is not None:
+            pag_mul_outputs.add(str(parsed_pag_mul_output))
+            continue
+        parsed_pag_reduce_sum_input = _parse_pidnet_skip_pag_reduce_sum_input(current_line)
+        if parsed_pag_reduce_sum_input is not None:
+            pag_reduce_sum_inputs.add(str(parsed_pag_reduce_sum_input))
+            continue
+    has_scale4_singleton_bn_chain = bool(scale4_mul_outputs & scale4_add_inputs)
+    has_scale3_pool_anchor_context = bool(scale3_pool_outputs & scale3_anchor_inputs)
+    has_spp_pool_context = bool(padded_inputs & mean_inputs)
+    has_pag_gate_context = bool(pag_mul_outputs & pag_reduce_sum_inputs)
+    return bool(
+        has_pag_gate_context
+        or has_scale3_pool_anchor_context
+        or has_spp_pool_context
+        or (has_scale4_singleton_bn_chain and (has_spp_pool_context or has_scale3_pool_anchor_context))
     )
 
 

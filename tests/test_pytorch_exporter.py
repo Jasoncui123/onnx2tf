@@ -22885,6 +22885,50 @@ def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_gene
     )
 
 
+def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_from_direct_singleton_bn_chain(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "pidnet_generic_spp_scale4_direct_singleton_bn_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "import torch.nn.functional as F",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, spp_average_in: torch.Tensor, pag_left: torch.Tensor, pag_right: torch.Tensor) -> torch.Tensor:",
+                "        spp_nhwc_pad = F.pad(_align_tensor_to_target_shape(spp_average_in, [1, 3, 5, 512]), [0, 0, 8, 8, 8, 8], mode='constant', value=0.0)",
+                "        spp_pool = _apply_pool2d(spp_nhwc_pad, filter_height=17, filter_width=17, stride_h=8, stride_w=8, padding='VALID', target_shape=[1, 512, 1, 1], is_max_pool=False, channel_last=True)",
+                "        spp_global_cf = torch.mean(spp_average_in, dim=[1, 2], keepdim=True)",
+                "        spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul), [1, 512, 1, 1])",
+                "        _binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, self.const_demo_scale4_scale4_1_BatchNormalization_bn_add, [1, 512, 1, 1])",
+                "        pag_mul_out0_raw = _align_tensor_to_target_shape(torch.mul(pag_left, pag_right), [1, 24, 40, 32])",
+                "        pag_reduce_sum_out0 = _reduce_sum(pag_mul_out0_raw, _normalize_axes([3], pag_mul_out0_raw.ndim), True)",
+                "        return _binary_lhs_11 + spp_pool + pag_reduce_sum_out0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    _apply_fast_precanonicalize_repairs(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert "spp_global_cf = torch.mean(spp_average_in, dim=[2, 3], keepdim=True)" in rewritten
+    assert (
+        "spp_bn_mul_out = _align_tensor_to_target_shape(torch.mul(spp_global_cf, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_mul, [1, 512, 1, 1])), [1, 512, 1, 1])"
+        in rewritten
+    )
+    assert (
+        "_binary_lhs_11, _binary_rhs_11 = _align_binary_inputs_to_anchor(spp_bn_mul_out, "
+        "torch.reshape(self.const_demo_scale4_scale4_1_BatchNormalization_bn_add, [1, 512, 1, 1]), [1, 512, 1, 1])"
+        in rewritten
+    )
+
+
 def test_apply_fast_precanonicalize_repairs_rewrites_pidnet_spp_scale4_with_generic_const_names(
     tmp_path,
 ) -> None:
