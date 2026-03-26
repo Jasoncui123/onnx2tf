@@ -4,6 +4,7 @@ import ast
 import contextlib
 import copy
 import dataclasses
+import functools
 import hashlib
 import importlib.util
 import json
@@ -26480,6 +26481,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                             cf_aliases.add(lhs)
                             if resolved_source_shape[1] == 1:
                                 singleton_cf_vars.add(lhs)
+                            index += 1
                             continue
                         should_rewrite_to_cf = target_shape == [
                             resolved_source_shape[0],
@@ -26492,9 +26494,11 @@ def _canonicalize_generated_model_source_for_raw_export(
                             cf_aliases.add(lhs)
                             if buffer_channel_count == 1:
                                 singleton_cf_vars.add(lhs)
+                            index += 1
                             continue
                         should_rewrite_to_cf = target_shape == [n, h, w, buffer_channel_count]
                     if not should_rewrite_to_cf:
+                        index += 1
                         continue
                     indent = str(aligned_nhwc_rank4_match.group("indent"))
                     lines[index] = (
@@ -26562,6 +26566,7 @@ def _canonicalize_generated_model_source_for_raw_export(
                             cf_aliases.add(lhs)
                             if common_shape[1] == 1:
                                 singleton_cf_vars.add(lhs)
+                            index += 1
                             continue
                         if target_shape == [
                             common_shape[0],
@@ -40387,18 +40392,50 @@ def _parse_align_tensor_target_shape_assign(line: str) -> Tuple[str, str] | None
     return _parse_align_tensor_target_shape_expr(rhs.strip())
 
 
-def _parse_simple_assignment_line(line: str) -> Tuple[str, str, str] | None:
-    assign_match = re.match(
-        r"^(?P<indent>\s*)(?P<lhs>[A-Za-z0-9_]+)(?:\s*:\s*[^=]+)?\s*=\s*(?P<rhs>.+)$",
-        str(line),
-    )
-    if assign_match is None:
+@functools.lru_cache(maxsize=131072)
+def _parse_simple_assignment_line_cached(
+    line: str,
+) -> Tuple[str, str, str] | None:
+    current_line = str(line)
+    line_length = len(current_line)
+    indent_end = 0
+    while indent_end < line_length and current_line[indent_end].isspace():
+        indent_end += 1
+    if indent_end >= line_length:
         return None
-    return (
-        str(assign_match.group("indent")),
-        str(assign_match.group("lhs")),
-        str(assign_match.group("rhs")).strip(),
-    )
+    lhs_start = indent_end
+    first_char = current_line[lhs_start]
+    if not (first_char.isalnum() or first_char == "_"):
+        return None
+    lhs_end = lhs_start + 1
+    while lhs_end < line_length:
+        current_char = current_line[lhs_end]
+        if not (current_char.isalnum() or current_char == "_"):
+            break
+        lhs_end += 1
+    lhs = current_line[lhs_start:lhs_end]
+    cursor = lhs_end
+    while cursor < line_length and current_line[cursor].isspace():
+        cursor += 1
+    if cursor < line_length and current_line[cursor] == ":":
+        cursor += 1
+        equal_index = current_line.find("=", cursor)
+        if equal_index < 0:
+            return None
+    else:
+        equal_index = cursor
+        while equal_index < line_length and current_line[equal_index].isspace():
+            equal_index += 1
+        if equal_index >= line_length or current_line[equal_index] != "=":
+            return None
+    rhs = current_line[equal_index + 1 :].strip()
+    if not rhs:
+        return None
+    return current_line[:indent_end], lhs, rhs
+
+
+def _parse_simple_assignment_line(line: str) -> Tuple[str, str, str] | None:
+    return _parse_simple_assignment_line_cached(str(line))
 
 
 def _parse_torch_permute_assign(
@@ -40564,7 +40601,6 @@ def _parse_rank4_shape_literal(shape_expr: str) -> Tuple[int, int, int, int] | N
         int(shape_match.group("d2")),
         int(shape_match.group("d3")),
     )
-
 
 def _parse_rank4_shape_expr(
     shape_expr: str,
