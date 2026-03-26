@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -96,6 +97,7 @@ from onnx2tf.tflite_builder.pytorch_exporter import (
     _onnx_repair_inferred_shapes_in_place,
     _patch_generated_runtime_pool2d_channel_last_recovery,
     _parse_copy_call_expr,
+    _parse_simple_assignment_line,
     _sanitize_dynamo_exported_onnx_metadata,
     _has_dynamic_score_sampling_stage_signature,
     _has_humanseg_fast_repair_signature,
@@ -146,6 +148,23 @@ def _import_generated_runtime_module(package_path: str):
     finally:
         if sys.path[0] == parent:
             sys.path.pop(0)
+
+
+def _canonicalize_generated_model_source_for_raw_export_with_alarm(
+    package_path: Path,
+    seconds: int = 2,
+) -> None:
+    def _handle_alarm(signum, frame):
+        raise TimeoutError("canonicalize_generated_model_source_for_raw_export timed out")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handle_alarm)
+    signal.alarm(seconds)
+    try:
+        _canonicalize_generated_model_source_for_raw_export(package_path)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _onnx_value_shape_signature(value_info: onnx.ValueInfoProto) -> tuple[Any, ...]:
@@ -364,6 +383,69 @@ def test_canonicalize_generated_model_source_for_raw_export_rewrites_rank3_rank4
         "resize_cubic_out0 = _align_tensor_to_target_shape("
         "torch.matmul(_tmp_y_19, _tmp_x_19.transpose(-1, -2)), [1, 1, 90, 320])"
     ) in rewritten
+
+
+def test_canonicalize_generated_model_source_for_raw_export_progresses_past_cf_batchnorm_shape_match(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_batchnorm_progress_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x):",
+                "        feature_cf = _align_tensor_to_target_shape(x, [1, 3, 4, 4])",
+                "        output = _align_tensor_to_target_shape(torch.add(feature_cf, self.BatchNormalization_scale), [1, 3, 4, 4])",
+                "        return output",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export_with_alarm(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "output = _align_tensor_to_target_shape(torch.add(feature_cf, self.BatchNormalization_scale), [1, 3, 4, 4])"
+        in rewritten
+    )
+
+
+def test_canonicalize_generated_model_source_for_raw_export_progresses_past_cf_binary_shape_match(
+    tmp_path,
+) -> None:
+    package_dir = tmp_path / "cf_binary_progress_pkg"
+    package_dir.mkdir()
+    model_path = package_dir / "model.py"
+    model_path.write_text(
+        "\n".join(
+            [
+                "import torch",
+                "",
+                "class Model(torch.nn.Module):",
+                "    def forward(self, x, y):",
+                "        lhs_cf = _align_tensor_to_target_shape(x, [1, 3, 4, 4])",
+                "        rhs_cf = _align_tensor_to_target_shape(y, [1, 3, 4, 4])",
+                "        output = _align_tensor_to_target_shape(torch.add(lhs_cf, rhs_cf), [1, 3, 4, 4])",
+                "        return output",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _canonicalize_generated_model_source_for_raw_export_with_alarm(package_dir)
+
+    rewritten = model_path.read_text(encoding="utf-8")
+    assert (
+        "output = _align_tensor_to_target_shape(torch.add(lhs_cf, rhs_cf), [1, 3, 4, 4])"
+        in rewritten
+    )
 
 
 def test_rewrite_channel_last_binary_bridge_chains_accepts_helper_permute_bridges() -> None:
@@ -19915,6 +19997,22 @@ def test_parse_copy_call_expr_rejects_non_keyword_trailing_copy_args() -> None:
     line = "        self.mask_buf_a.copy_(self.attn_src_a, trailing_value)"
 
     assert _parse_copy_call_expr(line) is None
+
+
+def test_parse_simple_assignment_line_handles_typed_assignment_without_regex_backtracking() -> None:
+    line = "    scores_alias: torch.Tensor = torch.reshape(input_tensor, [5000, 1])"
+
+    assert _parse_simple_assignment_line(line) == (
+        "    ",
+        "scores_alias",
+        "torch.reshape(input_tensor, [5000, 1])",
+    )
+
+
+def test_parse_simple_assignment_line_rejects_non_assignment_expression() -> None:
+    line = "    return foo == bar"
+
+    assert _parse_simple_assignment_line(line) is None
 
 
 def test_apply_fast_precanonicalize_repairs_fix_shadowformer_attention_mask_axes_with_functional_permute_copy(

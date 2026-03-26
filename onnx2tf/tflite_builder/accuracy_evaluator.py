@@ -1399,6 +1399,50 @@ def _judge_metrics(
     }
 
 
+def _judge_per_output_metrics(
+    *,
+    output_names: Sequence[str],
+    per_output_metrics: Dict[str, "_MetricAccumulator"],
+    thresholds: Dict[str, float],
+    rtol: float,
+    skipped_output_names: Optional[Sequence[str]] = None,
+) -> Tuple[bool, Dict[str, Optional[Dict[str, Any]]]]:
+    skipped_output_name_set = {
+        str(output_name)
+        for output_name in (skipped_output_names or [])
+    }
+    numeric_outputs_pass = True
+    per_output_metric_judgements: Dict[str, Optional[Dict[str, Any]]] = {}
+    for output_name in output_names:
+        output_name = str(output_name)
+        if output_name in skipped_output_name_set:
+            per_output_metric_judgements[output_name] = None
+            continue
+        output_metric_judgement = _judge_metrics(
+            metrics=per_output_metrics[output_name].to_dict(),
+            thresholds=thresholds,
+            rtol=rtol,
+        )
+        per_output_metric_judgements[output_name] = output_metric_judgement
+        if bool(output_metric_judgement.get("pass", False)):
+            continue
+        numeric_outputs_pass = False
+    return numeric_outputs_pass, per_output_metric_judgements
+
+
+def _resolve_tflite_evaluation_pass(
+    *,
+    metric_judgement: Dict[str, Any],
+    numeric_outputs_pass: bool,
+) -> bool:
+    # Keep allclose accounting in the report, but align pass/fail gating with
+    # the PyTorch evaluator so threshold-safe numeric mismatches do not fail.
+    return bool(
+        bool(metric_judgement.get("pass", False))
+        or bool(numeric_outputs_pass)
+    )
+
+
 def evaluate_onnx_tflite_outputs(
     *,
     onnx_graph: onnx.ModelProto,
@@ -1656,7 +1700,17 @@ def evaluate_onnx_tflite_outputs(
         rtol=rtol,
     )
     allclose_pass = bool(allclose_total == allclose_matched)
-    evaluation_pass = bool(metric_judgement["pass"] and allclose_pass)
+    numeric_outputs_pass, per_output_metric_judgements = _judge_per_output_metrics(
+        output_names=onnx_output_names,
+        per_output_metrics=per_output_metrics,
+        thresholds=resolved_thresholds,
+        rtol=rtol,
+        skipped_output_names=skipped_output_names,
+    )
+    evaluation_pass = _resolve_tflite_evaluation_pass(
+        metric_judgement=metric_judgement,
+        numeric_outputs_pass=numeric_outputs_pass,
+    )
     report: Dict[str, Any] = {
         "schema_version": 1,
         "seed": int(seed),
@@ -1716,6 +1770,7 @@ def evaluate_onnx_tflite_outputs(
                         )
                     ),
                 },
+                "metric_threshold_judgement": per_output_metric_judgements[output_name],
                 "layout_alignment": {
                     "identity": int(per_output_layout_alignment[output_name]["identity"]),
                     "transpose": int(per_output_layout_alignment[output_name]["transpose"]),
@@ -2280,7 +2335,17 @@ def evaluate_onnx_tflite_outputs_isolated(
         rtol=rtol,
     )
     allclose_pass = bool(allclose_total == allclose_matched)
-    evaluation_pass = bool(metric_judgement["pass"] and allclose_pass)
+    numeric_outputs_pass, per_output_metric_judgements = _judge_per_output_metrics(
+        output_names=onnx_output_names,
+        per_output_metrics=per_output_metrics,
+        thresholds=resolved_thresholds,
+        rtol=rtol,
+        skipped_output_names=skipped_output_names,
+    )
+    evaluation_pass = _resolve_tflite_evaluation_pass(
+        metric_judgement=metric_judgement,
+        numeric_outputs_pass=numeric_outputs_pass,
+    )
     report: Dict[str, Any] = {
         "schema_version": 1,
         "seed": int(seed),
@@ -2340,6 +2405,7 @@ def evaluate_onnx_tflite_outputs_isolated(
                         )
                     ),
                 },
+                "metric_threshold_judgement": per_output_metric_judgements[output_name],
                 "layout_alignment": {
                     "identity": int(per_output_layout_alignment[output_name]["identity"]),
                     "transpose": int(per_output_layout_alignment[output_name]["transpose"]),

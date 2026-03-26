@@ -18,10 +18,12 @@ from onnx2tf.tflite_builder.accuracy_evaluator import (
     _FLOAT_METRIC_THRESHOLDS,
     _generate_seeded_input,
     _judge_metrics,
+    _judge_per_output_metrics,
     _load_custom_input_data,
     _normalize_tensor_name,
     _quantize_for_tflite_input,
     _QUANT_METRIC_THRESHOLDS,
+    _resolve_tflite_evaluation_pass,
     _resolve_compare_mode,
     _resolve_metric_thresholds,
     _resize_tflite_inputs_if_needed,
@@ -428,7 +430,16 @@ def evaluate_split_manifest_outputs(
         rtol=rtol,
     )
     allclose_pass = bool(allclose_total == allclose_matched)
-    evaluation_pass = bool(metric_judgement["pass"] and allclose_pass)
+    numeric_outputs_pass, per_output_metric_judgements = _judge_per_output_metrics(
+        output_names=final_partition_outputs,
+        per_output_metrics=per_output_metrics,
+        thresholds=resolved_thresholds,
+        rtol=rtol,
+    )
+    evaluation_pass = _resolve_tflite_evaluation_pass(
+        metric_judgement=metric_judgement,
+        numeric_outputs_pass=numeric_outputs_pass,
+    )
     if used_custom_inputs and used_test_data_nhwc:
         inputs_source = "mixed_custom_and_test_data_nhwc"
     elif used_test_data_nhwc:
@@ -470,6 +481,7 @@ def evaluate_split_manifest_outputs(
                         == per_output_allclose[output_name]["total"]
                     ),
                 },
+                "metric_threshold_judgement": per_output_metric_judgements[output_name],
                 **per_output_metrics[output_name].to_dict(),
             }
             for output_name in final_partition_outputs

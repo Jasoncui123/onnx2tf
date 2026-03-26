@@ -26,6 +26,7 @@ tflite2sm_*/
 *pytorch_bulk*/
 partial_onnx*/
 flatbuffer_direct_bulk_report*/
+.tmp/
 
 .act.secrets
 .act.env
@@ -33,3 +34,4 @@ flatbuffer_direct_bulk_report*/
 *.sarif
 *.data
 generic_rule_refactor.md
+analyze.md

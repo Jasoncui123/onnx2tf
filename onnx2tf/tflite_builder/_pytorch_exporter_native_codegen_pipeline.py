@@ -50,10 +50,18 @@ _NATIVE_CODEGEN_FUNCTION_SOURCE = re.sub(
         "forward_lines = _fold_channel_first_gap_conv_bridges(forward_lines)\n"
         r"\1forward_lines = _repair_channel_last_gap_conv_inputs(forward_lines)\n"
         r"\1forward_lines = _rewrite_channel_first_gap_outputs_to_explicit_channel_last(forward_lines)\n"
-        r"\1forward_lines = _rewrite_channel_last_gap_means_to_reduce_mean(forward_lines)"
+        r"\1forward_lines = _rewrite_channel_last_gap_means_to_reduce_mean(forward_lines)\n"
+        r"\1forward_lines = _repair_channel_last_gap_conv_inputs(forward_lines)"
     ),
     _NATIVE_CODEGEN_FUNCTION_SOURCE,
     count=1,
+)
+_NATIVE_CODEGEN_FUNCTION_SOURCE = _NATIVE_CODEGEN_FUNCTION_SOURCE.replace(
+    '    (package_dir / "model.py").write_text(model_source, encoding="utf-8")\n',
+    '    model_source_lines = model_source.splitlines()\n'
+    '    model_source_lines = _repair_channel_last_gap_conv_inputs(model_source_lines)\n'
+    '    model_source = "\\n".join(model_source_lines) + "\\n"\n'
+    '    (package_dir / "model.py").write_text(model_source, encoding="utf-8")\n',
 )
 _NATIVE_CODEGEN_IMPL: Optional[Callable[..., Any]] = None
 
@@ -737,6 +745,21 @@ def _rewrite_native_generated_model_postprocesses(model_file: Path) -> None:
     _rewrite_channel_first_const_binary_target_shapes(model_file)
     _rewrite_channel_first_rank4_flatten_to_nwc(model_file)
     _rewrite_rank3_feature_tail_split_axes(model_file)
+    if model_file.exists():
+        from .pytorch_exporter import (
+            _repair_cf_consumed_permute_aliases,
+            _repair_channel_last_gap_conv_inputs,
+            _repair_nhwc_named_binary_add_align_outputs,
+            _repair_plain_mixed_layout_attention_adds,
+        )
+
+        original_lines = model_file.read_text(encoding="utf-8").splitlines()
+        rewritten_lines = _repair_channel_last_gap_conv_inputs(original_lines)
+        rewritten_lines = _repair_nhwc_named_binary_add_align_outputs(rewritten_lines)
+        rewritten_lines = _repair_cf_consumed_permute_aliases(rewritten_lines)
+        rewritten_lines = _repair_plain_mixed_layout_attention_adds(rewritten_lines)
+        if rewritten_lines != original_lines:
+            model_file.write_text("\n".join(rewritten_lines) + "\n", encoding="utf-8")
 
 
 def _resolve_static_split_axis(
@@ -1038,19 +1061,7 @@ def assemble_and_write_model_phase(
             state.context.package_dir,
             model_ir=state.context.model_ir,
         )
-    _rewrite_public_layout_bridge_binary_align_calls(
-        state.context.package_dir / "model.py"
-    )
-    _rewrite_resize_argmax_channel_first_axis(
-        state.context.package_dir / "model.py"
-    )
-    _rewrite_binary_aligned_target_shapes(
-        state.context.package_dir / "model.py"
-    )
-    _rewrite_binary_conv_bridge_target_shapes(
-        state.context.package_dir / "model.py"
-    )
-    _rewrite_invalid_constant_reshape_targets(
+    _rewrite_native_generated_model_postprocesses(
         state.context.package_dir / "model.py"
     )
     _rewrite_split_axes_from_static_shapes(

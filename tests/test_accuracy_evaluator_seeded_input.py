@@ -8,9 +8,11 @@ from onnx2tf.tflite_builder.accuracy_evaluator import (
     _build_eval_inputs_for_sample,
     _collect_onnx_input_specs,
     _generate_seeded_input,
+    _judge_per_output_metrics,
     _judge_metrics,
     _max_abs_error,
     _MetricAccumulator,
+    _resolve_tflite_evaluation_pass,
 )
 
 
@@ -258,6 +260,58 @@ def test_metric_accumulator_treats_equal_nonfinite_pairs_as_zero_error() -> None
     assert metrics["rmse"] == 0.0
     assert metrics["cosine_similarity"] == 1.0
     assert _max_abs_error(ref, pred) == 0.0
+
+
+def test_judge_per_output_metrics_passes_when_each_output_meets_thresholds() -> None:
+    acc = _MetricAccumulator()
+    ref = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+    pred = np.asarray([1.001, 2.001, 3.001], dtype=np.float32)
+    acc.update(ref, pred)
+
+    numeric_outputs_pass, per_output_metric_judgements = _judge_per_output_metrics(
+        output_names=["y"],
+        per_output_metrics={"y": acc},
+        thresholds=_FLOAT_METRIC_THRESHOLDS,
+        rtol=1.0e-4,
+    )
+
+    assert numeric_outputs_pass is True
+    assert per_output_metric_judgements["y"] is not None
+    assert per_output_metric_judgements["y"]["pass"] is True
+
+
+def test_resolve_tflite_evaluation_pass_matches_pytorch_style_when_allclose_fails() -> None:
+    metric_judgement = {
+        "pass": True,
+        "checks": {
+            "max_abs": True,
+            "mean_abs": True,
+            "rmse": True,
+            "cosine_similarity": True,
+        },
+    }
+
+    assert _resolve_tflite_evaluation_pass(
+        metric_judgement=metric_judgement,
+        numeric_outputs_pass=True,
+    ) is True
+
+
+def test_resolve_tflite_evaluation_pass_fails_when_metric_checks_fail() -> None:
+    metric_judgement = {
+        "pass": False,
+        "checks": {
+            "max_abs": False,
+            "mean_abs": True,
+            "rmse": True,
+            "cosine_similarity": True,
+        },
+    }
+
+    assert _resolve_tflite_evaluation_pass(
+        metric_judgement=metric_judgement,
+        numeric_outputs_pass=False,
+    ) is False
 
 
 def test_metric_accumulator_keeps_metrics_finite_on_nonfinite_mismatch() -> None:
