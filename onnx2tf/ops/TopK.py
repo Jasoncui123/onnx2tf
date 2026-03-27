@@ -67,7 +67,7 @@ def make_node(
         if isinstance(X, gs.Variable) else X
     k_tensor = tf_layers_dict[K.name]['tf_node'] \
         if isinstance(K, gs.Variable) else K
-    k_tensor = int(k_tensor) \
+    k_tensor = int(k_tensor.item()) \
         if isinstance(k_tensor, np.ndarray) else tf.cast(k_tensor, dtype=tf.int32)
     tensor_rank = len(input_tensor.shape)
 
