@@ -1,11 +1,12 @@
 name: Model Convert Test
 
 on:
-  pull_request:
-    branches: [ main ]
+  workflow_run:
+    workflows: ["Invisible Unicode Check"]
+    types: [completed]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -13,6 +14,9 @@ permissions:
 
 jobs:
   conversion-test:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     steps:
     - name: Check space before cleanup
@@ -83,6 +87,9 @@ jobs:
         swap-size-gb: 13
     - name: Checkout onnx2tf
       uses: actions/checkout@v5
+      with:
+        ref: ${{ github.event.workflow_run.head_sha }}
+        fetch-depth: 0
     - uses: actions/setup-python@v6
       with:
         python-version: '3.12'
