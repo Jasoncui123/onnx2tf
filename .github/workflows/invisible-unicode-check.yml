@@ -1,0 +1,32 @@
+name: Invisible Unicode Check
+
+on:
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  invisible-unicode-check:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+    - name: Check added lines for dangerous invisible Unicode
+      env:
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        INVISIBLE_UNICODE_ALLOWLIST_PATHS: ""
+        INVISIBLE_UNICODE_ALLOWLIST_EXTENSIONS: ""
+      run: |
+        python tools/check_pr_invisible_unicode.py "$PR_BASE_SHA" "$PR_HEAD_SHA"
