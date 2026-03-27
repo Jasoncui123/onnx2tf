@@ -1,23 +1,64 @@
-name: Model Convert Test
+name: Pull Request Checks
 
 on:
-  workflow_run:
-    workflows: ["Invisible Unicode Check"]
-    types: [completed]
+  pull_request:
+    branches: [ main ]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: write
-
 jobs:
-  conversion-test:
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'pull_request'
+  invisible-unicode-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+    - name: Check added lines for dangerous invisible Unicode
+      env:
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        INVISIBLE_UNICODE_ALLOWLIST_PATHS: ""
+        INVISIBLE_UNICODE_ALLOWLIST_EXTENSIONS: ""
+      run: |
+        python tools/check_pr_invisible_unicode.py "$PR_BASE_SHA" "$PR_HEAD_SHA"
+
+  codeql-analyze:
+    name: CodeQL Analyze
+    needs: invisible-unicode-check
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'python' ]
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v4
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4
+
+  conversion-test:
+    needs: invisible-unicode-check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
     - name: Check space before cleanup
       run: df -h
@@ -87,9 +128,6 @@ jobs:
         swap-size-gb: 13
     - name: Checkout onnx2tf
       uses: actions/checkout@v5
-      with:
-        ref: ${{ github.event.workflow_run.head_sha }}
-        fetch-depth: 0
     - uses: actions/setup-python@v6
       with:
         python-version: '3.12'
