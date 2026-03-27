@@ -34,7 +34,7 @@ RUN set -eux; \
             psutil==5.9.5 \
             ml_dtypes==0.5.1 \
             tf-keras==2.19.0 \
-            numpy==2.4.3 \
+            numpy==1.26.4 \
             'flatbuffers==25.12.19' && break; \
         if [ "${i}" -eq 3 ]; then \
             exit 1; \
