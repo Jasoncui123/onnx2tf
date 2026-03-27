@@ -103,6 +103,7 @@ jobs:
         pip install ml_dtypes==0.5.1
         pip install tf-keras==2.19.0
         pip install "flatbuffers==25.12.19"
+        pip install numpy==2.4.3
         pip install -e .
     - name: Download models
       run: |
