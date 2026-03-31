@@ -98,7 +98,6 @@ from onnx2tf.utils.common_functions import (
     dummy_tf_inference,
     onnx_tf_tensor_validation,
     weights_export,
-    download_test_image_data,
     get_tf_model_inputs,
     get_tf_model_outputs,
     rewrite_tflite_inout_opname,
@@ -1561,8 +1560,7 @@ def convert(
     custom_input_op_name_np_data_path: Optional[List]
         INPUT Name of OP and path of calibration data file (Numpy) for quantization\n
         and mean and std.\n
-        The specification can be omitted only when the input OP is a single 4D tensor image data.\n
-        If omitted, it is automatically calibrated using 20 normalized MS-COCO images.\n
+        This option is required when using integer quantization.\n
         The type of the input OP must be Float32.\n
         Data for calibration must be pre-normalized to a range of 0 to 1.\n
         [\n
@@ -1940,8 +1938,6 @@ def convert(
     test_data_nhwc_path: Optional[str]
         Path to a numpy file (.npy) containing custom test data in NHWC format.\n
         This is used for test inference and validation when check_onnx_tf_outputs options are enabled.\n
-        If not specified, the tool will attempt to download sample data from the internet\n
-        when the input is a 4D RGB image tensor.\n
         The numpy array should have shape [batch_size, height, width, 3] with values\n
         normalized to the range [0, 1].\n
         This option is useful for offline environments or when you want to use\n
@@ -6377,7 +6373,7 @@ def convert(
             tf_layers_dict=tf_layers_dict,
         )
 
-        # download test data or load from file
+        # Load optional user-provided test data.
         test_data_nhwc = None
         if test_data_nhwc_path:
             # Load user-provided test data
@@ -6394,31 +6390,7 @@ def convert(
                     test_data_nhwc = test_data_nhwc * 255.0
             except Exception as e:
                 error(f'Failed to load test data from {test_data_nhwc_path}: {e}')
-                warn('Falling back to automatic test data download if applicable.')
                 test_data_nhwc = None
-
-        if test_data_nhwc is None and inputs:
-            all_four_dim = sum(
-                [
-                    1 for input in inputs \
-                        if len(input.shape) == 4 \
-                            and input.shape[0] is not None \
-                            and input.shape[0] <= 20 \
-                            and input.shape[-1] == 3 \
-                            and input.shape[1] is not None \
-                            and input.shape[2] is not None
-                ]
-            ) == len(inputs)
-            same_batch_dim = False
-            if all_four_dim:
-                batch_size = inputs[0].shape[0]
-                for input in inputs:
-                    same_batch_dim = batch_size == input.shape[0]
-            if all_four_dim and same_batch_dim:
-                test_data: np.ndarray = download_test_image_data()
-                test_data_nhwc = test_data[:inputs[0].shape[0], ...]
-                if check_onnx_tf_outputs_sample_data_normalization == "denorm":
-                    test_data_nhwc = test_data_nhwc * 255.0
 
         # ONNX dummy inference
         # Generate output for all OPs.
@@ -7646,65 +7618,19 @@ def convert(
                 output_folder_path,
             )
 
-            # Download sample calibration data - MS-COCO x20 images
-            # Used only when there is only one input OP, a 4D tensor image,
-            # and --quant_calib_input_op_name_np_data_path is not specified.
-            # Otherwise, calibrate using the data specified in --quant_calib_input_op_name_np_data_path.
+            # Build representative dataset from user-provided calibration data.
             calib_data_dict: Dict[str, List[Any]] = {}
             model_input_name_list = [
                 model_input.name for model_input in model.inputs
             ]
             data_count = 0
-            if custom_input_op_name_np_data_path is None \
-                and model.inputs[0].dtype == tf.float32 \
-                and len(model.inputs[0].shape) == 4:
-
-                # AUTO calib 4D images
-                calib_data: np.ndarray = download_test_image_data()
-                data_count = calib_data.shape[0]
-                for model_input in model.inputs:
-                    if model_input.dtype != tf.float32 \
-                        or len(model_input.shape) != 4 \
-                        or model_input.shape[-1] not in [3, 4]:
-                        error(
-                            f'For models that have multiple input OPs and need to perform INT8 quantization calibration '+
-                            f'using non-rgb-image/non-rgba-image input tensors, specify the calibration data with '+
-                            f'--quant_calib_input_op_name_np_data_path. '+
-                            f'model_input[n].shape: {model_input.shape}'
-                        )
-                        sys.exit(1)
-
-                    if model_input.shape[-1] == 3:
-                        # RGB
-                        mean = quant_norm_mean_np
-                        std = quant_norm_std_np
-                    elif model_input.shape[-1] == 4:
-                        # RGBA
-                        zero = np.zeros((*quant_norm_mean_np.shape[:-1], 1), dtype=quant_norm_mean_np.dtype)
-                        mean = np.concatenate([quant_norm_mean_np, zero], axis=-1)
-                        one = np.ones((*quant_norm_std_np.shape[:-1], 1), dtype=quant_norm_std_np.dtype)
-                        std = np.concatenate([quant_norm_std_np, zero], axis=-1)
-                        new_element_array = np.full((*calib_data.shape[:-1], 1), 0.500, dtype=np.float32)
-                        calib_data = np.concatenate((calib_data, new_element_array), axis=-1)
-                    else:
-                        # Others
-                        mean = quant_norm_mean_np
-                        std = quant_norm_std_np
-
-                    calib_data_dict[model_input.name] = \
-                        [
-                            tf.image.resize(
-                                calib_data.copy(),
-                                (
-                                    model_input.shape[1] if model_input.shape[1] is not None else 640,
-                                    model_input.shape[2] if model_input.shape[2] is not None else 640,
-                                )
-                            ),
-                            mean,
-                            std,
-                        ]
-
-            elif custom_input_op_name_np_data_path is not None:
+            if custom_input_op_name_np_data_path is None:
+                error(
+                    "The '-oiqt' option requires calibration data specified with "
+                    "'--quant_calib_input_op_name_np_data_path' ('-cind')."
+                )
+                sys.exit(1)
+            else:
                 for param in custom_input_op_name_np_data_path:
                     if len(param) != 4:
                         error(
@@ -8748,8 +8674,7 @@ def main():
             '\n<Usage in -oiqt> \n' +
             'INPUT Name of OP and path of calibration data file (Numpy) for quantization \n' +
             'and mean and std. \n' +
-            'The specification can be omitted only when the input OP is a single 4D tensor image data. \n' +
-            'If omitted, it is automatically calibrated using 20 normalized MS-COCO images. \n' +
+            'This option is required when using -oiqt. \n' +
             'The type of the input OP must be Float32. \n' +
             'Data for calibration must be pre-normalized to a range of 0 to 1. \n' +
             '-cind {input_op_name} {numpy_file_path} {mean} {std} \n' +
@@ -9309,8 +9234,6 @@ def main():
         help=\
             'Path to a numpy file (.npy) containing custom test data in NHWC format. \n' +
             'This is used for test inference and validation when check_onnx_tf_outputs options are enabled. \n' +
-            'If not specified, the tool will attempt to download sample data from the internet \n' +
-            'when the input is a 4D RGB image tensor. \n' +
             'The numpy array should have shape [batch_size, height, width, 3] with values \n' +
             'normalized to the range [0, 1]. \n' +
             'This option is useful for offline environments or when you want to use \n' +

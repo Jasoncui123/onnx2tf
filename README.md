@@ -919,7 +919,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm -it \
   -v `pwd`:/workdir \
   -w /workdir \
-  ghcr.io/pinto0309/onnx2tf:2.3.16
+  ghcr.io/pinto0309/onnx2tf:2.3.17
 
   or
 
@@ -928,7 +928,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm -it \
   -v `pwd`:/workdir \
   -w /workdir \
-  docker.io/pinto0309/onnx2tf:2.3.16
+  docker.io/pinto0309/onnx2tf:2.3.17
 
   or
 
@@ -938,7 +938,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm \
   --user $(id -u):$(id -g) \
   -v $(pwd):/work \
-  docker.io/pinto0309/onnx2tf:2.3.16 \
+  docker.io/pinto0309/onnx2tf:2.3.17 \
   onnx2tf -i /work/densenet-12.onnx -o /work/saved_model
 
   or
@@ -2355,8 +2355,7 @@ optional arguments:
     <Usage in -oiqt>
       INPUT Name of OP and path of calibration data file (Numpy) for quantization
       and mean and std.
-      The specification can be omitted only when the input OP is a single 4D tensor image data.
-      If omitted, it is automatically calibrated using 20 normalized MS-COCO images.
+      This option is required when using -oiqt.
       The type of the input OP must be Float32.
       Data for calibration must be pre-normalized to a range of 0 to 1.
       -cind {input_op_name} {numpy_file_path} {mean} {std}
@@ -2822,8 +2821,6 @@ optional arguments:
   -tdnp TEST_DATA_NHWC_PATH, --test_data_nhwc_path TEST_DATA_NHWC_PATH
     Path to a numpy file (.npy) containing custom test data in NHWC format.
     This is used for test inference and validation when check_onnx_tf_outputs options are enabled.
-    If not specified, the tool will attempt to download sample data from the internet
-    when the input is a 4D RGB image tensor.
     The numpy array should have shape [batch_size, height, width, 3] with values
     normalized to the range [0, 1].
     This option is useful for offline environments or when you want to use
@@ -3143,8 +3140,7 @@ convert(
       <Usage in -oiqt>
         INPUT Name of OP and path of calibration data file (Numpy) for quantization
         and mean and std.
-        The specification can be omitted only when the input OP is a single 4D tensor image data.
-        If omitted, it is automatically calibrated using 20 normalized MS-COCO images.
+        This option is required when using -oiqt.
         The type of the input OP must be Float32.
         Data for calibration must be pre-normalized to a range of 0 to 1.
         -cind {input_op_name} {numpy_file_path} {mean} {std}
@@ -3609,8 +3605,6 @@ convert(
     test_data_nhwc_path: Optional[str]
       Path to a numpy file (.npy) containing custom test data in NHWC format.
       This is used for test inference and validation when check_onnx_tf_outputs options are enabled.
-      If not specified, the tool will attempt to download sample data from the internet
-      when the input is a 4D RGB image tensor.
       The numpy array should have shape [batch_size, height, width, 3] with values
       normalized to the range [0, 1].
       This option is useful for offline environments or when you want to use
