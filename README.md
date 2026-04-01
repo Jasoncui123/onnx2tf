@@ -949,6 +949,10 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   source .venv/bin/activate
   uv pip install -U onnx2tf
 
+  Note: onnx2tf's uv configuration excludes package versions published within the last 7 days.
+  If no compatible version older than 7 days exists, dependency resolution may fail.
+  PyTorch packages from the official PyTorch index are exempt from this cooldown.
+
   or
 
   curl -LsSf https://astral.sh/uv/install.sh | sh

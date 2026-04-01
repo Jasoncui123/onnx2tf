@@ -64,12 +64,18 @@ Documentation = "https://github.com/PINTO0309/onnx2tf#readme"
 Issues = "https://github.com/PINTO0309/onnx2tf/issues"
 
 [tool.uv]
+exclude-newer = "7 days"
+exclude-newer-package = { torch = false, torchvision = false, torchaudio = false }
 override-dependencies = [
     "onnx==1.20.1",
     "onnxsim-prebuilt==0.4.39.post2",
     "ml-dtypes==0.5.1",
     "numpy==1.26.4",
 ]
+
+[tool.uv.pip]
+exclude-newer = "7 days"
+exclude-newer-package = { torch = false, torchvision = false, torchaudio = false }
 
 [tool.uv.build-backend]
 module-root = ""
