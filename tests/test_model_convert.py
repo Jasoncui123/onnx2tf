@@ -234,7 +234,7 @@ def _configure(
     output_dir=tempfile.gettempdir(),
     verbose=False,
     dry_run=False,
-    tflite_backend='tf_converter',
+    tflite_backend='flatbuffer_direct',
     report_filename='model_status.md',
     preserve_model_files=False,
     not_use_onnxsim=False,
@@ -290,7 +290,7 @@ def model_convert_report(
     output_dir=tempfile.gettempdir(),
     verbose=False,
     dry_run=False,
-    tflite_backend='tf_converter',
+    tflite_backend='flatbuffer_direct',
     report_filename='model_status.md',
     preserve_model_files=False,
     not_use_onnxsim=False,
@@ -391,9 +391,9 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--tflite-backend',
-        default='tf_converter',
+        default='flatbuffer_direct',
         choices=['tf_converter', 'flatbuffer_direct'],
-        help='tflite backend for conversion (default: tf_converter)'
+        help='tflite backend for conversion (default: flatbuffer_direct)'
     )
     parser.add_argument(
         '--report-filename',

@@ -9,10 +9,7 @@ You should use LiteRT Torch rather than onnx2tf. https://github.com/google-ai-ed
 
 [![Downloads](https://static.pepy.tech/personalized-badge/onnx2tf?period=total&units=none&left_color=grey&right_color=brightgreen&left_text=Downloads)](https://pepy.tech/project/onnx2tf) ![GitHub](https://img.shields.io/github/license/PINTO0309/onnx2tf?color=2BAF2B) [![Python](https://img.shields.io/badge/Python-3.12-2BAF2B)](https://img.shields.io/badge/Python-3.8-2BAF2B) [![PyPI](https://img.shields.io/pypi/v/onnx2tf?color=2BAF2B)](https://pypi.org/project/onnx2tf/) [![CodeQL](https://github.com/PINTO0309/onnx2tf/workflows/CodeQL/badge.svg)](https://github.com/PINTO0309/onnx2tf/actions?query=workflow%3ACodeQL) ![Model Convert Test Status](https://github.com/PINTO0309/onnx2tf/workflows/Model%20Convert%20Test/badge.svg) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7230085.svg)](https://doi.org/10.5281/zenodo.7230085) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/PINTO0309/onnx2tf)
 
-## Model Conversion Status
-https://github.com/PINTO0309/onnx2tf/wiki/model_status
-
-## Supported layers
+## `tf_converter` supported layers
 - https://github.com/onnx/onnx/blob/main/docs/Operators.md
 - :heavy_check_mark:: Supported　:white_check_mark:: Partial support　**Help wanted**: Pull Request are welcome
 
@@ -233,14 +230,14 @@ https://github.com/PINTO0309/onnx2tf/wiki/model_status
 
 ## `flatbuffer_direct` execution path
 
-Currently, the `flatbuffer_direct` backend is faster and has a higher success rate than the default `tf_converter` backend. The simplest conversion command for `flatbuffer_direct` outputs only a LiteRT model, but if you add `--flatbuffer_direct_output_saved_model`, it will output a `saved_model` as before. However, what is different from the previous behavior is that it will build the graph of the `saved_model` from the LiteRT model.
+`flatbuffer_direct` is now the default backend. It is faster and has a higher success rate than `tf_converter` for the supported direct path. The simplest conversion command now outputs only a LiteRT model by default, but if you add `--flatbuffer_direct_output_saved_model`, it will also output a `saved_model`. Unlike the legacy `tf_converter` path, this SavedModel is built from the LiteRT-side ModelIR.
 
 > [!IMPORTANT]
-> **Starting with onnx2tf v2.4.0, `tf_converter` will be deprecated and the default backend will be switched to `flatbuffer_direct`. With the v2.3.3 update, all backward compatible conversion options have been migrated to `flatbuffer_direct`, so I will only be doing minor bug fixes until April. If you provide us with ONNX sample models, I will consider incorporating them into `flatbuffer_direct`. I'll incorporate [ai-edge-quantizer](https://github.com/google-ai-edge/ai-edge-quantizer) when I feel like it, but that will probably be about 10 years from now.**
+> **`flatbuffer_direct` is the current default backend. Use `--tflite_backend tf_converter` only when you explicitly need the legacy TensorFlow Lite Converter compatibility path.**
 
 <img width="1390" height="680" alt="image" src="https://github.com/user-attachments/assets/04c5d8e2-2465-4dac-b3ea-37d7e7f987cc" />
 
-When `--tflite_backend flatbuffer_direct` is selected, onnx2tf now uses a direct fast path for both ONNX input and `-it/--input_tflite_file_path` input:
+With the default `flatbuffer_direct` backend, onnx2tf uses a direct fast path for both ONNX input and `-it/--input_tflite_file_path` input:
 
 1. ONNX graph preprocessing (`tflite_builder.preprocess`) and direct lowering (`lower_onnx_to_ir`)
 2. Direct FlatBuffer export (`*_float32.tflite`, `*_float16.tflite`, and optional quantized variants)
@@ -528,7 +525,7 @@ via `--shape_hints`, `--test_data_nhwc_path`, or `-cind`.
 
 <details><summary>Click to expand</summary>
 
-- Scope: ONNX ops listed in the `Supported layers` table above.
+- Scope: ONNX ops listed in the ``tf_converter` supported layers` table above.
 - Source of truth: `onnx2tf/tflite_builder/op_registry.py` and `--report_op_coverage` output.
 - Current summary:
   - Listed ONNX ops in the builtin table below: `192`
@@ -920,7 +917,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm -it \
   -v `pwd`:/workdir \
   -w /workdir \
-  ghcr.io/pinto0309/onnx2tf:2.3.19
+  ghcr.io/pinto0309/onnx2tf:2.4.0
 
   or
 
@@ -929,7 +926,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm -it \
   -v `pwd`:/workdir \
   -w /workdir \
-  docker.io/pinto0309/onnx2tf:2.3.19
+  docker.io/pinto0309/onnx2tf:2.4.0
 
   or
 
@@ -939,7 +936,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm \
   --user $(id -u):$(id -g) \
   -v $(pwd):/work \
-  docker.io/pinto0309/onnx2tf:2.3.19 \
+  docker.io/pinto0309/onnx2tf:2.4.0 \
   onnx2tf -i /work/densenet-12.onnx -o /work/saved_model
 
   or
@@ -1031,14 +1028,14 @@ Only patterns that are considered to be used particularly frequently are describ
 ```bash
 # Float32, Float16
 # This is the fastest way to generate tflite.
-# Improved to automatically generate `signature` without `-osd` starting from v1.25.3.
+# Add `-fdosm` if you also want SavedModel output on the default backend.
 # Also, starting from v1.24.0, efficient TFLite can be generated
 # without unrolling `GroupConvolution`. e.g. YOLOv9, YOLOvN
 # Conversion to other frameworks. e.g. TensorFlow.js, CoreML, etc
 # https://github.com/PINTO0309/onnx2tf#19-conversion-to-tensorflowjs
 # https://github.com/PINTO0309/onnx2tf#20-conversion-to-coreml
 wget https://github.com/PINTO0309/onnx2tf/releases/download/0.0.2/resnet18-v1-7.onnx
-onnx2tf -i resnet18-v1-7.onnx
+onnx2tf -i resnet18-v1-7.onnx -fdosm
 
 ls -lh saved_model/
 
@@ -1234,7 +1231,7 @@ Quick difference between `-tdnp` and `-cind`:
 - `-tdnp` (`--test_data_nhwc_path`): Validation-only test data for accuracy checks. Expects one NHWC RGB `.npy` (`[N,H,W,3]`). No `mean/std`. For multi-input models, this single array is reused across inputs (per-input mapping is not supported). Also accepted by `-fdots` for eligible 4D RGB inputs.
 - `-cind` (`--custom_input_op_name_np_data_path`): Per-input custom data mapping by input name. Supports multi-input/non-image inputs. Also used for `-fdots` trace inputs and INT8 calibration (`-oiqt`) with optional `mean/std`.
 
-The `-cotof` option evaluates Float32 accuracy only. In the default path it checks ONNX against TensorFlow/TFLite outputs. When `--tflite_backend flatbuffer_direct` is used, the base report is ONNX↔TFLite. If `--flatbuffer_direct_output_pytorch` is also enabled, onnx2tf additionally emits ONNX↔PyTorch and combined comparison reports using the same input samples.
+The `-cotof` option evaluates Float32 accuracy only. On the default `flatbuffer_direct` path, the base report is ONNX↔TFLite. When `--tflite_backend tf_converter` is explicitly used, it checks ONNX against TensorFlow/TFLite outputs. If `--flatbuffer_direct_output_pytorch` is also enabled, onnx2tf additionally emits ONNX↔PyTorch and combined comparison reports using the same input samples.
 
 ```
 onnx2tf -i mobilenetv2-12.onnx -ois input:1,3,224,224 -cotof -cotoa 1e-1
@@ -1524,7 +1521,7 @@ e.g. How to specify calibration data in CLI or Script respectively.
 
 If you do not need to perform INT8 quantization with this tool alone, the following method is the easiest.
 
-The `-osd` option will output a `saved_model.pb` in the `saved_model` folder with the full size required for quantization. That is, a default signature named `serving_default` is embedded in `.pb`. The `-b` option is used to convert the batch size by rewriting it as a static integer.
+On the default `flatbuffer_direct` backend, combine `-fdosm` with `-osd` to output a `saved_model.pb` in the `saved_model` folder with the full size required for quantization. That is, a default signature named `serving_default` is embedded in `.pb`. If you need the legacy behavior instead, use `--tflite_backend tf_converter` explicitly. The `-b` option is used to convert the batch size by rewriting it as a static integer.
 
 **Note: INT8 TFLite generated by following this procedure as is will result in a model with significantly degraded accuracy. This tutorial only demonstrates the INT8 quantization procedure; if you wish to correct for accuracy, please refer to [Parameter replacement](#parameter-replacement) to correct for transposition errors in the operation.**
 
@@ -1532,7 +1529,7 @@ The `-osd` option will output a `saved_model.pb` in the `saved_model` folder wit
 # Ref: https://github.com/onnx/models/tree/main/text/machine_comprehension/bert-squad
 wget https://s3.ap-northeast-2.wasabisys.com/temp-models/onnx2tf_248/bertsquad-12.onnx
 
-onnx2tf -i bertsquad-12.onnx -b 1 -osd -cotof
+onnx2tf -i bertsquad-12.onnx -b 1 -fdosm -osd -cotof
 ```
 
 ![image](https://user-images.githubusercontent.com/33194443/225175510-95200964-06ff-474a-8cd4-f640bec6c397.png)
@@ -1638,7 +1635,7 @@ PyTorch's `NonMaxSuppression (torchvision.ops.nms)` and ONNX's `NonMaxSuppressio
 
 3. Finally, simply convert ONNX to TFLite or saved_model or TFJS using onnx2tf. onnx2tf performs an internal operation to automatically optimize the NMS output to a fixed shape if `max_output_boxes_per_class` is set to a value other than `-Infinity` and `9223372036854775807 (Maximum value of INT64)`. Specify `--output_nms_with_dynamic_tensor` or `-onwdt` if you do not want to optimize for a fixed shape. If you want to shrink class scores in NMS from `[B, C, N]` to `[B, 1, N]`, enable `--output_nms_with_argmax` or `-onwa`.
     ```
-    onnx2tf -i nms_yolov7_update.onnx -osd -cotof
+    onnx2tf -i nms_yolov7_update.onnx -fdosm -osd -cotof
     ```
     I would be happy if this is a reference for Android + Java or TFJS implementations. There are tons more tricky model optimization techniques described in my blog posts, so you'll have to find them yourself. I don't dare to list the URL here because it is annoying to see so many `issues` being posted. And unfortunately, all articles are in Japanese.
     ![image](https://user-images.githubusercontent.com/33194443/230780749-9967a34b-abf6-47fe-827d-92e0f6bddf46.png)
@@ -1814,7 +1811,7 @@ This model calculates the similarity of features by cosine similarity. The batch
 Convert the downloaded `OSNet` to `tflite` and `saved_model` as a variable batch. If you do not specify the `-b` or `-ois` options, onnx2tf does not change the batch size as `N`. The only important point is to convert the model with the `-osd` and `-coion` options.
 
 ```
-onnx2tf -i osnet_x0_25_msmt17.onnx -osd -coion
+onnx2tf -i osnet_x0_25_msmt17.onnx -fdosm -osd -coion
 ```
 
   - `.tflite`
@@ -2074,7 +2071,7 @@ If such a model is converted without any options, TensorFlow/Keras will abort. T
 Thus, for models such as this, where all dimensions, including batch size, are dynamic shapes, it is often possible to convert by fixing the batch size to `1` with the `-b 1` or `--batch_size 1` option.
 
 ```
-onnx2tf -i model.onnx -b 1 -osd
+onnx2tf -i model.onnx -b 1 -fdosm -osd
 ```
 
 - Results
@@ -2143,7 +2140,7 @@ tensorflow_decision_forests \
 ydf \
 tensorflow_hub
 
-onnx2tf -i mobilenetv2-12.onnx -ois input:1,3,224,224 -osd -dgc
+onnx2tf -i mobilenetv2-12.onnx -ois input:1,3,224,224 -fdosm -osd -dgc
 
 tensorflowjs_converter \
 --input_format tf_saved_model \
@@ -2167,7 +2164,7 @@ When converting to CoreML, process as follows. The `-k` option is for conversion
 ```bash
 pip install coremltools==8.2
 
-onnx2tf -i mobilenetv2-12.onnx -k input -ois input:1,3,224,224 -osd
+onnx2tf -i mobilenetv2-12.onnx -k input -ois input:1,3,224,224 -fdosm -osd
 ```
 ```python
 import coremltools as ct
@@ -2303,9 +2300,10 @@ optional arguments:
   -tb {tf_converter,flatbuffer_direct}, \
     --tflite_backend {tf_converter,flatbuffer_direct}
     TFLite generation backend.
-    "tf_converter"(default): Use TensorFlow Lite Converter.
-    "flatbuffer_direct": Use direct FlatBuffer builder path (limited
+    "flatbuffer_direct"(default): Use direct FlatBuffer builder path (limited
     OP/quantization support).
+    "tf_converter": Use TensorFlow Lite Converter as an explicit compatibility
+    path.
 
   -fdosm, --flatbuffer_direct_output_saved_model
     Output SavedModel directly from flatbuffer_direct ModelIR (float32).
@@ -2924,7 +2922,7 @@ convert(
   flatbuffer_direct_output_dynamo_onnx: Optional[bool] = False,
   flatbuffer_direct_output_exported_program: Optional[bool] = False,
   native_pytorch_generation_timeout_sec: Optional[int] = 0,
-  tflite_backend: Optional[str] = 'tf_converter',
+  tflite_backend: Optional[str] = 'flatbuffer_direct',
   quant_norm_mean: Optional[str] = '[[[[0.485, 0.456, 0.406]]]]',
   quant_norm_std: Optional[str] = '[[[[0.229, 0.224, 0.225]]]]',
   quant_type: Optional[str] = 'per-channel',
@@ -3072,8 +3070,8 @@ convert(
 
     tflite_backend: Optional[str]
       TFLite generation backend.
-      "tf_converter"(default): Use TensorFlow Lite Converter.
-      "flatbuffer_direct": Experimental direct FlatBuffer builder path.
+      "flatbuffer_direct"(default): Experimental direct FlatBuffer builder path.
+      "tf_converter": Use TensorFlow Lite Converter as an explicit compatibility path.
       Note: "flatbuffer_direct" supports a limited builtin OP set,
       FP32/FP16 export, limited dynamic-range quantization,
       limited integer quantization, and limited int16-activation variants.
