@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "2.3.18"
+__version__ = "2.3.19"
 
 
 def _load_impl():

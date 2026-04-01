@@ -920,7 +920,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm -it \
   -v `pwd`:/workdir \
   -w /workdir \
-  ghcr.io/pinto0309/onnx2tf:2.3.18
+  ghcr.io/pinto0309/onnx2tf:2.3.19
 
   or
 
@@ -929,7 +929,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm -it \
   -v `pwd`:/workdir \
   -w /workdir \
-  docker.io/pinto0309/onnx2tf:2.3.18
+  docker.io/pinto0309/onnx2tf:2.3.19
 
   or
 
@@ -939,7 +939,7 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   docker run --rm \
   --user $(id -u):$(id -g) \
   -v $(pwd):/work \
-  docker.io/pinto0309/onnx2tf:2.3.18 \
+  docker.io/pinto0309/onnx2tf:2.3.19 \
   onnx2tf -i /work/densenet-12.onnx -o /work/saved_model
 
   or
@@ -2313,8 +2313,6 @@ optional arguments:
     Cannot be used with --disable_model_save.
     Fails explicitly if CUSTOM ops are present.
     With split output, partition SavedModels are emitted instead of a single root SavedModel.
-    When used with -cotof, also outputs `<model_name>_saved_model_validation_report.json`
-    in the output directory (inference status + SavedModel/TFLite comparison metrics).
 
   -fdopt, --flatbuffer_direct_output_pytorch
     Output a reloadable PyTorch package directly from flatbuffer_direct ModelIR.
@@ -2830,7 +2828,8 @@ optional arguments:
     values are compared, causing OutOfMemory.
     It is very time consuming because it performs as many inferences as
     there are operations.
-    With `--tflite_backend flatbuffer_direct`, the base report is
+    With `--tflite_backend flatbuffer_direct`, this uses the TensorFlow-free
+    ONNX/TFLite comparison path. The base report is
     `<model_name>_accuracy_report.json` (`ONNX↔TFLite`).
     If `--flatbuffer_direct_output_pytorch` is also enabled, onnx2tf additionally
     emits `<model_name>_pytorch_accuracy_report.json` (`ONNX↔PyTorch`) and
@@ -2839,10 +2838,6 @@ optional arguments:
     `--flatbuffer_direct_output_pytorch`, onnx2tf emits
     `<model_name>_pytorch_accuracy_report.json` (`TFLite↔PyTorch`) and
     `<model_name>_accuracy_comparison_report.json`.
-    SavedModel validation remains separate and, if enabled, emits
-    `<model_name>_saved_model_validation_report.json`.
-    If split SavedModels are emitted, they are executed sequentially in
-    split-manifest order before comparison.
 
   -coton, --check_onnx_tf_outputs_sample_data_normalization
     norm: Validate using random data normalized to the range 0.0 to 1.0
@@ -3092,8 +3087,6 @@ convert(
       Fails explicitly if `CUSTOM` ops are present.
       When used together with split output, partition SavedModels are emitted
       instead of a single root SavedModel.
-      When used with `check_onnx_tf_outputs_elementwise_close_full=True`,
-      `<model_name>_saved_model_validation_report.json` is generated.
 
     flatbuffer_direct_output_pytorch: Optional[bool]
       Output a reloadable PyTorch package directly from flatbuffer_direct

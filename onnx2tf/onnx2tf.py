@@ -1496,9 +1496,7 @@ def convert(
         Export SavedModel directly from flatbuffer_direct ModelIR (float32 path)
         without tf_converter fallback.\n
         When used together with split output, partition SavedModels are emitted
-        instead of a single root SavedModel.\n
-        With `check_onnx_tf_outputs_elementwise_close_full=True`, onnx2tf writes
-        `<model_name>_saved_model_validation_report.json`.
+        instead of a single root SavedModel.
 
     flatbuffer_direct_output_pytorch: Optional[bool]
         Export a reloadable PyTorch package directly from flatbuffer_direct
@@ -2351,6 +2349,7 @@ def convert(
     )
     run_saved_model_inference_check = bool(
         check_onnx_tf_outputs_elementwise_close_full
+        and tflite_backend == 'tf_converter'
     )
     run_flatbuffer_direct_op_error_report = bool(
         check_onnx_tf_outputs_elementwise_close_full
@@ -9250,8 +9249,9 @@ def main():
             'values are compared, causing OutOfMemory. ' +
             'It is very time consuming because it performs as many inferences as '+
             'there are operations. '+
-            'With -it and -fdopt, this compares TFLite and PyTorch outputs instead of ONNX-based outputs. '+
-            'In addition, final ONNX vs generated TFLite output error check is automatically executed.'
+            'With --tflite_backend flatbuffer_direct, this runs the TensorFlow-free ONNX/TFLite '+
+            'comparison path and final ONNX vs generated TFLite output error check. '+
+            'With -it and -fdopt, this compares TFLite and PyTorch outputs instead of ONNX-based outputs. '
     )
     parser.add_argument(
         '-coton',
