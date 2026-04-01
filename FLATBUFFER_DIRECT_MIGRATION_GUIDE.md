@@ -1,12 +1,12 @@
 # flatbuffer_direct Migration Guide
 
 ## Goal
-Migrate from the default `tf_converter` backend to `flatbuffer_direct` in controlled stages while preserving production stability and diagnosability.
+Operate with the default `flatbuffer_direct` backend while preserving production stability and diagnosability, and keep `tf_converter` available only as an explicit compatibility path when needed.
 
 ## Backend differences (quick view)
 |Item|`tf_converter`|`flatbuffer_direct`|
 |:-|:-|:-|
-|Default|Yes|No (opt-in)|
+|Default|No (explicit fallback)|Yes|
 |Final generation path|TensorFlow Lite Converter|Direct FlatBuffer builder|
 |Optimization behavior|TF-path accumulated rewrites/heuristics|Direct preprocess + strict dispatch constraints|
 |Failure model|Many patterns absorbed by TF conversion|Explicit failure with `reason_code`|
@@ -14,9 +14,9 @@ Migrate from the default `tf_converter` backend to `flatbuffer_direct` in contro
 |Fallback|N/A|N/A (no fallback)|
 
 ## Recommended rollout
-1. Keep baseline CI on `--tflite_backend tf_converter`.
-2. Add one additional CI lane with `--tflite_backend flatbuffer_direct --report_op_coverage`.
-3. Resolve failures by `reason_code` and adjust model/export options.
+1. Keep the default CI lane on `flatbuffer_direct` and enable `--report_op_coverage` there.
+2. Add an explicit compatibility lane with `--tflite_backend tf_converter` if you still need to monitor legacy behavior.
+3. Resolve direct-path failures by `reason_code` and adjust model/export options.
 4. Only after stable float32/float16 conversion, enable quantization and split evaluation.
 
 ## Stage-by-stage commands
@@ -25,7 +25,6 @@ Migrate from the default `tf_converter` backend to `flatbuffer_direct` in contro
 python -m onnx2tf.onnx2tf \
   -i model.onnx \
   -o out \
-  --tflite_backend flatbuffer_direct \
   --report_op_coverage
 ```
 
@@ -34,7 +33,6 @@ python -m onnx2tf.onnx2tf \
 python -m onnx2tf.onnx2tf \
   -i model.onnx \
   -o out \
-  --tflite_backend flatbuffer_direct \
   -odrqt -oiqt \
   --eval_with_onnx \
   --eval_target_tflite full_integer_quant \
@@ -47,7 +45,6 @@ python -m onnx2tf.onnx2tf \
 python -m onnx2tf.onnx2tf \
   -i model.onnx \
   -o out \
-  --tflite_backend flatbuffer_direct \
   --auto_split_tflite_by_size \
   --tflite_split_target_bytes 1060000000 \
   --tflite_split_max_bytes 1073741824 \
@@ -59,11 +56,10 @@ python -m onnx2tf.onnx2tf \
 ```bash
 python -m onnx2tf.onnx2tf \
   -i model.onnx \
-  -o out \
-  --tflite_backend flatbuffer_direct
+  -o out
 ```
 
-When direct export fails, conversion stops with an explicit error. Use `tf_converter` explicitly if fallback behavior is required operationally.
+When direct export fails, conversion stops with an explicit error. Use `tf_converter` explicitly if the legacy TensorFlow Lite Converter path is still required operationally.
 
 ## Preprocess scope in direct path
 `flatbuffer_direct` applies staged preprocess rules before lowering:
@@ -114,8 +110,9 @@ Behavior:
 5. OP coverage: `*_op_coverage_report.json`
 
 ## Operational checklist
-1. Keep `tf_converter` lane green at all times.
-2. Gate `flatbuffer_direct` rollout by model family (small -> medium -> large).
-3. Require `--report_op_coverage` in CI for direct lane.
-4. Review `unsupported_reason_counts` and `custom_op_policy` for every failure.
-5. Avoid custom-op expansion unless runtime/serving side is ready.
+1. Keep the default `flatbuffer_direct` lane green at all times.
+2. Keep an explicit `tf_converter` lane only if you still rely on that compatibility path.
+3. Gate `flatbuffer_direct` rollout by model family (small -> medium -> large).
+4. Require `--report_op_coverage` in CI for the direct lane.
+5. Review `unsupported_reason_counts` and `custom_op_policy` for every failure.
+6. Avoid custom-op expansion unless runtime/serving side is ready.

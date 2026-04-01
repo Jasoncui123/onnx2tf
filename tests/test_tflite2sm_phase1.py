@@ -2018,6 +2018,7 @@ def test_tflite_direct_input_rejects_mixed_onnx_and_tflite_input() -> None:
                 input_tflite_file_path=tflite_path,
                 output_folder_path=tmpdir,
                 verbosity="error",
+                tflite_backend="flatbuffer_direct",
             )
 
 

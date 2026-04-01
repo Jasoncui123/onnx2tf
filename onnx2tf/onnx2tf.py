@@ -1310,7 +1310,7 @@ def convert(
     flatbuffer_direct_custom_op_allowlist: Optional[List[str]] = None,
     tflite_split_max_bytes: Optional[int] = 1073741824,
     tflite_split_target_bytes: Optional[int] = 1060000000,
-    tflite_backend: Optional[str] = 'tf_converter',
+    tflite_backend: Optional[str] = 'flatbuffer_direct',
     quant_norm_mean: Optional[str] = '[[[[0.485, 0.456, 0.406]]]]',
     quant_norm_std: Optional[str] = '[[[[0.229, 0.224, 0.225]]]]',
     quant_type: Optional[str] = 'per-channel',
@@ -1564,8 +1564,9 @@ def convert(
 
     tflite_backend: Optional[str]
         TFLite generation backend.\n
-        "tf_converter"(default): Use TensorFlow Lite Converter.\n
-        "flatbuffer_direct": Use direct FlatBuffer builder path.\n
+        "flatbuffer_direct"(default): Use direct FlatBuffer builder path.\n
+        "tf_converter": Use TensorFlow Lite Converter as an explicit\n
+        compatibility path.\n
         Note: "flatbuffer_direct" supports a limited builtin OP set,\n
         FP32/FP16 export, limited dynamic-range quantization,\n
         limited integer quantization, and limited int16-activation variants.\n
@@ -8476,11 +8477,11 @@ def main():
         '--tflite_backend',
         type=str,
         choices=['tf_converter', 'flatbuffer_direct'],
-        default='tf_converter',
+        default='flatbuffer_direct',
         help=\
             'TFLite generation backend. \n' +
-            '"tf_converter"(default): Use TensorFlow Lite Converter. \n' +
-            '"flatbuffer_direct": Use direct FlatBuffer builder path (limited OP/quantization support).'
+            '"flatbuffer_direct"(default): Use direct FlatBuffer builder path (limited OP/quantization support). \n' +
+            '"tf_converter": Use TensorFlow Lite Converter as an explicit compatibility path.'
     )
     parser.add_argument(
         '-ewo',

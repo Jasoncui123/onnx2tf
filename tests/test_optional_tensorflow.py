@@ -135,6 +135,69 @@ print('tensorflow' in sys.modules, 'tf_keras' in sys.modules)
         assert lines[-1] == "False False"
 
 
+def test_default_backend_convert_succeeds_without_tensorflow() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "add.onnx"
+        output_dir = Path(tmpdir) / "out"
+        _make_add_model(model_path)
+        result = _run_python(
+            BLOCK_TF_IMPORTS
+            + """
+import os
+import sys
+import onnx2tf
+
+model_path = sys.argv[1]
+output_dir = sys.argv[2]
+onnx2tf.convert(
+    input_onnx_file_path=model_path,
+    output_folder_path=output_dir,
+    disable_strict_mode=True,
+    verbosity='error',
+)
+print(os.path.exists(os.path.join(output_dir, 'add_float32.tflite')))
+print('tensorflow' in sys.modules, 'tf_keras' in sys.modules)
+""",
+            str(model_path),
+            str(output_dir),
+        )
+        assert result.returncode == 0, result.stderr
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        assert lines[-2] == "True"
+        assert lines[-1] == "False False"
+
+
+def test_main_default_backend_succeeds_without_tensorflow() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = Path(tmpdir) / "add.onnx"
+        output_dir = Path(tmpdir) / "out"
+        _make_add_model(model_path)
+        result = _run_python(
+            BLOCK_TF_IMPORTS
+            + """
+import os
+import sys
+import onnx2tf
+
+sys.argv = [
+    'onnx2tf',
+    '-i', sys.argv[1],
+    '-o', sys.argv[2],
+]
+onnx2tf.main()
+output_dir = sys.argv[4]
+print(os.path.exists(os.path.join(output_dir, 'add_float32.tflite')))
+print('tensorflow' in sys.modules, 'tf_keras' in sys.modules)
+""",
+            str(model_path),
+            str(output_dir),
+        )
+        assert result.returncode == 0, result.stderr
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        assert lines[-2] == "True"
+        assert lines[-1] == "False False"
+
+
 def test_flatbuffer_direct_cotof_succeeds_without_tensorflow() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         model_path = Path(tmpdir) / "add.onnx"
