@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-03-25T04:54:12.0537971Z"
+exclude-newer = "2026-03-25T05:07:53.372380983Z"
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
@@ -693,7 +693,7 @@ wheels = [
 
 [[package]]
 name = "onnx2tf"
-version = "2.3.17"
+version = "2.3.18"
 source = { editable = "." }
 dependencies = [
     { name = "ai-edge-litert" },
