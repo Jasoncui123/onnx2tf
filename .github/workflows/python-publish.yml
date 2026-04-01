@@ -11,8 +11,10 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  pypi-deploy:
+  build-python-dist:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
     - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
     - name: Install uv
@@ -21,14 +23,32 @@ jobs:
         python-version: "3.12"
     - name: Build
       run: uv build
+    - name: Upload Python distributions
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+      with:
+        name: python-distributions
+        path: dist/*
+        if-no-files-found: error
+        retention-days: 1
+
+  pypi-publish:
+    needs: build-python-dist
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+    - name: Download Python distributions
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      with:
+        name: python-distributions
+        path: dist/
     - name: Publish a Python distribution to PyPI
       uses: pypa/gh-action-pypi-publish@27b31702a0e7fc50959f5ad993c78deac1bdfc29
       with:
-        user: __token__
-        password: ${{ secrets.PYPI_API_TOKEN }}
+        packages-dir: dist/
 
   docker-deploy:
-    needs: pypi-deploy
+    needs: pypi-publish
     permissions:
       contents: read
       packages: write
@@ -57,19 +77,19 @@ jobs:
         run: |
           echo "repository=${GITHUB_REPOSITORY@L}" >> $GITHUB_OUTPUT
 
-      # For Github Container Registory
-      - name: Log in to GCR
+      # For GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract metadata (tags, labels) for GCR
+          password: ${{ github.token }}
+      - name: Extract metadata (tags, labels) for GHCR
         id: meta_gh
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
         with:
           images: ${{ env.REGISTRY }}/${{ steps.lower-repo-1.outputs.repository }}
-      - name: Build and push by digest to GCR
+      - name: Build and push by digest to GHCR
         id: build_gh
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294
         with:
@@ -128,6 +148,9 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - docker-deploy
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Download digests
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
@@ -144,24 +167,24 @@ jobs:
         run: |
           echo "repository=${GITHUB_REPOSITORY@L}" >> $GITHUB_OUTPUT
 
-      # For Github Container Registory
-      - name: Log in to GCR
+      # For GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract metadata (tags, labels) for GCR
+          password: ${{ github.token }}
+      - name: Extract metadata (tags, labels) for GHCR
         id: meta_gh
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
         with:
           images: ${{ env.REGISTRY }}/${{ steps.lower-repo-2.outputs.repository }}
-      - name: Create manifest list and push to GCR
+      - name: Create manifest list and push to GHCR
         working-directory: /tmp/digests/gh
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
           $(printf '${{ env.REGISTRY }}/${{ steps.lower-repo-2.outputs.repository }}@sha256:%s ' *)
-      - name: Inspect image on GCR
+      - name: Inspect image on GHCR
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ steps.lower-repo-2.outputs.repository }}:${{ steps.meta_gh.outputs.version }}
 
