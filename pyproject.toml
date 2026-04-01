@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "onnx2tf"
-version = "2.3.18"
+version = "2.3.19"
 description = "A tool for converting ONNX files to LiteRT/TFLite/TensorFlow, PyTorch native code (nn.Module), TorchScript (.pt), state_dict (.pt), Exported Program (.pt2), and Dynamo ONNX. It also supports direct conversion from LiteRT to PyTorch."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,7 +25,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "requests==2.32.5",
     "numpy==1.26.4",
     "onnx==1.20.1",
     "onnxruntime==1.24.3",
@@ -34,8 +33,6 @@ dependencies = [
     "onnxoptimizer==0.4.2",
     "onnxscript==0.6.2",
     "ai-edge-litert==2.1.2",
-    "tensorflow==2.19.0",
-    "tf-keras==2.19.0",
     "sne4onnx==2.0.1",
     "sng4onnx==2.0.1",
     "psutil==5.9.5",
@@ -48,8 +45,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tensorflow = [
+    "tensorflow==2.19.0",
+    "tf-keras==2.19.0",
+]
 torch = [
-    "torch==2.9.0+cu128",
+    "torch==2.11.0",
 ]
 
 [project.scripts]
@@ -64,8 +65,6 @@ Documentation = "https://github.com/PINTO0309/onnx2tf#readme"
 Issues = "https://github.com/PINTO0309/onnx2tf/issues"
 
 [tool.uv]
-exclude-newer = "7 days"
-exclude-newer-package = { torch = false, torchvision = false, torchaudio = false }
 override-dependencies = [
     "onnx==1.20.1",
     "onnxsim-prebuilt==0.4.39.post2",
@@ -73,21 +72,17 @@ override-dependencies = [
     "numpy==1.26.4",
 ]
 
-[tool.uv.pip]
-exclude-newer = "7 days"
-exclude-newer-package = { torch = false, torchvision = false, torchaudio = false }
-
 [tool.uv.build-backend]
 module-root = ""
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.pyright]

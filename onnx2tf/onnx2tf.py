@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 #! /usr/bin/env python
 
 import os
@@ -30,61 +32,6 @@ import random
 random.seed(0)
 import numpy as np
 np.random.seed(0)
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ["TF_USE_LEGACY_KERAS"] = '1'
-
-
-def _should_suppress_tf_startup_stderr() -> bool:
-    raw = str(
-        os.environ.get(
-            'ONNX2TF_SUPPRESS_TF_STARTUP_STDERR',
-            '1',
-        )
-    ).strip().lower()
-    return raw not in {'0', 'false', 'off', 'no'}
-
-
-@contextlib.contextmanager
-def _suppress_stderr_fd_for_tf_startup():
-    if not _should_suppress_tf_startup_stderr():
-        yield
-        return
-    try:
-        stderr_fd = sys.stderr.fileno()
-    except Exception:
-        yield
-        return
-    saved_fd = None
-    devnull_fd = None
-    try:
-        saved_fd = os.dup(stderr_fd)
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull_fd, stderr_fd)
-        yield
-    finally:
-        try:
-            if saved_fd is not None:
-                os.dup2(saved_fd, stderr_fd)
-        finally:
-            if saved_fd is not None:
-                os.close(saved_fd)
-            if devnull_fd is not None:
-                os.close(devnull_fd)
-
-
-with _suppress_stderr_fd_for_tf_startup():
-    import tensorflow as tf
-    from tensorflow.python.saved_model.load import _WrapperFunction
-    import tf_keras
-
-tf.random.set_seed(0)
-tf_keras.utils.set_random_seed(0)
-tf.config.experimental.enable_op_determinism()
-tf.get_logger().setLevel('INFO')
-tf.autograph.set_verbosity(0)
-tf.get_logger().setLevel(logging.FATAL)
-from absl import logging as absl_logging
-absl_logging.set_verbosity(absl_logging.ERROR)
 
 import onnx
 import onnx2tf.gs as gs
@@ -92,24 +39,25 @@ from typing import Optional, List, Any, Dict, cast
 from argparse import ArgumentParser, SUPPRESS
 
 import importlib
-import onnx2tf.utils.common_functions as common_functions
-from onnx2tf.utils.common_functions import (
-    dummy_onnx_inference,
-    dummy_tf_inference,
-    onnx_tf_tensor_validation,
-    weights_export,
-    get_tf_model_inputs,
-    get_tf_model_outputs,
-    rewrite_tflite_inout_opname,
-    check_cuda_enabled,
-    check_has_external_data,
-)
 from onnx2tf.utils.json_auto_generator import (
     generate_auto_replacement_json,
     save_auto_replacement_json,
 )
-from onnx2tf.utils.enums import (
-    CUDA_ONLY_OPS,
+from onnx2tf.utils.onnx_litert_runtime import (
+    check_cuda_enabled,
+    check_has_external_data,
+    dummy_onnx_inference,
+    set_dummy_shape_hints,
+    set_dummy_value_hints,
+    weights_export,
+)
+from onnx2tf.utils.tf_optional import (
+    OptionalTensorFlowDependencyError,
+    require_tensorflow,
+)
+from onnx2tf.utils.torch_optional import (
+    OptionalPyTorchDependencyError,
+    require_torch,
 )
 from onnx2tf.tflite_builder.preprocess.rules.cleanup_unused_initializers import (
     prune_unused_initializers_inplace,
@@ -122,6 +70,76 @@ from sng4onnx import generate as op_name_auto_generate
 
 
 _SAVED_MODEL_BRIDGE_SIGNATURE_CACHE: Dict[tuple[str, str], Any] = {}
+_SAVED_MODEL_BRIDGE_LAYER_CLS: Optional[type] = None
+_CURRENT_DUMMY_SHAPE_HINTS: Optional[List[str]] = None
+_CURRENT_DUMMY_VALUE_HINTS: Optional[List[str]] = None
+CUDA_ONLY_OPS = [
+    'GroupNorm',
+]
+
+
+class _TensorFlowModuleProxy:
+    def __init__(self, module_name: str) -> None:
+        self._module_name = str(module_name)
+
+    def _load(self) -> Any:
+        modules = require_tensorflow('TensorFlow-backed onnx2tf feature')
+        return getattr(modules, self._module_name)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+tf = _TensorFlowModuleProxy('tf')
+tf_keras = _TensorFlowModuleProxy('tf_keras')
+
+
+def _load_common_functions():
+    module = importlib.import_module('onnx2tf.utils.common_functions')
+    module.set_dummy_shape_hints(_CURRENT_DUMMY_SHAPE_HINTS)
+    module.set_dummy_value_hints(_CURRENT_DUMMY_VALUE_HINTS)
+    return module
+
+
+def dummy_tf_inference(*args: Any, **kwargs: Any):
+    return _load_common_functions().dummy_tf_inference(*args, **kwargs)
+
+
+def onnx_tf_tensor_validation(*args: Any, **kwargs: Any):
+    return _load_common_functions().onnx_tf_tensor_validation(*args, **kwargs)
+
+
+def get_tf_model_inputs(*args: Any, **kwargs: Any):
+    return _load_common_functions().get_tf_model_inputs(*args, **kwargs)
+
+
+def get_tf_model_outputs(*args: Any, **kwargs: Any):
+    return _load_common_functions().get_tf_model_outputs(*args, **kwargs)
+
+
+def rewrite_tflite_inout_opname(*args: Any, **kwargs: Any):
+    return _load_common_functions().rewrite_tflite_inout_opname(*args, **kwargs)
+
+
+def _set_dummy_inference_defaults(
+    *,
+    shape_hints: Optional[List[str]],
+    value_hints: Optional[List[str]],
+) -> None:
+    global _CURRENT_DUMMY_SHAPE_HINTS
+    global _CURRENT_DUMMY_VALUE_HINTS
+    _CURRENT_DUMMY_SHAPE_HINTS = shape_hints
+    _CURRENT_DUMMY_VALUE_HINTS = value_hints
+    set_dummy_shape_hints(shape_hints)
+    set_dummy_value_hints(value_hints)
+
+
+def _require_tensorflow_for_feature(feature: str) -> None:
+    require_tensorflow(str(feature))
+
+
+def _require_torch_for_feature(feature: str) -> None:
+    require_torch(str(feature))
 
 
 def _generated_pytorch_export_skip_reason(
@@ -160,6 +178,7 @@ def _get_saved_model_bridge_signature(
     saved_model_path: str,
     endpoint: str = 'serving_default',
 ):
+    require_tensorflow('flatbuffer_direct SavedModel bridge')
     cache_key = (os.path.abspath(str(saved_model_path)), str(endpoint))
     if cache_key not in _SAVED_MODEL_BRIDGE_SIGNATURE_CACHE:
         module = tf.saved_model.load(str(saved_model_path))
@@ -174,66 +193,76 @@ def _get_saved_model_bridge_signature(
     return _SAVED_MODEL_BRIDGE_SIGNATURE_CACHE[cache_key]
 
 
-@tf_keras.utils.register_keras_serializable(package='onnx2tf')
-class SavedModelBridgeLayer(tf_keras.layers.Layer):
-    def __init__(
-        self,
-        *,
-        saved_model_path: str,
-        input_names: List[str],
-        output_names: Optional[List[str]] = None,
-        endpoint: str = 'serving_default',
-        **kwargs,
-    ):
-        kwargs.setdefault('trainable', False)
-        super().__init__(**kwargs)
-        self.saved_model_path = str(saved_model_path)
-        self.input_names = [str(v) for v in list(input_names)]
-        self.output_names = (
-            [str(v) for v in list(output_names)]
-            if output_names is not None
-            else []
-        )
-        self.endpoint = str(endpoint)
+def _get_saved_model_bridge_layer_cls():
+    global _SAVED_MODEL_BRIDGE_LAYER_CLS
+    if _SAVED_MODEL_BRIDGE_LAYER_CLS is not None:
+        return _SAVED_MODEL_BRIDGE_LAYER_CLS
 
-    def call(self, inputs, *args, **kwargs):
-        call_inputs = list(inputs) if isinstance(inputs, (list, tuple)) else [inputs]
-        signature_fn = _get_saved_model_bridge_signature(
-            saved_model_path=self.saved_model_path,
-            endpoint=self.endpoint,
-        )
-        outputs = signature_fn(
-            **{
-                input_name: tensor
-                for input_name, tensor in zip(self.input_names, call_inputs)
-            }
-        )
-        if not isinstance(outputs, dict):
-            return outputs
-        ordered_output_names = (
-            list(self.output_names)
-            if len(self.output_names) > 0
-            else [str(name) for name in outputs.keys()]
-        )
-        ordered_outputs = [
-            outputs[str(output_name)]
-            for output_name in ordered_output_names
-        ]
-        if len(ordered_outputs) == 1:
-            return ordered_outputs[0]
-        return ordered_outputs
+    require_tensorflow('flatbuffer_direct SavedModel bridge')
 
-    def get_config(self):
-        config = super().get_config()
-        config.update(
-            {
-                'saved_model_path': self.saved_model_path,
-                'input_names': list(self.input_names),
-                'output_names': list(self.output_names),
-                'endpoint': self.endpoint,
-            }
-        )
-        return config
+    @tf_keras.utils.register_keras_serializable(package='onnx2tf')
+    class SavedModelBridgeLayer(tf_keras.layers.Layer):
+        def __init__(
+            self,
+            *,
+            saved_model_path: str,
+            input_names: List[str],
+            output_names: Optional[List[str]] = None,
+            endpoint: str = 'serving_default',
+            **kwargs,
+        ):
+            kwargs.setdefault('trainable', False)
+            super().__init__(**kwargs)
+            self.saved_model_path = str(saved_model_path)
+            self.input_names = [str(v) for v in list(input_names)]
+            self.output_names = (
+                [str(v) for v in list(output_names)]
+                if output_names is not None
+                else []
+            )
+            self.endpoint = str(endpoint)
+
+        def call(self, inputs, *args, **kwargs):
+            call_inputs = list(inputs) if isinstance(inputs, (list, tuple)) else [inputs]
+            signature_fn = _get_saved_model_bridge_signature(
+                saved_model_path=self.saved_model_path,
+                endpoint=self.endpoint,
+            )
+            outputs = signature_fn(
+                **{
+                    input_name: tensor
+                    for input_name, tensor in zip(self.input_names, call_inputs)
+                }
+            )
+            if not isinstance(outputs, dict):
+                return outputs
+            ordered_output_names = (
+                list(self.output_names)
+                if len(self.output_names) > 0
+                else [str(name) for name in outputs.keys()]
+            )
+            ordered_outputs = [
+                outputs[str(output_name)]
+                for output_name in ordered_output_names
+            ]
+            if len(ordered_outputs) == 1:
+                return ordered_outputs[0]
+            return ordered_outputs
+
+        def get_config(self):
+            config = super().get_config()
+            config.update(
+                {
+                    'saved_model_path': self.saved_model_path,
+                    'input_names': list(self.input_names),
+                    'output_names': list(self.output_names),
+                    'endpoint': self.endpoint,
+                }
+            )
+            return config
+
+    _SAVED_MODEL_BRIDGE_LAYER_CLS = SavedModelBridgeLayer
+    return _SAVED_MODEL_BRIDGE_LAYER_CLS
 
 def _sanitize_split_input_name(name: str) -> str:
     if not name:
@@ -1467,9 +1496,7 @@ def convert(
         Export SavedModel directly from flatbuffer_direct ModelIR (float32 path)
         without tf_converter fallback.\n
         When used together with split output, partition SavedModels are emitted
-        instead of a single root SavedModel.\n
-        With `check_onnx_tf_outputs_elementwise_close_full=True`, onnx2tf writes
-        `<model_name>_saved_model_validation_report.json`.
+        instead of a single root SavedModel.
 
     flatbuffer_direct_output_pytorch: Optional[bool]
         Export a reloadable PyTorch package directly from flatbuffer_direct
@@ -1967,8 +1994,10 @@ def convert(
     if verbosity is None:
         verbosity = 'debug'
     set_log_level('error' if non_verbose else verbosity)
-    common_functions.set_dummy_shape_hints(shape_hints)
-    common_functions.set_dummy_value_hints(value_hints)
+    _set_dummy_inference_defaults(
+        shape_hints=shape_hints,
+        value_hints=value_hints,
+    )
 
     # If output_folder_path is empty, set the initial value
     if not output_folder_path:
@@ -2320,10 +2349,37 @@ def convert(
     )
     run_saved_model_inference_check = bool(
         check_onnx_tf_outputs_elementwise_close_full
+        and tflite_backend == 'tf_converter'
     )
     run_flatbuffer_direct_op_error_report = bool(
         check_onnx_tf_outputs_elementwise_close_full
     )
+    required_pytorch_feature: Optional[str] = None
+    if flatbuffer_direct_output_torchscript:
+        required_pytorch_feature = 'flatbuffer_direct TorchScript export'
+    elif flatbuffer_direct_output_dynamo_onnx:
+        required_pytorch_feature = 'flatbuffer_direct Dynamo ONNX export'
+    elif flatbuffer_direct_output_exported_program:
+        required_pytorch_feature = 'flatbuffer_direct ExportedProgram export'
+    elif flatbuffer_direct_output_pytorch:
+        required_pytorch_feature = 'flatbuffer_direct PyTorch package export'
+    if required_pytorch_feature is not None:
+        _require_torch_for_feature(required_pytorch_feature)
+    required_tensorflow_feature: Optional[str] = None
+    if tflite_backend == 'tf_converter':
+        required_tensorflow_feature = 'tflite_backend="tf_converter"'
+    elif output_h5:
+        required_tensorflow_feature = 'flatbuffer_direct H5 export'
+    elif output_keras_v3:
+        required_tensorflow_feature = 'flatbuffer_direct Keras v3 export'
+    elif output_tfv1_pb:
+        required_tensorflow_feature = 'flatbuffer_direct TFv1 PB export'
+    elif flatbuffer_direct_output_saved_model:
+        required_tensorflow_feature = 'flatbuffer_direct SavedModel export'
+    elif run_saved_model_inference_check:
+        required_tensorflow_feature = 'SavedModel-based validation'
+    if required_tensorflow_feature is not None:
+        _require_tensorflow_for_feature(required_tensorflow_feature)
     runtime_output_folder_path = output_folder_path
 
     def _run_onnx_tflite_output_check(
@@ -4005,7 +4061,7 @@ def convert(
             )
             input_names.append(str(input_name))
         layer_inputs = keras_inputs if len(keras_inputs) > 1 else keras_inputs[0]
-        bridge_outputs = SavedModelBridgeLayer(
+        bridge_outputs = _get_saved_model_bridge_layer_cls()(
             saved_model_path=saved_model_path,
             input_names=input_names,
             output_names=output_names,
@@ -9193,8 +9249,9 @@ def main():
             'values are compared, causing OutOfMemory. ' +
             'It is very time consuming because it performs as many inferences as '+
             'there are operations. '+
-            'With -it and -fdopt, this compares TFLite and PyTorch outputs instead of ONNX-based outputs. '+
-            'In addition, final ONNX vs generated TFLite output error check is automatically executed.'
+            'With --tflite_backend flatbuffer_direct, this runs the TensorFlow-free ONNX/TFLite '+
+            'comparison path and final ONNX vs generated TFLite output error check. '+
+            'With -it and -fdopt, this compares TFLite and PyTorch outputs instead of ONNX-based outputs. '
     )
     parser.add_argument(
         '-coton',
@@ -9332,96 +9389,103 @@ def main():
     )
 
     # Convert
-    model = convert(
-        input_onnx_file_path=args.input_onnx_file_path,
-        input_tflite_file_path=args.input_tflite_file_path,
-        output_folder_path=args.output_folder_path,
-        output_signaturedefs=args.output_signaturedefs,
-        output_h5=args.output_h5,
-        output_keras_v3=args.output_keras_v3,
-        output_tfv1_pb=args.output_tfv1_pb,
-        output_weights=args.output_weights,
-        copy_onnx_input_output_names_to_tflite=args.copy_onnx_input_output_names_to_tflite,
-        output_dynamic_range_quantized_tflite=args.output_dynamic_range_quantized_tflite,
-        output_integer_quantized_tflite=args.output_integer_quantized_tflite,
-        eval_with_onnx=args.eval_with_onnx,
-        eval_num_samples=args.eval_num_samples,
-        eval_rtol=args.eval_rtol,
-        eval_atol=args.eval_atol,
-        eval_fail_on_threshold=args.eval_fail_on_threshold,
-        eval_target_tflite=args.eval_target_tflite,
-        eval_compare_mode=args.eval_compare_mode,
-        eval_split_models=args.eval_split_models,
-        eval_split_fail_on_threshold=args.eval_split_fail_on_threshold,
-        report_op_coverage=args.report_op_coverage,
-        flatbuffer_direct_output_saved_model=args.flatbuffer_direct_output_saved_model,
-        flatbuffer_direct_output_pytorch=args.flatbuffer_direct_output_pytorch,
-        flatbuffer_direct_output_torchscript=args.flatbuffer_direct_output_torchscript,
-        flatbuffer_direct_output_dynamo_onnx=args.flatbuffer_direct_output_dynamo_onnx,
-        flatbuffer_direct_output_exported_program=args.flatbuffer_direct_output_exported_program,
-        native_pytorch_generation_timeout_sec=args.native_pytorch_generation_timeout_sec,
-        flatbuffer_direct_allow_custom_ops=args.flatbuffer_direct_allow_custom_ops,
-        flatbuffer_direct_custom_op_allowlist=flatbuffer_direct_custom_op_allowlist,
-        tflite_split_max_bytes=args.tflite_split_max_bytes,
-        tflite_split_target_bytes=args.tflite_split_target_bytes,
-        tflite_backend=args.tflite_backend,
-        quant_norm_mean=args.quant_norm_mean,
-        quant_norm_std=args.quant_norm_std,
-        quant_type=args.quant_type,
-        custom_input_op_name_np_data_path=custom_params,
-        input_quant_dtype=args.input_quant_dtype,
-        output_quant_dtype=args.output_quant_dtype,
-        not_use_onnxsim=args.not_use_onnxsim,
-        not_use_opname_auto_generate=args.not_use_opname_auto_generate,
-        batch_size=args.batch_size,
-        overwrite_input_shape=args.overwrite_input_shape,
-        shape_hints=args.shape_hints,
-        value_hints=args.value_hints,
-        no_large_tensor=args.no_large_tensor,
-        output_nms_with_dynamic_tensor=args.output_nms_with_dynamic_tensor,
-        output_nms_with_argmax=args.output_nms_with_argmax,
-        switch_nms_version=args.switch_nms_version,
-        keep_ncw_or_nchw_or_ncdhw_input_names=args.keep_ncw_or_nchw_or_ncdhw_input_names,
-        keep_nwc_or_nhwc_or_ndhwc_input_names=args.keep_nwc_or_nhwc_or_ndhwc_input_names,
-        keep_shape_absolutely_input_names=args.keep_shape_absolutely_input_names,
-        input_names_to_interrupt_model_conversion=args.input_names_to_interrupt_model_conversion,
-        output_names_to_interrupt_model_conversion=args.output_names_to_interrupt_model_conversion,
-        disable_group_convolution=args.disable_group_convolution,
-        enable_accumulation_type_float16=args.enable_accumulation_type_float16,
-        enable_batchmatmul_unfold=args.enable_batchmatmul_unfold,
-        enable_rnn_unroll=args.enable_rnn_unroll,
-        disable_suppression_flextranspose=args.disable_suppression_flextranspose,
-        disable_strict_mode=args.disable_strict_mode,
-        onnxruntime_output_memmap=not args.disable_onnxruntime_output_memmap,
-        onnxruntime_output_memmap_dir=args.onnxruntime_output_memmap_dir,
-        number_of_dimensions_after_flextranspose_compression=args.number_of_dimensions_after_flextranspose_compression,
-        disable_suppression_flexstridedslice=args.disable_suppression_flexstridedslice,
-        number_of_dimensions_after_flexstridedslice_compression=args.number_of_dimensions_after_flexstridedslice_compression,
-        optimization_for_gpu_delegate=args.optimization_for_gpu_delegate,
-        replace_argmax_to_reducemax_and_indices_is_int64=args.replace_argmax_to_reducemax_and_indices_is_int64,
-        replace_argmax_to_reducemax_and_indices_is_float32=args.replace_argmax_to_reducemax_and_indices_is_float32,
-        replace_argmax_to_fused_argmax_and_indices_is_int64=args.replace_argmax_to_fused_argmax_and_indices_is_int64,
-        replace_argmax_to_fused_argmax_and_indices_is_float32=args.replace_argmax_to_fused_argmax_and_indices_is_float32,
-        fused_argmax_scale_ratio=args.fused_argmax_scale_ratio,
-        replace_to_pseudo_operators=args.replace_to_pseudo_operators,
-        param_replacement_file=args.param_replacement_file,
-        auto_generate_json=args.auto_generate_json,
-        auto_generate_json_on_error=args.auto_generate_json_on_error,
-        enable_auto_split_model=args.enable_auto_split_model,
-        auto_split_max_size=args.auto_split_max_size,
-        auto_split_max_size_mb=args.auto_split_max_size_mb,
-        check_gpu_delegate_compatibility=args.check_gpu_delegate_compatibility,
-        check_onnx_tf_outputs_elementwise_close=args.check_onnx_tf_outputs_elementwise_close,
-        check_onnx_tf_outputs_elementwise_close_full=args.check_onnx_tf_outputs_elementwise_close_full,
-        check_onnx_tf_outputs_sample_data_normalization=args.check_onnx_tf_outputs_sample_data_normalization,
-        check_onnx_tf_outputs_elementwise_close_rtol=args.check_onnx_tf_outputs_elementwise_close_rtol,
-        check_onnx_tf_outputs_elementwise_close_atol=args.check_onnx_tf_outputs_elementwise_close_atol,
-        test_data_nhwc_path=args.test_data_nhwc_path,
-        mvn_epsilon=args.mvn_epsilon,
-        disable_model_save=args.disable_model_save,
-        non_verbose=args.non_verbose,
-        verbosity=args.verbosity,
-    )
+    try:
+        model = convert(
+            input_onnx_file_path=args.input_onnx_file_path,
+            input_tflite_file_path=args.input_tflite_file_path,
+            output_folder_path=args.output_folder_path,
+            output_signaturedefs=args.output_signaturedefs,
+            output_h5=args.output_h5,
+            output_keras_v3=args.output_keras_v3,
+            output_tfv1_pb=args.output_tfv1_pb,
+            output_weights=args.output_weights,
+            copy_onnx_input_output_names_to_tflite=args.copy_onnx_input_output_names_to_tflite,
+            output_dynamic_range_quantized_tflite=args.output_dynamic_range_quantized_tflite,
+            output_integer_quantized_tflite=args.output_integer_quantized_tflite,
+            eval_with_onnx=args.eval_with_onnx,
+            eval_num_samples=args.eval_num_samples,
+            eval_rtol=args.eval_rtol,
+            eval_atol=args.eval_atol,
+            eval_fail_on_threshold=args.eval_fail_on_threshold,
+            eval_target_tflite=args.eval_target_tflite,
+            eval_compare_mode=args.eval_compare_mode,
+            eval_split_models=args.eval_split_models,
+            eval_split_fail_on_threshold=args.eval_split_fail_on_threshold,
+            report_op_coverage=args.report_op_coverage,
+            flatbuffer_direct_output_saved_model=args.flatbuffer_direct_output_saved_model,
+            flatbuffer_direct_output_pytorch=args.flatbuffer_direct_output_pytorch,
+            flatbuffer_direct_output_torchscript=args.flatbuffer_direct_output_torchscript,
+            flatbuffer_direct_output_dynamo_onnx=args.flatbuffer_direct_output_dynamo_onnx,
+            flatbuffer_direct_output_exported_program=args.flatbuffer_direct_output_exported_program,
+            native_pytorch_generation_timeout_sec=args.native_pytorch_generation_timeout_sec,
+            flatbuffer_direct_allow_custom_ops=args.flatbuffer_direct_allow_custom_ops,
+            flatbuffer_direct_custom_op_allowlist=flatbuffer_direct_custom_op_allowlist,
+            tflite_split_max_bytes=args.tflite_split_max_bytes,
+            tflite_split_target_bytes=args.tflite_split_target_bytes,
+            tflite_backend=args.tflite_backend,
+            quant_norm_mean=args.quant_norm_mean,
+            quant_norm_std=args.quant_norm_std,
+            quant_type=args.quant_type,
+            custom_input_op_name_np_data_path=custom_params,
+            input_quant_dtype=args.input_quant_dtype,
+            output_quant_dtype=args.output_quant_dtype,
+            not_use_onnxsim=args.not_use_onnxsim,
+            not_use_opname_auto_generate=args.not_use_opname_auto_generate,
+            batch_size=args.batch_size,
+            overwrite_input_shape=args.overwrite_input_shape,
+            shape_hints=args.shape_hints,
+            value_hints=args.value_hints,
+            no_large_tensor=args.no_large_tensor,
+            output_nms_with_dynamic_tensor=args.output_nms_with_dynamic_tensor,
+            output_nms_with_argmax=args.output_nms_with_argmax,
+            switch_nms_version=args.switch_nms_version,
+            keep_ncw_or_nchw_or_ncdhw_input_names=args.keep_ncw_or_nchw_or_ncdhw_input_names,
+            keep_nwc_or_nhwc_or_ndhwc_input_names=args.keep_nwc_or_nhwc_or_ndhwc_input_names,
+            keep_shape_absolutely_input_names=args.keep_shape_absolutely_input_names,
+            input_names_to_interrupt_model_conversion=args.input_names_to_interrupt_model_conversion,
+            output_names_to_interrupt_model_conversion=args.output_names_to_interrupt_model_conversion,
+            disable_group_convolution=args.disable_group_convolution,
+            enable_accumulation_type_float16=args.enable_accumulation_type_float16,
+            enable_batchmatmul_unfold=args.enable_batchmatmul_unfold,
+            enable_rnn_unroll=args.enable_rnn_unroll,
+            disable_suppression_flextranspose=args.disable_suppression_flextranspose,
+            disable_strict_mode=args.disable_strict_mode,
+            onnxruntime_output_memmap=not args.disable_onnxruntime_output_memmap,
+            onnxruntime_output_memmap_dir=args.onnxruntime_output_memmap_dir,
+            number_of_dimensions_after_flextranspose_compression=args.number_of_dimensions_after_flextranspose_compression,
+            disable_suppression_flexstridedslice=args.disable_suppression_flexstridedslice,
+            number_of_dimensions_after_flexstridedslice_compression=args.number_of_dimensions_after_flexstridedslice_compression,
+            optimization_for_gpu_delegate=args.optimization_for_gpu_delegate,
+            replace_argmax_to_reducemax_and_indices_is_int64=args.replace_argmax_to_reducemax_and_indices_is_int64,
+            replace_argmax_to_reducemax_and_indices_is_float32=args.replace_argmax_to_reducemax_and_indices_is_float32,
+            replace_argmax_to_fused_argmax_and_indices_is_int64=args.replace_argmax_to_fused_argmax_and_indices_is_int64,
+            replace_argmax_to_fused_argmax_and_indices_is_float32=args.replace_argmax_to_fused_argmax_and_indices_is_float32,
+            fused_argmax_scale_ratio=args.fused_argmax_scale_ratio,
+            replace_to_pseudo_operators=args.replace_to_pseudo_operators,
+            param_replacement_file=args.param_replacement_file,
+            auto_generate_json=args.auto_generate_json,
+            auto_generate_json_on_error=args.auto_generate_json_on_error,
+            enable_auto_split_model=args.enable_auto_split_model,
+            auto_split_max_size=args.auto_split_max_size,
+            auto_split_max_size_mb=args.auto_split_max_size_mb,
+            check_gpu_delegate_compatibility=args.check_gpu_delegate_compatibility,
+            check_onnx_tf_outputs_elementwise_close=args.check_onnx_tf_outputs_elementwise_close,
+            check_onnx_tf_outputs_elementwise_close_full=args.check_onnx_tf_outputs_elementwise_close_full,
+            check_onnx_tf_outputs_sample_data_normalization=args.check_onnx_tf_outputs_sample_data_normalization,
+            check_onnx_tf_outputs_elementwise_close_rtol=args.check_onnx_tf_outputs_elementwise_close_rtol,
+            check_onnx_tf_outputs_elementwise_close_atol=args.check_onnx_tf_outputs_elementwise_close_atol,
+            test_data_nhwc_path=args.test_data_nhwc_path,
+            mvn_epsilon=args.mvn_epsilon,
+            disable_model_save=args.disable_model_save,
+            non_verbose=args.non_verbose,
+            verbosity=args.verbosity,
+        )
+    except (
+        OptionalTensorFlowDependencyError,
+        OptionalPyTorchDependencyError,
+    ) as ex:
+        error(str(ex))
+        sys.exit(1)
 
 
 if __name__ == '__main__':

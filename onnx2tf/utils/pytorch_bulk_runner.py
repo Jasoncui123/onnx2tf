@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import importlib
 import json
 import os
 import shlex
@@ -13,9 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import onnx
 
-from onnx2tf.tflite_builder.pytorch_accuracy_evaluator import (
-    evaluate_pytorch_package_outputs,
-    smoke_test_pytorch_package_inference,
+from onnx2tf.utils.torch_optional import (
+    OptionalPyTorchDependencyError,
+    require_torch,
 )
 
 
@@ -30,6 +31,27 @@ _ACCEPTED_ACCURACY_MISMATCH_PREFIXES = (
 _DEFAULT_SKIP_MODEL_NAMES = (
     "dehaze_maxim_2022aug_opt_sim_special_05_max_to_relu.onnx",
 )
+
+
+def _load_pytorch_accuracy_evaluator():
+    require_torch("PyTorch bulk verification")
+    return importlib.import_module(
+        "onnx2tf.tflite_builder.pytorch_accuracy_evaluator"
+    )
+
+
+def evaluate_pytorch_package_outputs(*args: Any, **kwargs: Any):
+    return _load_pytorch_accuracy_evaluator().evaluate_pytorch_package_outputs(
+        *args,
+        **kwargs,
+    )
+
+
+def smoke_test_pytorch_package_inference(*args: Any, **kwargs: Any):
+    return _load_pytorch_accuracy_evaluator().smoke_test_pytorch_package_inference(
+        *args,
+        **kwargs,
+    )
 
 
 def _utc_now_iso() -> str:
@@ -491,18 +513,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    state = run_bulk_pytorch_verification(
-        list_path=args.list_path,
-        output_dir=args.output_dir,
-        resume=bool(args.resume),
-        onnx2tf_command=str(args.onnx2tf_command),
-        num_samples=int(args.num_samples),
-        rtol=float(args.rtol),
-        atol=float(args.atol),
-        timeout_sec=int(args.timeout_sec),
-        smoke_only=bool(args.smoke_only),
-        skip_model_names=list(args.skip_model_name),
-    )
+    try:
+        require_torch("PyTorch bulk verification")
+        state = run_bulk_pytorch_verification(
+            list_path=args.list_path,
+            output_dir=args.output_dir,
+            resume=bool(args.resume),
+            onnx2tf_command=str(args.onnx2tf_command),
+            num_samples=int(args.num_samples),
+            rtol=float(args.rtol),
+            atol=float(args.atol),
+            timeout_sec=int(args.timeout_sec),
+            smoke_only=bool(args.smoke_only),
+            skip_model_names=list(args.skip_model_name),
+        )
+    except OptionalPyTorchDependencyError as ex:
+        print(str(ex))
+        sys.exit(1)
     print(
         "Bulk PyTorch verification complete. "
         f"total_entries={len(state.get('entries', []))} "

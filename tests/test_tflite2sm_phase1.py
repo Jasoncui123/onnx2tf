@@ -1720,17 +1720,16 @@ def test_tflite_direct_input_saved_model_with_cotof_smoke() -> None:
             tflite_backend="flatbuffer_direct",
             check_onnx_tf_outputs_elementwise_close_full=True,
         )
-        report_path = os.path.join(
-            output_dir,
-            "add_tflite_direct_input_cotof_saved_model_validation_report.json",
+        assert os.path.exists(os.path.join(output_dir, "saved_model.pb"))
+        assert not os.path.exists(
+            os.path.join(
+                output_dir,
+                "add_tflite_direct_input_cotof_saved_model_validation_report.json",
+            )
         )
-        assert os.path.exists(report_path)
-        with open(report_path, "r", encoding="utf-8") as f:
-            report = json.load(f)
-        assert report["inference"]["status"] == "passed"
-        assert report["comparison"]["status"] == "passed"
-        assert report["comparison"]["pass"] is True
-        assert report["overall_pass"] is True
+        assert not os.path.exists(
+            os.path.join(output_dir, "add_tflite_direct_input_cotof_accuracy_report.json")
+        )
 
 
 def test_tflite_direct_input_split_outputs_smoke() -> None:
@@ -1797,17 +1796,15 @@ def test_tflite_direct_input_split_saved_model_cotof_smoke() -> None:
             flatbuffer_direct_output_saved_model=True,
             check_onnx_tf_outputs_elementwise_close_full=True,
         )
-        report_path = os.path.join(
-            output_dir,
-            "add_tflite_direct_input_split_cotof_saved_model_validation_report.json",
+        assert os.path.exists(
+            os.path.join(output_dir, "add_tflite_direct_input_split_cotof_accuracy_report.json")
         )
-        assert os.path.exists(report_path)
-        with open(report_path, "r", encoding="utf-8") as f:
-            report = json.load(f)
-        assert report["source_label"] == "tflite_direct_input"
-        assert report["comparison"]["status"] == "passed"
-        assert report["comparison"]["pass"] is True
-        assert report["overall_pass"] is True
+        assert not os.path.exists(
+            os.path.join(
+                output_dir,
+                "add_tflite_direct_input_split_cotof_saved_model_validation_report.json",
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -2038,17 +2035,10 @@ def test_flatbuffer_direct_output_saved_model_cotof_smoke() -> None:
         )
         assert os.path.exists(os.path.join(tmpdir, "saved_model.pb"))
         assert os.path.exists(os.path.join(tmpdir, "add_float32.tflite"))
-        report_path = os.path.join(
-            tmpdir,
-            "add_saved_model_validation_report.json",
+        assert os.path.exists(os.path.join(tmpdir, "add_accuracy_report.json"))
+        assert not os.path.exists(
+            os.path.join(tmpdir, "add_saved_model_validation_report.json")
         )
-        assert os.path.exists(report_path)
-        with open(report_path, "r", encoding="utf-8") as f:
-            report = json.load(f)
-        assert report["inference"]["status"] == "passed"
-        assert report["comparison"]["status"] == "passed"
-        assert report["comparison"]["pass"] is True
-        assert report["overall_pass"] is True
 
 
 def test_flatbuffer_direct_output_pytorch_cotof_generates_comparison_report() -> None:
@@ -2160,20 +2150,15 @@ def test_flatbuffer_direct_output_saved_model_split_cotof_smoke() -> None:
             auto_split_max_size="256MB",
             check_onnx_tf_outputs_elementwise_close_full=True,
         )
-        report_path = os.path.join(
-            tmpdir,
-            "add_split_sm_cotof_saved_model_validation_report.json",
+        assert os.path.exists(
+            os.path.join(tmpdir, "add_split_sm_cotof_accuracy_report.json")
         )
-        assert os.path.exists(report_path)
-        with open(report_path, "r", encoding="utf-8") as f:
-            report = json.load(f)
-        assert report["mode"] == "split_saved_model"
-        assert report["comparison"]["status"] == "passed"
-        assert report["comparison"]["pass"] is True
-        assert report["overall_pass"] is True
+        assert not os.path.exists(
+            os.path.join(tmpdir, "add_split_sm_cotof_saved_model_validation_report.json")
+        )
 
 
-def test_flatbuffer_direct_output_saved_model_cotof_runs_saved_model_inference_check(
+def test_flatbuffer_direct_output_saved_model_cotof_does_not_run_saved_model_inference_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2183,26 +2168,20 @@ def test_flatbuffer_direct_output_saved_model_cotof_runs_saved_model_inference_c
             raise RuntimeError("saved model load failure for test")
 
         monkeypatch.setattr(tf.saved_model, "load", _raise_saved_model_load)
-        with pytest.raises(RuntimeError, match="SavedModel inference check failed"):
-            onnx2tf.convert(
-                input_onnx_file_path=model_path,
-                output_folder_path=tmpdir,
-                verbosity="error",
-                disable_strict_mode=True,
-                tflite_backend="flatbuffer_direct",
-                flatbuffer_direct_output_saved_model=True,
-                check_onnx_tf_outputs_elementwise_close_full=True,
-            )
-        report_path = os.path.join(
-            tmpdir,
-            "add_saved_model_validation_report.json",
+        onnx2tf.convert(
+            input_onnx_file_path=model_path,
+            output_folder_path=tmpdir,
+            verbosity="error",
+            disable_strict_mode=True,
+            tflite_backend="flatbuffer_direct",
+            flatbuffer_direct_output_saved_model=True,
+            check_onnx_tf_outputs_elementwise_close_full=True,
         )
-        assert os.path.exists(report_path)
-        with open(report_path, "r", encoding="utf-8") as f:
-            report = json.load(f)
-        assert report["inference"]["status"] == "failed"
-        assert report["comparison"]["status"] == "skipped"
-        assert report["overall_pass"] is False
+        assert os.path.exists(os.path.join(tmpdir, "saved_model.pb"))
+        assert os.path.exists(os.path.join(tmpdir, "add_accuracy_report.json"))
+        assert not os.path.exists(
+            os.path.join(tmpdir, "add_saved_model_validation_report.json")
+        )
 
 
 def test_saved_model_exporter_kernel_registry_completeness() -> None:

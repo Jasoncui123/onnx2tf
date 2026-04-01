@@ -1,4 +1,4 @@
-from . import main
+from . import main as lazy_main
 
 if __name__ == '__main__':
-    main()
+    lazy_main()

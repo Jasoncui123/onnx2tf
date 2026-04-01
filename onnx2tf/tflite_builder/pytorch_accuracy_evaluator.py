@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import onnx
-import torch
 
 from onnx2tf.tflite_builder.accuracy_evaluator import (
     _FLOAT_METRIC_THRESHOLDS,
@@ -31,6 +30,21 @@ from onnx2tf.tflite_builder.accuracy_evaluator import (
     _resize_tflite_inputs_if_needed,
     _resolve_metric_thresholds,
 )
+from onnx2tf.utils.torch_optional import require_torch
+
+
+class _TorchModuleProxy:
+    def __init__(self, feature: str) -> None:
+        self._feature = str(feature)
+
+    def _load(self) -> Any:
+        return require_torch(self._feature).torch
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+torch = _TorchModuleProxy("PyTorch evaluator")
 
 
 def _import_generated_package(package_path: str) -> Any:
@@ -355,6 +369,7 @@ def evaluate_pytorch_package_outputs(
     custom_input_op_name_np_data_path: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     import onnxruntime as ort
+    require_torch("ONNX/PyTorch validation")
 
     if int(num_samples) <= 0:
         raise ValueError(f"num_samples must be > 0. got: {num_samples}")
@@ -627,6 +642,7 @@ def evaluate_tflite_pytorch_package_outputs(
     atol: float = 1.0e-4,
     metric_thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
+    require_torch("TFLite/PyTorch validation")
     if int(num_samples) <= 0:
         raise ValueError(f"num_samples must be > 0. got: {num_samples}")
     if not os.path.exists(tflite_path):
@@ -876,6 +892,7 @@ def smoke_test_pytorch_package_inference(
     num_samples: int = 1,
     seed: int = 0,
 ) -> Dict[str, Any]:
+    require_torch("PyTorch package inference smoke test")
     if int(num_samples) <= 0:
         raise ValueError(f"num_samples must be > 0. got: {num_samples}")
     if not os.path.exists(package_dir):

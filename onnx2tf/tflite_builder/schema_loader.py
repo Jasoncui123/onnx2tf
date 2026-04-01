@@ -4,7 +4,7 @@ import os
 from functools import lru_cache
 from typing import Dict, Any
 
-from onnx2tf.utils.common_functions import ensure_tflite_schema_artifacts
+from onnx2tf.utils.onnx_litert_runtime import ensure_tflite_schema_artifacts
 
 
 @lru_cache(maxsize=16)
