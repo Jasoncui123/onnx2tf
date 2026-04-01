@@ -10,7 +10,7 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-from onnx2tf.utils.common_functions import check_model_has_external_data
+from onnx2tf.utils.onnx_litert_runtime import check_model_has_external_data
 from onnx2tf.tflite_builder.dispatcher import dispatch_node
 from onnx2tf.tflite_builder.op_registry import (
     NodeValidationError,

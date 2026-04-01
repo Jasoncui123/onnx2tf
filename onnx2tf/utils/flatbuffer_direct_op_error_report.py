@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple
 import numpy as np
 import onnx
 
-from onnx2tf import gs
+import onnx2tf.gs as gs
 from onnx2tf.tflite_builder.accuracy_evaluator import (
     _MetricAccumulator,
     _adapt_input_layout_for_tflite_input,
@@ -31,7 +31,7 @@ from onnx2tf.tflite_builder.accuracy_evaluator import (
     _resize_tflite_inputs_if_needed,
 )
 from onnx2tf.utils.tempdir_cleanup import make_managed_tempdir
-from onnx2tf.utils.common_functions import dummy_onnx_inference
+from onnx2tf.utils.onnx_litert_runtime import dummy_onnx_inference
 
 
 class _LiteInterpreterProtocol(Protocol):

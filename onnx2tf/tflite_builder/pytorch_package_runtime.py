@@ -7,8 +7,6 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 from onnx2tf.tflite_builder.accuracy_evaluator import (
     _adapt_input_layout_for_tflite_input,
@@ -19,18 +17,52 @@ from onnx2tf.tflite_builder.accuracy_evaluator import (
     _quantize_for_tflite_input,
     _resize_tflite_inputs_if_needed,
 )
+from onnx2tf.utils.torch_optional import require_torch
 
 
-_TORCH_DTYPE_BY_TFLITE_DTYPE: Dict[str, torch.dtype] = {
-    "BOOL": torch.bool,
-    "INT8": torch.int8,
-    "INT16": torch.int16,
-    "INT32": torch.int32,
-    "INT64": torch.int64,
-    "UINT8": torch.uint8,
-    "FLOAT16": torch.float16,
-    "FLOAT32": torch.float32,
-    "FLOAT64": torch.float64,
+class _TorchModuleProxy:
+    def __init__(self, feature: str) -> None:
+        self._feature = str(feature)
+
+    def _load(self) -> Any:
+        return require_torch(self._feature).torch
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+class _TorchFunctionalProxy:
+    def __init__(self, feature: str) -> None:
+        self._feature = str(feature)
+
+    def _load(self) -> Any:
+        return require_torch(self._feature).torch.nn.functional
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+class _EvalModeMixin:
+    def eval(self):
+        return self
+
+    def train(self, mode: bool = True):
+        return self
+
+
+torch = _TorchModuleProxy("PyTorch package runtime")
+F = _TorchFunctionalProxy("PyTorch package runtime")
+
+_TORCH_DTYPE_BY_TFLITE_DTYPE: Dict[str, str] = {
+    "BOOL": "bool",
+    "INT8": "int8",
+    "INT16": "int16",
+    "INT32": "int32",
+    "INT64": "int64",
+    "UINT8": "uint8",
+    "FLOAT16": "float16",
+    "FLOAT32": "float32",
+    "FLOAT64": "float64",
 }
 
 
@@ -38,7 +70,7 @@ def _torch_dtype(dtype_name: str) -> torch.dtype:
     key = str(dtype_name).upper()
     if key not in _TORCH_DTYPE_BY_TFLITE_DTYPE:
         raise RuntimeError(f"Unsupported dtype for PyTorch runtime: {dtype_name}")
-    return _TORCH_DTYPE_BY_TFLITE_DTYPE[key]
+    return getattr(torch, _TORCH_DTYPE_BY_TFLITE_DTYPE[key])
 
 
 def _module_device(module: Any) -> torch.device:
@@ -1831,63 +1863,173 @@ def _register_supported_kernels() -> Dict[str, Callable[[_GraphExecutor, Dict[st
 
 
 SUPPORTED_TORCH_KERNEL_OP_TYPES = {
-    op_type for op_type in _register_supported_kernels().keys() if str(op_type) != "CUSTOM"
+    "ABS",
+    "ADD",
+    "ARG_MAX",
+    "ARG_MIN",
+    "ATAN",
+    "ATAN2",
+    "AVERAGE_POOL_2D",
+    "BATCH_MATMUL",
+    "BROADCAST_TO",
+    "CAST",
+    "CEIL",
+    "CONCATENATION",
+    "CONV_2D",
+    "CONV_3D",
+    "CONV_3D_TRANSPOSE",
+    "COS",
+    "CUMSUM",
+    "DEPTHWISE_CONV_2D",
+    "DEPTH_TO_SPACE",
+    "DIV",
+    "ELU",
+    "EQUAL",
+    "EXP",
+    "EXPAND_DIMS",
+    "FILL",
+    "FLOOR",
+    "FLOOR_MOD",
+    "GATHER",
+    "GATHER_ND",
+    "GELU",
+    "GREATER",
+    "GREATER_EQUAL",
+    "IDENTITY",
+    "L2_NORMALIZATION",
+    "LEAKY_RELU",
+    "LESS",
+    "LESS_EQUAL",
+    "LOG",
+    "LOGICAL_AND",
+    "LOGICAL_NOT",
+    "LOGICAL_OR",
+    "LOGISTIC",
+    "MAXIMUM",
+    "MAX_POOL_2D",
+    "MEAN",
+    "MINIMUM",
+    "MIRROR_PAD",
+    "MUL",
+    "NEG",
+    "NON_MAX_SUPPRESSION_V4",
+    "NOT_EQUAL",
+    "ONE_HOT",
+    "PACK",
+    "PAD",
+    "PADV2",
+    "POW",
+    "PRELU",
+    "RANGE",
+    "REDUCE_ANY",
+    "REDUCE_MAX",
+    "REDUCE_MIN",
+    "REDUCE_PROD",
+    "RELU",
+    "RELU6",
+    "RELU_0_TO_1",
+    "RELU_N1_TO_1",
+    "RESHAPE",
+    "RESIZE_BILINEAR",
+    "RESIZE_NEAREST_NEIGHBOR",
+    "REVERSE_V2",
+    "RIGHT_SHIFT",
+    "SCATTER_ND",
+    "SELECT",
+    "SELECT_V2",
+    "SHAPE",
+    "SIGN",
+    "SIN",
+    "SLICE",
+    "SOFTMAX",
+    "SPACE_TO_DEPTH",
+    "SPLIT",
+    "SQRT",
+    "SQUEEZE",
+    "STRIDED_SLICE",
+    "SUB",
+    "SUM",
+    "TANH",
+    "TILE",
+    "TOPK_V2",
+    "TRANSPOSE",
+    "TRANSPOSE_CONV",
+    "UNPACK",
+    "WHERE",
 }
 
 
-class _GeneratedModel(torch.nn.Module):
-    def __init__(self, *, metadata: Dict[str, Any]) -> None:
-        super().__init__()
-        self._metadata = metadata
-        self.input_names = list(metadata.get("inputs", []))
-        self.output_names = list(metadata.get("outputs", []))
-        self.tensor_storage_names = _tensor_storage_name_map_from_metadata(metadata)
-        self._executor = _GraphExecutor(model=self, metadata=metadata)
-        for tensor_name, tensor_meta in sorted(metadata.get("tensors", {}).items()):
-            if not bool(tensor_meta.get("has_data", False)):
-                continue
-            dtype = _torch_dtype(str(tensor_meta["dtype"]))
-            shape = [int(v) for v in list(tensor_meta.get("shape", []))]
-            if len(shape) == 0:
-                shape = []
-            value = torch.zeros(shape, dtype=dtype)
-            storage_name = self.tensor_storage_names.get(
-                str(tensor_name),
-                _default_tensor_storage_name(str(tensor_name)),
-            )
-            if bool(tensor_meta.get("is_variable", False)):
-                self.register_parameter(storage_name, torch.nn.Parameter(value, requires_grad=False))
-            else:
-                self.register_buffer(storage_name, value, persistent=True)
+_NATIVE_GENERATED_MODEL_CLS: Optional[type] = None
 
-    def forward(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> Any:
-        if len(args) > 0 and len(kwargs) > 0:
-            raise RuntimeError("Use either positional inputs or keyword inputs, not both.")
-        if len(kwargs) > 0:
-            inputs = {
-                str(name): _resolve_named_input_value(kwargs, str(name))
-                for name in self.input_names
-            }
-        else:
-            if len(args) != len(self.input_names):
-                raise RuntimeError(
-                    f"Input arity mismatch. expected={len(self.input_names)} actual={len(args)}"
+
+def _get_generated_model_cls():
+    global _NATIVE_GENERATED_MODEL_CLS
+    if _NATIVE_GENERATED_MODEL_CLS is not None:
+        return _NATIVE_GENERATED_MODEL_CLS
+
+    require_torch("PyTorch package runtime")
+
+    class _GeneratedModel(torch.nn.Module):
+        def __init__(self, *, metadata: Dict[str, Any]) -> None:
+            super().__init__()
+            self._metadata = metadata
+            self.input_names = list(metadata.get("inputs", []))
+            self.output_names = list(metadata.get("outputs", []))
+            self.tensor_storage_names = _tensor_storage_name_map_from_metadata(metadata)
+            self._executor = _GraphExecutor(model=self, metadata=metadata)
+            for tensor_name, tensor_meta in sorted(metadata.get("tensors", {}).items()):
+                if not bool(tensor_meta.get("has_data", False)):
+                    continue
+                dtype = _torch_dtype(str(tensor_meta["dtype"]))
+                shape = [int(v) for v in list(tensor_meta.get("shape", []))]
+                if len(shape) == 0:
+                    shape = []
+                value = torch.zeros(shape, dtype=dtype)
+                storage_name = self.tensor_storage_names.get(
+                    str(tensor_name),
+                    _default_tensor_storage_name(str(tensor_name)),
                 )
-            inputs = {str(name): value for name, value in zip(self.input_names, args)}
-        env = self._executor.run(inputs)
-        outputs = [self._executor._resolve_tensor(str(name), env) for name in self.output_names]
-        if len(outputs) == 1:
-            return outputs[0]
-        return tuple(outputs)
+                if bool(tensor_meta.get("is_variable", False)):
+                    self.register_parameter(storage_name, torch.nn.Parameter(value, requires_grad=False))
+                else:
+                    self.register_buffer(storage_name, value, persistent=True)
 
-    def forward_named(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> Dict[str, torch.Tensor]:
-        result = self.forward(*args, **kwargs)
-        if len(self.output_names) == 1:
-            return {str(self.output_names[0]): result}
-        return {str(name): value for name, value in zip(self.output_names, result)}
+        def forward(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> Any:
+            if len(args) > 0 and len(kwargs) > 0:
+                raise RuntimeError("Use either positional inputs or keyword inputs, not both.")
+            if len(kwargs) > 0:
+                inputs = {
+                    str(name): _resolve_named_input_value(kwargs, str(name))
+                    for name in self.input_names
+                }
+            else:
+                if len(args) != len(self.input_names):
+                    raise RuntimeError(
+                        f"Input arity mismatch. expected={len(self.input_names)} actual={len(args)}"
+                    )
+                inputs = {str(name): value for name, value in zip(self.input_names, args)}
+            env = self._executor.run(inputs)
+            outputs = [self._executor._resolve_tensor(str(name), env) for name in self.output_names]
+            if len(outputs) == 1:
+                return outputs[0]
+            return tuple(outputs)
+
+        def forward_named(self, *args: torch.Tensor, **kwargs: torch.Tensor) -> Dict[str, torch.Tensor]:
+            result = self.forward(*args, **kwargs)
+            if len(self.output_names) == 1:
+                return {str(self.output_names[0]): result}
+            return {str(name): value for name, value in zip(self.output_names, result)}
+
+    _NATIVE_GENERATED_MODEL_CLS = _GeneratedModel
+    return _NATIVE_GENERATED_MODEL_CLS
 
 
-GeneratedModelBase = _GeneratedModel
+class _GeneratedModelBaseProxy:
+    def __mro_entries__(self, bases: tuple[Any, ...]) -> tuple[type, ...]:
+        return (_get_generated_model_cls(),)
+
+
+GeneratedModelBase = _GeneratedModelBaseProxy()
 
 
 def prepare_generated_model_metadata(
@@ -1942,7 +2084,7 @@ def load_generated_model_weights(
     return model
 
 
-class _TFLiteBackedGeneratedModel(torch.nn.Module):
+class _TFLiteBackedGeneratedModel(_EvalModeMixin):
     def __init__(
         self,
         *,
@@ -2132,7 +2274,7 @@ class _TFLiteBackedGeneratedModel(torch.nn.Module):
         return {str(name): value for name, value in zip(self.output_names, result)}
 
 
-class _StringNormalizerGeneratedModel(torch.nn.Module):
+class _StringNormalizerGeneratedModel(_EvalModeMixin):
     def __init__(self, *, metadata: Dict[str, Any]) -> None:
         super().__init__()
         self._metadata = metadata
@@ -2191,7 +2333,7 @@ class _StringNormalizerGeneratedModel(torch.nn.Module):
         return {str(self.output_names[0]): self.forward(*args, **kwargs)}
 
 
-class _SavedModelBackedGeneratedModel(torch.nn.Module):
+class _SavedModelBackedGeneratedModel(_EvalModeMixin):
     def __init__(
         self,
         *,
@@ -2356,6 +2498,7 @@ def load_generated_model_package(
     device: Optional[str] = None,
     eval_mode: bool = True,
 ) -> torch.nn.Module:
+    require_torch("PyTorch package runtime")
     metadata_path = os.path.join(package_dir, "metadata.json")
     state_dict_path = os.path.join(package_dir, "state_dict.pth")
     with open(metadata_path, "r", encoding="utf-8") as f:

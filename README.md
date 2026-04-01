@@ -884,8 +884,9 @@ Video speed is adjusted approximately 50 times slower than actual speed.
 - onnxoptimizer==0.4.2
 - sne4onnx>=2.0.1
 - sng4onnx>=2.0.1
-- tensorflow==2.19.0
-- tf-keras==2.19.0
+- tensorflow==2.19.0 (optional: TensorFlow-backed export / tf_converter only)
+- tf-keras==2.19.0 (optional: TensorFlow-backed export / tf_converter only)
+- torch==2.11.0 (optional: PyTorch-backed export / validation only)
 - ai-edge-litert==2.1.2
 - h5py==3.12.1
 - psutil==5.9.5
@@ -949,9 +950,20 @@ Video speed is adjusted approximately 50 times slower than actual speed.
   source .venv/bin/activate
   uv pip install -U onnx2tf
 
-  Note: onnx2tf's uv configuration excludes package versions published within the last 7 days.
-  If no compatible version older than 7 days exists, dependency resolution may fail.
-  PyTorch packages from the official PyTorch index are exempt from this cooldown.
+  or
+
+  # Install TensorFlow-backed features too (tf_converter, SavedModel/H5/Keras exports).
+  uv pip install -U 'onnx2tf[tensorflow]'
+
+  or
+
+  # Install PyTorch-backed features too (native package / TorchScript / Dynamo ONNX / ExportedProgram).
+  uv pip install -U 'onnx2tf[torch]'
+
+  or
+
+  # Install all optional features at once.
+  uv pip install -U 'onnx2tf[tensorflow,torch]'
 
   or
 
@@ -963,7 +975,34 @@ Video speed is adjusted approximately 50 times slower than actual speed.
 
   or
 
+  # Sync with TensorFlow-backed features enabled.
+  uv sync --extra tensorflow
+
+  or
+
+  # Sync with PyTorch-backed features enabled.
+  uv sync --extra torch
+
+  or
+
+  # Sync with all optional features enabled.
+  uv sync --all-extras
+
+  or
+
   pip install -e .
+
+  or
+
+  pip install -e '.[tensorflow]'
+
+  or
+
+  pip install -e '.[torch]'
+
+  or
+
+  pip install -e '.[tensorflow,torch]'
 
   or
 
