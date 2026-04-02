@@ -1,6 +1,13 @@
 # onnx2tf
 A tool for converting ONNX files to LiteRT/TFLite/TensorFlow, PyTorch native code (nn.Module), TorchScript (.pt), state_dict (.pt), Exported Program (.pt2), and Dynamo ONNX. It also supports direct conversion from LiteRT to PyTorch.
 
+pip install onnx_graphsurgeon==0.5.2
+
+pip install onnx_graphsurgeon numpy==1.26.4 onnx==1.20.1 onnxruntime==1.24.3 opencv-python==4.11.0.86 onnxsim-prebuilt==0.4.39.post2 onnxoptimizer==0.4.2 onnxscript==0.6.2 ai-edge-litert==2.1.2 sne4onnx==2.0.1 sng4onnx==2.0.1 psutil==5.9.5 protobuf==4.25.5 h5py==3.12.1 ml_dtypes==0.5.1 flatbuffers==25.12.19 tqdm==4.67.1 pytest==9.0.2 tensorflow-intel  ml-dtypes==0.5.1 tf2onnx   tf-keras==2.19.0 tensorflow==2.19.0 torch==2.11.0 numpy==1.26.4  onnxsim-prebuilt==0.4.39.post2  torchaudio torchvision
+
+
+
+
 You should use LiteRT Torch rather than onnx2tf. https://github.com/google-ai-edge/litert-torch and https://github.com/google-ai-edge/ai-edge-quantizer
 
 <p align="center">
