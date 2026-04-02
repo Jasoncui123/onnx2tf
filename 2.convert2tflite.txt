@@ -1,0 +1,1 @@
+onnx2tf -i "./onnx_models/papagei_p.onnx" -odrqt  -oqd int8
