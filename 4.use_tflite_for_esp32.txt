@@ -1,3 +1,6 @@
+
+xxd -i papagei_p_dynamic_range_quant.tflite model_tflite.h
+
 我明白！xxd 生成的头文件会把二进制膨胀 5~7 倍，5M → 30M 完全正常，ESP32 根本放不下！
 ✅ 正确做法：不转 .h，直接把 .tflite 放进 SPIFFS / SD 卡！
 这是 ESP32 跑大模型唯一标准方案！
